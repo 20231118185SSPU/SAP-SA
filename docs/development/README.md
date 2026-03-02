@@ -74,6 +74,7 @@ Event fields:
 - 0.2.0: persistent long-term memory, Agents.md reload + persona preloading, interrupt, TUI CLI, infinite retry/backoff.
 - 0.2.1: CLI always requests WS history on connect (prevents missing `final` after disconnect).
 - 0.2.2: TUI ignores key release events (fixes double-typed input on some terminals).
+- 0.2.3: TUI cursor uses Unicode display width (fixes cursor drift for CJK/emoji input).
 
 ## Traceability (extracted from `../zeroclaw`)
 
