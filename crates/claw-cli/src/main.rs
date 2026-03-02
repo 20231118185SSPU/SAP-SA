@@ -280,16 +280,24 @@ async fn run_one_shot(ws_url: String, task: String) -> anyhow::Result<()> {
             .await
             .context("Failed to send submit")?;
 
-        // On reconnect, request history since last_event_id.
-        if last_event_id > 0 {
-            let hist = ClientMessage::GetHistory {
-                from_event_id: last_event_id,
-            };
-            ws_tx
-                .send(Message::Text(serde_json::to_string(&hist)?.into()))
-                .await
-                .context("Failed to request history")?;
-        }
+        // Always request history since `last_event_id`.
+        //
+        // Why do this even when `last_event_id == 0`?
+        // - If the connection drops right after we submit the task but before we
+        //   see the first event, `last_event_id` is still 0.
+        // - Without requesting history, we could miss the `final` event and
+        //   hang forever (the agent will finish, but the CLI never observes it).
+        //
+        // Requesting history from 0 is safe because:
+        // - The daemon's buffer is bounded (`MAX_BUFFERED_EVENTS`).
+        // - We filter by `task_id` before printing.
+        let hist = ClientMessage::GetHistory {
+            from_event_id: last_event_id,
+        };
+        ws_tx
+            .send(Message::Text(serde_json::to_string(&hist)?.into()))
+            .await
+            .context("Failed to request history")?;
 
         // Read loop.
         while let Some(msg) = ws_rx.next().await {
@@ -601,14 +609,15 @@ async fn ws_worker(
         let (mut ws_tx, mut ws_rx) = ws_stream.split();
 
         // Request history first so we catch up on events while we were offline.
-        if last_event_id > 0 {
-            let hist = ClientMessage::GetHistory {
-                from_event_id: last_event_id,
-            };
-            let _ = ws_tx
-                .send(Message::Text(serde_json::to_string(&hist).unwrap().into()))
-                .await;
-        }
+        //
+        // We do this even for `last_event_id == 0` so a fresh UI session can
+        // immediately display recent buffered events.
+        let hist = ClientMessage::GetHistory {
+            from_event_id: last_event_id,
+        };
+        let _ = ws_tx
+            .send(Message::Text(serde_json::to_string(&hist).unwrap().into()))
+            .await;
 
         // Connected loop:
         // - forward outbound messages to server
