@@ -18,7 +18,7 @@ use claw_core::config::load_config_from_file;
 use claw_core::retry::retry_delay;
 use claw_core::ws_protocol::{ClientMessage, Event, EventKind, ServerMessage};
 use crossterm::cursor;
-use crossterm::event::{Event as CtEvent, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{Event as CtEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -386,11 +386,28 @@ enum UiAction {
 /// mentally and extend safely.
 fn handle_input_event(input: &mut String, ev: CtEvent) -> Option<UiAction> {
     let CtEvent::Key(KeyEvent {
-        code, modifiers, ..
+        code,
+        modifiers,
+        kind,
+        ..
     }) = ev
     else {
         return None;
     };
+
+    // IMPORTANT: only react to key presses (and repeats), not key releases.
+    //
+    // Why?
+    // - On some terminals / platforms (notably Windows), crossterm can emit
+    //   both `Press` and `Release` events.
+    // - If we treat `Release` like `Press`, every typed character appears twice
+    //   in the input box (and Enter can double-trigger).
+    //
+    // Filtering here keeps behavior deterministic and fixes the user's report:
+    // "TUI 输入时会输出两次重复" (input shows duplicated characters).
+    if !matches!(kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+        return None;
+    }
 
     // Exit shortcuts.
     if modifiers.contains(KeyModifiers::CONTROL) {
