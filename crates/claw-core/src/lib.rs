@@ -11,8 +11,11 @@
 
 pub mod agent;
 pub mod agents_md;
+pub mod cancel;
 pub mod config;
+pub mod memory;
 pub mod openai;
+pub mod retry;
 pub mod skills;
 pub mod tools;
 pub mod ws_protocol;

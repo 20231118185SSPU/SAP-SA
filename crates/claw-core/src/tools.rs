@@ -15,6 +15,7 @@
 //! NOTE: The user request requires that communication interruptions do not stop
 //! the agent. Tools therefore should not depend on any client connection.
 
+use crate::cancel::CancelToken;
 use crate::openai::{ToolDefinition, ToolFunctionDefinition};
 use crate::skills::SkillRegistry;
 use anyhow::Context as _;
@@ -214,20 +215,33 @@ impl ToolExecutor {
     }
 
     /// Execute a tool by name with already-parsed JSON arguments.
-    pub async fn execute(&self, name: &str, args: serde_json::Value) -> anyhow::Result<String> {
+    ///
+    /// Cancellation:
+    /// - Long-running tools (especially `shell_command`) must support cooperative
+    ///   cancellation so the user can interrupt the agent.
+    pub async fn execute(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+        cancel: &CancelToken,
+    ) -> anyhow::Result<String> {
         match name {
-            "shell_command" => self.shell_command(args).await,
-            "read_file" => self.read_file(args).await,
-            "write_file" => self.write_file(args).await,
-            "list_dir" => self.list_dir(args).await,
-            "list_skills" => self.list_skills(args).await,
-            "load_skill" => self.load_skill(args).await,
+            "shell_command" => self.shell_command(args, cancel).await,
+            "read_file" => self.read_file(args, cancel).await,
+            "write_file" => self.write_file(args, cancel).await,
+            "list_dir" => self.list_dir(args, cancel).await,
+            "list_skills" => self.list_skills(args, cancel).await,
+            "load_skill" => self.load_skill(args, cancel).await,
             _ => anyhow::bail!("Unknown tool: {name}"),
         }
     }
 
     /// Tool: `shell_command`.
-    async fn shell_command(&self, args: serde_json::Value) -> anyhow::Result<String> {
+    async fn shell_command(
+        &self,
+        args: serde_json::Value,
+        cancel: &CancelToken,
+    ) -> anyhow::Result<String> {
         #[derive(Debug, Deserialize)]
         struct Args {
             command: String,
@@ -260,10 +274,21 @@ impl ToolExecutor {
         }
 
         // Collect output with a timeout so the agent cannot hang indefinitely.
-        let output = tokio::time::timeout(Duration::from_secs(300), cmd.output())
-            .await
-            .context("shell_command timed out")?
-            .context("shell_command failed to spawn or wait")?;
+        //
+        // Cancellation note:
+        // - We use `kill_on_drop(true)` above.
+        // - If the user interrupts, we drop the output future; Tokio will drop
+        //   the child process handle and attempt to kill it.
+        let output = tokio::select! {
+            _ = cancel.cancelled() => {
+                anyhow::bail!("shell_command cancelled");
+            }
+            output = tokio::time::timeout(Duration::from_secs(300), cmd.output()) => {
+                output
+                    .context("shell_command timed out")?
+                    .context("shell_command failed to spawn or wait")?
+            }
+        };
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -279,7 +304,14 @@ impl ToolExecutor {
     }
 
     /// Tool: `read_file`.
-    async fn read_file(&self, args: serde_json::Value) -> anyhow::Result<String> {
+    async fn read_file(
+        &self,
+        args: serde_json::Value,
+        cancel: &CancelToken,
+    ) -> anyhow::Result<String> {
+        if cancel.is_cancelled() {
+            anyhow::bail!("read_file cancelled");
+        }
         #[derive(Debug, Deserialize)]
         struct Args {
             path: String,
@@ -307,7 +339,14 @@ impl ToolExecutor {
     }
 
     /// Tool: `write_file`.
-    async fn write_file(&self, args: serde_json::Value) -> anyhow::Result<String> {
+    async fn write_file(
+        &self,
+        args: serde_json::Value,
+        cancel: &CancelToken,
+    ) -> anyhow::Result<String> {
+        if cancel.is_cancelled() {
+            anyhow::bail!("write_file cancelled");
+        }
         #[derive(Debug, Deserialize)]
         struct Args {
             path: String,
@@ -350,7 +389,14 @@ impl ToolExecutor {
     }
 
     /// Tool: `list_dir`.
-    async fn list_dir(&self, args: serde_json::Value) -> anyhow::Result<String> {
+    async fn list_dir(
+        &self,
+        args: serde_json::Value,
+        cancel: &CancelToken,
+    ) -> anyhow::Result<String> {
+        if cancel.is_cancelled() {
+            anyhow::bail!("list_dir cancelled");
+        }
         #[derive(Debug, Deserialize)]
         struct Args {
             path: String,
@@ -382,13 +428,27 @@ impl ToolExecutor {
     }
 
     /// Tool: `list_skills`.
-    async fn list_skills(&self, _args: serde_json::Value) -> anyhow::Result<String> {
+    async fn list_skills(
+        &self,
+        _args: serde_json::Value,
+        cancel: &CancelToken,
+    ) -> anyhow::Result<String> {
+        if cancel.is_cancelled() {
+            anyhow::bail!("list_skills cancelled");
+        }
         let skills = self.ctx.skills.list();
         Ok(serde_json::json!({ "skills": skills }).to_string())
     }
 
     /// Tool: `load_skill`.
-    async fn load_skill(&self, args: serde_json::Value) -> anyhow::Result<String> {
+    async fn load_skill(
+        &self,
+        args: serde_json::Value,
+        cancel: &CancelToken,
+    ) -> anyhow::Result<String> {
+        if cancel.is_cancelled() {
+            anyhow::bail!("load_skill cancelled");
+        }
         #[derive(Debug, Deserialize)]
         struct Args {
             name: String,

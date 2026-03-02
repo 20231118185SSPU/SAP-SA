@@ -8,6 +8,7 @@
 //! - Treats a missing file as "empty instructions" (but returns `found=false`
 //!   so the caller can log a warning).
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 /// Result of reading `Agents.md`.
@@ -70,4 +71,60 @@ pub fn is_agents_md_path(path: &Path) -> bool {
         return false;
     };
     file_name.eq_ignore_ascii_case("Agents.md")
+}
+
+/// Extract Markdown file references from the `Agents.md` content.
+///
+/// Motivation:
+/// - Users often write an `Agents.md` that says things like:
+///   - "Read `SOUL.md`"
+///   - "Read `USER.md`"
+///   - "Read `memory/YYYY-MM-DD.md` (today + yesterday)"
+/// - Relying on the model to call `read_file` for these can be flaky.
+/// - To make behavior **verifiable**, the daemon proactively reads referenced
+///   files (best-effort) and injects them into the system prompt.
+///
+/// Extraction rules (intentionally simple and explainable):
+/// - We scan for text enclosed in backticks (`...`).
+/// - We keep tokens that look like Markdown paths (contain `.md`/`.MD`).
+/// - We strip any `#anchor` suffix.
+/// - We return a de-duplicated list in first-seen order.
+pub fn extract_markdown_file_references(agents_md_content: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::<String>::new();
+
+    // We parse by scanning for pairs of backticks. This is not a full Markdown
+    // parser, but is stable and easy to reason about.
+    let mut rest = agents_md_content;
+    while let Some(start) = rest.find('`') {
+        let after_start = &rest[start + 1..];
+        let Some(end) = after_start.find('`') else {
+            break;
+        };
+
+        let token = &after_start[..end];
+        rest = &after_start[end + 1..];
+
+        // Ignore empty tokens.
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+
+        // Strip anchor fragments (`file.md#section`).
+        let token = token.split('#').next().unwrap_or(token).trim();
+
+        // Keep only Markdown-like references.
+        let token_lower = token.to_ascii_lowercase();
+        if !token_lower.contains(".md") {
+            continue;
+        }
+
+        // Keep first occurrence only (stable order).
+        if seen.insert(token.to_string()) {
+            out.push(token.to_string());
+        }
+    }
+
+    out
 }

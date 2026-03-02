@@ -14,6 +14,64 @@
 use anyhow::Context as _;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
+use std::fmt;
+
+/// Error returned by [`OpenAiClient::chat_completions`].
+///
+/// We keep this error structured so the agent loop can decide whether an error
+/// is retryable (temporary) or non-retryable (permanent, such as invalid auth).
+#[derive(Debug)]
+pub enum ChatCompletionsError {
+    /// Transport-level errors (DNS failure, connection refused, TLS, timeout, etc.).
+    Transport(reqwest::Error),
+    /// Non-2xx HTTP status with the raw response body.
+    Http {
+        /// HTTP status code returned by the server.
+        status: reqwest::StatusCode,
+        /// Raw response body (best-effort, may be truncated by the server).
+        body: String,
+    },
+}
+
+impl ChatCompletionsError {
+    /// Return `true` if we should retry this error.
+    ///
+    /// We follow a conservative policy:
+    /// - Transport errors are usually retryable (except builder errors).
+    /// - HTTP 408/429/5xx are treated as retryable.
+    /// - Authentication/validation errors (4xx) are treated as non-retryable.
+    pub fn is_retriable(&self) -> bool {
+        match self {
+            ChatCompletionsError::Transport(err) => !err.is_builder(),
+            ChatCompletionsError::Http { status, .. } => {
+                *status == reqwest::StatusCode::REQUEST_TIMEOUT
+                    || *status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                    || status.is_server_error()
+            }
+        }
+    }
+
+    /// Return the HTTP status code, if this is an HTTP error.
+    pub fn status(&self) -> Option<reqwest::StatusCode> {
+        match self {
+            ChatCompletionsError::Transport(_) => None,
+            ChatCompletionsError::Http { status, .. } => Some(*status),
+        }
+    }
+}
+
+impl fmt::Display for ChatCompletionsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ChatCompletionsError::Transport(err) => write!(f, "transport error: {err}"),
+            ChatCompletionsError::Http { status, body } => {
+                write!(f, "http error ({status}): {body}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ChatCompletionsError {}
 
 /// Minimal OpenAI-compatible client.
 #[derive(Debug, Clone)]
@@ -59,7 +117,7 @@ impl OpenAiClient {
     pub async fn chat_completions(
         &self,
         req: &ChatCompletionsRequest,
-    ) -> anyhow::Result<ChatCompletionsResponse> {
+    ) -> Result<ChatCompletionsResponse, ChatCompletionsError> {
         let url = self.chat_completions_url();
 
         // Send request.
@@ -69,7 +127,7 @@ impl OpenAiClient {
             .json(req)
             .send()
             .await
-            .context("Chat completions request failed")?;
+            .map_err(ChatCompletionsError::Transport)?;
 
         // Handle non-2xx responses with a readable error.
         if !resp.status().is_success() {
@@ -78,17 +136,38 @@ impl OpenAiClient {
                 .text()
                 .await
                 .unwrap_or_else(|_| "<failed to read body>".to_string());
+            let body = truncate_error_body(body);
 
-            // IMPORTANT: do not include the API key in the error.
-            // (We keep `self.api_key` only for the header; we never print it.)
-            anyhow::bail!("Chat completions error ({status}): {body}");
+            // IMPORTANT:
+            // - We do not include the API key in the error.
+            // - We keep the raw body because it is often the only traceable clue.
+            return Err(ChatCompletionsError::Http { status, body });
         }
 
         // Parse JSON.
         resp.json::<ChatCompletionsResponse>()
             .await
-            .context("Failed to parse chat completions JSON response")
+            .map_err(ChatCompletionsError::Transport)
     }
+}
+
+/// Truncate a response body that is going to be included in an error.
+///
+/// Rationale:
+/// - Many API gateways return large HTML error pages on 502/503.
+/// - Emitting megabytes into the agent event stream is not useful and can
+///   degrade the CLI UX.
+fn truncate_error_body(body: String) -> String {
+    const MAX_CHARS: usize = 4_000;
+
+    // If already small, keep as-is.
+    if body.chars().count() <= MAX_CHARS {
+        return body;
+    }
+
+    // Truncate by *characters* so we do not split UTF-8 sequences.
+    let truncated: String = body.chars().take(MAX_CHARS).collect();
+    format!("{truncated}…(truncated)")
 }
 
 /// Request body for `POST /v1/chat/completions`.

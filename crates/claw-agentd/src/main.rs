@@ -17,8 +17,10 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use clap::Parser;
 use claw_core::agent::{AgentRunner, AgentRunnerConfig, EmitEventFn};
-use claw_core::agents_md::load_agents_md;
+use claw_core::agents_md::{extract_markdown_file_references, load_agents_md};
+use claw_core::cancel::{CancelHandle, cancel_pair};
 use claw_core::config::load_config_from_file;
+use claw_core::memory::{MemoryEntry, MemoryStore, default_memory_path};
 use claw_core::openai::OpenAiClient;
 use claw_core::skills::SkillRegistry;
 use claw_core::tools::{ToolContext, ToolExecutor};
@@ -56,6 +58,18 @@ struct TaskRequest {
     task: String,
 }
 
+/// Information about the task currently being executed by the worker loop.
+///
+/// This enables cooperative cancellation: a WebSocket client can request an
+/// interrupt, and the worker loop will stop at the next cancellation point.
+#[derive(Debug, Clone)]
+struct CurrentTask {
+    /// Currently running task id.
+    task_id: Uuid,
+    /// Cancellation handle for the task.
+    cancel: CancelHandle,
+}
+
 /// Shared daemon state.
 ///
 /// This object is designed so:
@@ -78,16 +92,35 @@ struct Hub {
     /// Set of task ids already accepted (idempotency for retries).
     seen_tasks: Mutex<HashSet<Uuid>>,
 
+    /// Currently running task (if any), so we can cancel it.
+    current_task: Mutex<Option<CurrentTask>>,
+
+    /// Context used for safe path resolution when preloading files.
+    preload_ctx: ToolContext,
+
+    /// Persistent long-term memory (JSONL on disk).
+    memory: Mutex<MemoryStore>,
+
     /// The agent runner (OpenAI + tools loop).
     runner: AgentRunner,
 
-    /// Loaded Agents.md (instructions).
-    agents_md: claw_core::agents_md::AgentsMd,
+    /// Path to Agents.md (reloaded for every task).
+    ///
+    /// Why reload each task?
+    /// - Users often edit `Agents.md` while the daemon is running.
+    /// - Users may create `Agents.md` after the daemon starts.
+    /// Reloading makes this behavior verifiable and fixes "Agents.md not loaded" confusion.
+    agents_md_path: PathBuf,
 }
 
 impl Hub {
     /// Create a new hub and spawn the background worker.
-    fn new(runner: AgentRunner, agents_md: claw_core::agents_md::AgentsMd) -> Arc<Self> {
+    fn new(
+        runner: AgentRunner,
+        agents_md_path: PathBuf,
+        preload_ctx: ToolContext,
+        memory: MemoryStore,
+    ) -> Arc<Self> {
         // Task queue capacity (small but adequate for minimal agent).
         let (task_tx, task_rx) = mpsc::channel::<TaskRequest>(128);
 
@@ -102,8 +135,11 @@ impl Hub {
             events_buf: Mutex::new(VecDeque::new()),
             next_event_id: AtomicU64::new(0),
             seen_tasks: Mutex::new(HashSet::new()),
+            current_task: Mutex::new(None),
+            preload_ctx,
+            memory: Mutex::new(memory),
             runner,
-            agents_md,
+            agents_md_path,
         });
 
         // Spawn worker loop.
@@ -152,6 +188,46 @@ impl Hub {
         let _ = self.events_tx.send(event);
     }
 
+    /// Request interruption (cancellation) of a running task.
+    ///
+    /// This is called from the WS handler when a client sends:
+    /// `{"type":"interrupt","task_id":"..."}`
+    fn request_interrupt(&self, task_id: Uuid) {
+        let current = self
+            .current_task
+            .lock()
+            .expect("current_task mutex poisoned");
+
+        let Some(info) = current.as_ref() else {
+            self.publish(
+                EventKind::Error,
+                task_id,
+                "Interrupt requested, but no task is currently running.".to_string(),
+            );
+            return;
+        };
+
+        if info.task_id != task_id {
+            self.publish(
+                EventKind::Error,
+                task_id,
+                format!(
+                    "Interrupt requested for task {task_id}, but currently running task is {}.",
+                    info.task_id
+                ),
+            );
+            return;
+        }
+
+        self.publish(
+            EventKind::Log,
+            task_id,
+            "Interrupt requested; cancelling current task.".to_string(),
+        );
+
+        info.cancel.cancel();
+    }
+
     /// Return all buffered events with `event_id > from_event_id`.
     async fn history_since(&self, from_event_id: u64) -> Vec<Event> {
         let buf = self.events_buf.lock().expect("events_buf mutex poisoned");
@@ -190,12 +266,54 @@ impl Hub {
     /// Background worker loop that executes tasks sequentially.
     async fn worker_loop(self: Arc<Self>, mut task_rx: mpsc::Receiver<TaskRequest>) {
         while let Some(req) = task_rx.recv().await {
+            // Create a per-task cancellation token and register it as the "current task".
+            //
+            // This is the backend part of: "the CLI can send messages anytime to interrupt".
+            let (cancel_handle, cancel_token) = cancel_pair();
+            {
+                let mut current = self
+                    .current_task
+                    .lock()
+                    .expect("current_task mutex poisoned");
+                *current = Some(CurrentTask {
+                    task_id: req.task_id,
+                    cancel: cancel_handle,
+                });
+            }
+
             // Emit task start.
             self.publish(
                 EventKind::Log,
                 req.task_id,
                 format!("Task started: {}", req.task),
             );
+
+            // Reload Agents.md for every task (see comment on `agents_md_path`).
+            let agents_md = match load_agents_md(self.agents_md_path.clone()).await {
+                Ok(a) => a,
+                Err(err) => {
+                    self.publish(
+                        EventKind::Error,
+                        req.task_id,
+                        format!("Failed to read Agents.md: {err}"),
+                    );
+                    claw_core::agents_md::AgentsMd {
+                        path: self.agents_md_path.clone(),
+                        content: String::new(),
+                        found: false,
+                    }
+                }
+            };
+
+            // Extra context injected into the system prompt:
+            // - persistent memory snapshot
+            // - proactive preloading of files referenced in Agents.md
+            let memory_block = {
+                let mem = self.memory.lock().expect("memory mutex poisoned");
+                mem.prompt_block()
+            };
+            let preload_block = self.preload_agents_md_references(&agents_md).await;
+            let extra_prompt = format!("{memory_block}\n\n{preload_block}");
 
             // Build the emit callback for the agent runner.
             let hub_for_emit = Arc::clone(&self);
@@ -206,13 +324,46 @@ impl Hub {
             // Run the agent loop.
             match self
                 .runner
-                .run_task(req.task_id, req.task, &self.agents_md, emit)
+                .run_task(
+                    req.task_id,
+                    req.task.clone(),
+                    &agents_md,
+                    Some(extra_prompt.as_str()),
+                    &cancel_token,
+                    emit,
+                )
                 .await
             {
-                Ok(_final_text) => {
+                Ok(final_text) => {
                     // The agent runner already emits `Final`, but we keep an explicit
                     // completion log for clarity.
                     self.publish(EventKind::Log, req.task_id, "Task finished.".to_string());
+
+                    // Persist memory entry (best-effort).
+                    //
+                    // We skip persisting on cancellation to keep memory signal high.
+                    if !cancel_token.is_cancelled()
+                        && !final_text.starts_with("Task cancelled by user interrupt")
+                    {
+                        let entry = MemoryEntry {
+                            ts: chrono::Utc::now(),
+                            task_id: req.task_id,
+                            user_task: req.task.trim().to_string(),
+                            final_answer: final_text.trim().to_string(),
+                        };
+
+                        let mut mem = self.memory.lock().expect("memory mutex poisoned");
+                        if let Err(err) = mem.append(entry) {
+                            self.publish(
+                                EventKind::Error,
+                                req.task_id,
+                                format!(
+                                    "Failed to persist memory to {}: {err}",
+                                    mem.path().display()
+                                ),
+                            );
+                        }
+                    }
                 }
                 Err(err) => {
                     let msg = format!("Task crashed: {err}");
@@ -221,8 +372,125 @@ impl Hub {
                     self.publish(EventKind::Final, req.task_id, msg);
                 }
             }
+
+            // Clear the "current task" slot if it still points to this task id.
+            //
+            // This prevents interrupts from accidentally cancelling the next task.
+            {
+                let mut current = self
+                    .current_task
+                    .lock()
+                    .expect("current_task mutex poisoned");
+                if current.as_ref().is_some_and(|c| c.task_id == req.task_id) {
+                    *current = None;
+                }
+            }
         }
     }
+
+    /// Preload workspace files referenced by `Agents.md` and return a prompt block.
+    async fn preload_agents_md_references(
+        &self,
+        agents_md: &claw_core::agents_md::AgentsMd,
+    ) -> String {
+        // If Agents.md is missing or empty, we return a short block for traceability.
+        if !agents_md.found || agents_md.content.trim().is_empty() {
+            return "## Preloaded files (from Agents.md)\n\n- (Agents.md missing or empty)\n"
+                .to_string();
+        }
+
+        let refs = extract_markdown_file_references(&agents_md.content);
+        let refs = expand_date_placeholders(refs);
+
+        // Hard limits to keep prompts bounded.
+        let max_files: usize = 10;
+        let max_bytes_per_file: u64 = 80_000;
+
+        let mut out = String::new();
+        out.push_str("## Preloaded files (from Agents.md)\n\n");
+
+        let mut loaded = 0usize;
+        for r in refs {
+            if loaded >= max_files {
+                out.push_str("- (truncated: too many referenced files)\n");
+                break;
+            }
+
+            // Resolve safely under the workspace root.
+            let abs = match self.preload_ctx.resolve_under_workspace(&r) {
+                Ok(p) => p,
+                Err(err) => {
+                    out.push_str(&format!("- `{r}`: resolve error: {err}\n"));
+                    continue;
+                }
+            };
+
+            // Only preload existing files.
+            let meta = match tokio::fs::metadata(&abs).await {
+                Ok(m) => m,
+                Err(_) => {
+                    out.push_str(&format!("- `{r}`: (missing)\n"));
+                    continue;
+                }
+            };
+
+            if meta.len() > max_bytes_per_file {
+                out.push_str(&format!(
+                    "- `{r}`: (skipped; too large: {} bytes)\n",
+                    meta.len()
+                ));
+                continue;
+            }
+
+            let content = match tokio::fs::read_to_string(&abs).await {
+                Ok(c) => c,
+                Err(err) => {
+                    out.push_str(&format!("- `{r}`: read error: {err}\n"));
+                    continue;
+                }
+            };
+
+            loaded += 1;
+            out.push_str(&format!("\n### `{r}`\n\n"));
+            out.push_str("```text\n");
+            out.push_str(&content);
+            if !content.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push_str("```\n");
+        }
+
+        if loaded == 0 {
+            out.push_str("- (no referenced files were loaded)\n");
+        }
+
+        out
+    }
+}
+
+/// Expand special placeholders in referenced paths.
+///
+/// Currently supported:
+/// - `YYYY-MM-DD` → replaced with today's date, and also yesterday's date
+///   (to match common "load today + yesterday" instructions).
+fn expand_date_placeholders(mut refs: Vec<String>) -> Vec<String> {
+    let mut out = Vec::new();
+
+    let today = chrono::Local::now().date_naive();
+    let yesterday = today - chrono::Duration::days(1);
+
+    for r in refs.drain(..) {
+        if r.contains("YYYY-MM-DD") {
+            out.push(r.replace("YYYY-MM-DD", &today.to_string()));
+            out.push(r.replace("YYYY-MM-DD", &yesterday.to_string()));
+        } else {
+            out.push(r);
+        }
+    }
+
+    // De-duplicate while preserving order.
+    let mut seen = HashSet::<String>::new();
+    out.into_iter().filter(|r| seen.insert(r.clone())).collect()
 }
 
 /// WS upgrade handler.
@@ -303,6 +571,13 @@ async fn ws_session(socket: WebSocket, hub: Arc<Hub>) {
                         let events = hub.history_since(from_event_id).await;
                         let _ = out_tx.send(ServerMessage::History { events });
                     }
+                    ClientMessage::Interrupt { task_id } => {
+                        // Cancellation is implemented in the worker loop. Here we only
+                        // forward the request into the hub.
+                        //
+                        // NOTE: If the task is not currently running, the hub will ignore it.
+                        hub.request_interrupt(task_id);
+                    }
                 }
             }
             Message::Close(_) => break,
@@ -353,8 +628,21 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Workspace root: {}", workspace_root.display());
     tracing::info!("Agents.md path: {}", agents_md_path.display());
 
-    // Load Agents.md.
-    let agents_md = load_agents_md(agents_md_path).await?;
+    // Best-effort load `Agents.md` once for startup logging.
+    //
+    // The worker loop reloads `Agents.md` **for every task**, so changes take
+    // effect without restarting the daemon.
+    match load_agents_md(agents_md_path.clone()).await {
+        Ok(a) if a.found => {
+            tracing::info!("Agents.md detected ({} bytes).", a.content.len());
+        }
+        Ok(_) => {
+            tracing::info!("Agents.md not found at startup (this is OK).");
+        }
+        Err(err) => {
+            tracing::warn!("Failed to read Agents.md at startup: {err}");
+        }
+    }
 
     // Discover skills.
     let skill_dirs = cfg.skills.dirs_as_paths();
@@ -363,6 +651,15 @@ async fn main() -> anyhow::Result<()> {
 
     // Build tools.
     let tool_ctx = ToolContext::new(workspace_root, Arc::clone(&skills))?;
+    let preload_ctx = tool_ctx.clone();
+
+    // Load persistent memory store (JSONL).
+    //
+    // This provides "long-term memory" across tasks and daemon restarts.
+    let memory_path = default_memory_path(&tool_ctx.workspace_root);
+    let memory_store = MemoryStore::load_or_new(memory_path)?;
+    tracing::info!("Memory file: {}", memory_store.path().display());
+
     let tools = ToolExecutor::new(tool_ctx);
 
     // Build LLM client.
@@ -380,7 +677,7 @@ async fn main() -> anyhow::Result<()> {
     let runner = AgentRunner::new(llm, tools, Arc::clone(&skills), runner_cfg);
 
     // Hub (spawns worker loop).
-    let hub = Hub::new(runner, agents_md);
+    let hub = Hub::new(runner, agents_md_path, preload_ctx, memory_store);
 
     // Build HTTP router (WS only).
     let app = Router::new()

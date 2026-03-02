@@ -8,6 +8,19 @@ Thumbs.db
 # Local configuration containing secrets (API keys, etc.).
 claw.toml
 
+# Local agent instructions (workspace-specific; not committed).
+Agents.md
+
+# Optional local persona / memory files (commonly referenced by Agents.md).
+SOUL.md
+USER.md
+IDENTITY.md
+HEARTBEAT.md
+MEMORY.md
+memory/
+
+# Local agent state (persistent memory, caches, etc.).
+.claw/
+
 # Optional local logs.
 *.log
-

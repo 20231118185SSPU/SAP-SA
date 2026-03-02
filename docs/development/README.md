@@ -11,13 +11,27 @@ This folder documents the minimal Rust agent in `../`:
 ## Running
 
 1. Create `claw.toml` from `claw.example.toml`.
-2. Start the daemon:
+2. (Optional) Create a local `Agents.md` (gitignored). If it references files in backticks
+   (e.g. `SOUL.md`, `USER.md`), the daemon will preload them into the prompt.
+3. Start the daemon:
 
 ```bash
 cargo run -p claw-agentd
 ```
 
-3. Submit a task:
+4. Start the interactive CLI (bottom input box):
+
+```bash
+cargo run -p claw-cli
+```
+
+Interactive commands:
+
+- Type text and press Enter → interrupts current task (if any) and submits a new task
+- `/stop` → interrupt current task
+- `/exit` → quit CLI
+
+One-shot mode (for scripting):
 
 ```bash
 cargo run -p claw-cli -- run "用一句话解释这个项目的结构"
@@ -31,6 +45,7 @@ Client → Server:
 
 - `{"type":"submit","task_id":"<optional uuid>","task":"..."}`
 - `{"type":"get_history","from_event_id":123}`
+- `{"type":"interrupt","task_id":"<uuid>"}`
 
 Server → Client:
 
@@ -51,6 +66,7 @@ Event fields:
 - This is intentionally minimal: no authentication on the WebSocket server.
 - The agent toolset is minimal (shell + basic file ops); expand as needed.
 - Streaming token output is not implemented; events are per-step.
+- Long-term memory is persisted to `.claw/memory.jsonl` (gitignored).
 
 ## Changelog
 

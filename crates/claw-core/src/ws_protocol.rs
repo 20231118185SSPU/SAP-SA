@@ -33,6 +33,13 @@ pub enum ClientMessage {
     /// Request event history starting *after* `from_event_id`.
     #[serde(rename = "get_history")]
     GetHistory { from_event_id: u64 },
+
+    /// Interrupt (cancel) a running task.
+    ///
+    /// This is the key feature that enables the CLI to "send a message at any
+    /// time" and stop the current autonomous loop without killing the daemon.
+    #[serde(rename = "interrupt")]
+    Interrupt { task_id: Uuid },
 }
 
 /// Server → client messages.

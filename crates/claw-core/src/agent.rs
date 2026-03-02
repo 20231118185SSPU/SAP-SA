@@ -12,7 +12,9 @@
 //! This module is deliberately "pure core": it only needs an event callback.
 
 use crate::agents_md::{AgentsMd, format_agents_md_block};
+use crate::cancel::CancelToken;
 use crate::openai::{ChatCompletionsRequest, ChatMessage, OpenAiClient, ToolCall};
+use crate::retry::retry_delay;
 use crate::skills::SkillRegistry;
 use crate::tools::ToolExecutor;
 use crate::ws_protocol::EventKind;
@@ -73,10 +75,34 @@ impl AgentRunner {
         task_id: Uuid,
         task: String,
         agents_md: &AgentsMd,
+        extra_system_prompt: Option<&str>,
+        cancel: &CancelToken,
         emit: EmitEventFn,
     ) -> anyhow::Result<String> {
+        // Make it visible in the event stream whether `Agents.md` was found.
+        //
+        // This directly addresses the user's report:
+        // "Agents.md seems not successfully read / persona not loaded".
+        if agents_md.found {
+            (emit)(
+                EventKind::Log,
+                task_id,
+                format!(
+                    "Agents.md loaded ({} bytes) from {}",
+                    agents_md.content.len(),
+                    agents_md.path.display()
+                ),
+            );
+        } else {
+            (emit)(
+                EventKind::Error,
+                task_id,
+                format!("Agents.md NOT FOUND at {}", agents_md.path.display()),
+            );
+        }
+
         // Build the "system prompt" (or "developer prompt") that stays constant.
-        let system_prompt = self.build_system_prompt(agents_md);
+        let system_prompt = self.build_system_prompt(agents_md, extra_system_prompt);
 
         // Initialize conversation.
         let mut messages = Vec::<ChatMessage>::new();
@@ -93,8 +119,20 @@ impl AgentRunner {
         // We pre-compute tool definitions once. This keeps requests stable.
         let tool_definitions = self.tools.tool_definitions();
 
+        // Consecutive model-call failures. This drives the infinite retry
+        // backoff schedule requested by the user.
+        let mut model_error_count: u32 = 0;
+
         // Step loop.
         for step in 1..=self.cfg.max_steps {
+            // Cooperative cancellation check before starting the next step.
+            if cancel.is_cancelled() {
+                let msg = "Task cancelled by user interrupt.".to_string();
+                (emit)(EventKind::Error, task_id, msg.clone());
+                (emit)(EventKind::Final, task_id, msg.clone());
+                return Ok(msg);
+            }
+
             (emit)(
                 EventKind::Log,
                 task_id,
@@ -110,8 +148,64 @@ impl AgentRunner {
                 stream: Some(false),
             };
 
-            // Call provider.
-            let resp = self.llm.chat_completions(&req).await?;
+            // Call provider with **infinite retry** + backoff.
+            let resp = loop {
+                // Allow cancelling even while we are retrying.
+                if cancel.is_cancelled() {
+                    let msg = "Task cancelled by user interrupt.".to_string();
+                    (emit)(EventKind::Error, task_id, msg.clone());
+                    (emit)(EventKind::Final, task_id, msg.clone());
+                    return Ok(msg);
+                }
+
+                let call = self.llm.chat_completions(&req);
+                let result = tokio::select! {
+                    _ = cancel.cancelled() => {
+                        let msg = "Task cancelled by user interrupt.".to_string();
+                        (emit)(EventKind::Error, task_id, msg.clone());
+                        (emit)(EventKind::Final, task_id, msg.clone());
+                        return Ok(msg);
+                    }
+                    r = call => r,
+                };
+
+                match result {
+                    Ok(resp) => {
+                        // Reset the counter on success.
+                        model_error_count = 0;
+                        break resp;
+                    }
+                    Err(err) if err.is_retriable() => {
+                        model_error_count = model_error_count.saturating_add(1);
+                        let delay = retry_delay(model_error_count);
+
+                        (emit)(
+                            EventKind::Error,
+                            task_id,
+                            format!(
+                                "Model call failed (retryable; count={model_error_count}; next_retry_in={:?}): {err}",
+                                delay
+                            ),
+                        );
+
+                        // Wait before retrying, but stay cancellable.
+                        tokio::select! {
+                            _ = cancel.cancelled() => {
+                                let msg = "Task cancelled by user interrupt.".to_string();
+                                (emit)(EventKind::Error, task_id, msg.clone());
+                                (emit)(EventKind::Final, task_id, msg.clone());
+                                return Ok(msg);
+                            }
+                            _ = tokio::time::sleep(delay) => {}
+                        }
+                    }
+                    Err(err) => {
+                        // Non-retryable error: fail the task.
+                        return Err(anyhow::Error::new(err))
+                            .context("Non-retryable model call error");
+                    }
+                }
+            };
             let choice = resp.first_choice()?;
 
             // Copy assistant message for our history.
@@ -143,6 +237,13 @@ impl AgentRunner {
 
             // Execute tools sequentially.
             for call in tool_calls {
+                if cancel.is_cancelled() {
+                    let msg = "Task cancelled by user interrupt.".to_string();
+                    (emit)(EventKind::Error, task_id, msg.clone());
+                    (emit)(EventKind::Final, task_id, msg.clone());
+                    return Ok(msg);
+                }
+
                 (emit)(
                     EventKind::Tool,
                     task_id,
@@ -162,9 +263,22 @@ impl AgentRunner {
                 })?;
 
                 // Execute.
-                let tool_result = match self.tools.execute(&call.function.name, args_json).await {
+                let tool_result = match self
+                    .tools
+                    .execute(&call.function.name, args_json, cancel)
+                    .await
+                {
                     Ok(output) => output,
                     Err(err) => {
+                        // If the tool failed because the user interrupted the task, treat it as
+                        // a task cancellation rather than a "normal" tool failure.
+                        if cancel.is_cancelled() {
+                            let msg = "Task cancelled by user interrupt.".to_string();
+                            (emit)(EventKind::Error, task_id, msg.clone());
+                            (emit)(EventKind::Final, task_id, msg.clone());
+                            return Ok(msg);
+                        }
+
                         let msg = format!("Tool `{}` failed: {err}", call.function.name);
                         (emit)(EventKind::Error, task_id, msg.clone());
                         // Still return a tool result message so the model can react.
@@ -192,7 +306,11 @@ impl AgentRunner {
     }
 
     /// Build the stable instructions block injected into the prompt.
-    fn build_system_prompt(&self, agents_md: &AgentsMd) -> String {
+    fn build_system_prompt(
+        &self,
+        agents_md: &AgentsMd,
+        extra_system_prompt: Option<&str>,
+    ) -> String {
         // Section 1: agents instructions.
         let mut out = String::new();
         out.push_str("# Claw minimal agent instructions\n\n");
@@ -233,6 +351,16 @@ Rules:\n\
 - Only operate inside the configured workspace root.\n\
 - Prefer small, incremental changes with verification steps.\n",
         );
+
+        // Additional context injected by the daemon (memory, preloaded files, etc.).
+        if let Some(extra) = extra_system_prompt {
+            let extra = extra.trim();
+            if !extra.is_empty() {
+                out.push_str("\n\n");
+                out.push_str(extra);
+                out.push('\n');
+            }
+        }
 
         out
     }

@@ -8,6 +8,7 @@
 - Discovers and loads `SKILL.md`-based skills (Codex/Agents skills format).
 - Runs a **tool-calling loop** (shell/file ops) to act autonomously.
 - Exposes a **WebSocket** server so a CLI can connect/disconnect without stopping the agent.
+- Persists **long-term memory** to `.claw/memory.jsonl` (gitignored).
 
 ## Quick start
 
@@ -16,19 +17,24 @@
    - Copy `claw.example.toml` to `claw.toml`
    - Fill in `llm.api_key`
 
-2. Start the agent daemon (WebSocket server):
+2. (Optional but recommended) Create a local `Agents.md` in this folder.
+
+   - It is **gitignored** by default.
+   - You can reference additional persona/memory files in backticks (e.g. `SOUL.md`, `USER.md`);
+     the daemon will preload them and inject into the prompt.
+
+3. Start the agent daemon (WebSocket server):
 
 ```bash
 cargo run -p claw-agentd
 ```
 
-3. In another terminal, send a task via the CLI:
+4. In another terminal, start the interactive CLI (bottom input box):
 
 ```bash
-cargo run -p claw-cli -- run "请在当前工作区创建一个README并解释如何运行"
+cargo run -p claw-cli
 ```
 
 ## Docs
 
 Development docs live in `./docs/development/`.
-
