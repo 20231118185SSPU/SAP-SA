@@ -215,11 +215,10 @@ impl Hub {
                     self.publish(EventKind::Log, req.task_id, "Task finished.".to_string());
                 }
                 Err(err) => {
-                    self.publish(
-                        EventKind::Error,
-                        req.task_id,
-                        format!("Task crashed: {err}"),
-                    );
+                    let msg = format!("Task crashed: {err}");
+                    self.publish(EventKind::Error, req.task_id, msg.clone());
+                    // Emit `Final` so clients can stop waiting even on crash.
+                    self.publish(EventKind::Final, req.task_id, msg);
                 }
             }
         }

@@ -186,6 +186,8 @@ impl AgentRunner {
             self.cfg.max_steps
         );
         (emit)(EventKind::Error, task_id, msg.clone());
+        // Emit `Final` so clients can stop waiting even on failure.
+        (emit)(EventKind::Final, task_id, msg.clone());
         Ok(msg)
     }
 
