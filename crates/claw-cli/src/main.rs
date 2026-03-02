@@ -36,6 +36,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
+use unicode_width::UnicodeWidthStr as _;
 use uuid::Uuid;
 
 /// CLI arguments.
@@ -498,9 +499,41 @@ fn draw_ui(
             f.render_widget(input_widget, chunks[1]);
 
             // Place the cursor at the end of the input.
-            let cursor_x = chunks[1].x.saturating_add(2 + input.len() as u16);
-            let cursor_y = chunks[1].y + 1;
-            f.set_cursor_position((cursor_x, cursor_y));
+            //
+            // IMPORTANT: use **display width** (terminal columns), not bytes.
+            //
+            // Why?
+            // - `input.len()` counts UTF-8 bytes.
+            // - For non-ASCII input (CJK, emoji, etc.), byte length and display
+            //   width differ.
+            // - If we use byte length, the cursor drifts to the right and can
+            //   look like it is "double spaced" ("光标位置在两倍的地方").
+            //
+            // The visible input line is:
+            // - inside the block borders (`+1` on x, `+1` on y)
+            // - prefixed with `"> "` (2 columns)
+            let prefix = "> ";
+            let input_width = input.width();
+            let prefix_width = prefix.width();
+
+            // Compute the inner area start (after the left border).
+            let inner_x = chunks[1].x.saturating_add(1);
+            let inner_y = chunks[1].y.saturating_add(1);
+
+            // Compute cursor x (end of prefix + input).
+            let mut cursor_x = inner_x
+                .saturating_add(prefix_width as u16)
+                .saturating_add(input_width as u16);
+
+            // Clamp cursor to the inner width so we never point outside the
+            // widget (which can cause terminal-dependent glitches).
+            let inner_width = chunks[1].width.saturating_sub(2);
+            if inner_width > 0 {
+                let max_x = inner_x.saturating_add(inner_width.saturating_sub(1));
+                cursor_x = cursor_x.min(max_x);
+            }
+
+            f.set_cursor_position((cursor_x, inner_y));
         })
         .context("Failed to draw UI")?;
 
