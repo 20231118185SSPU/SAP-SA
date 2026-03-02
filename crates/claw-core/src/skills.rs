@@ -162,7 +162,7 @@ fn parse_skill_metadata(skill_md_path: &Path) -> anyhow::Result<(String, String)
     };
 
     let parsed: SkillFrontmatter =
-        serde_yaml::from_str(frontmatter).context("Failed to parse YAML frontmatter")?;
+        serde_yaml::from_str(&frontmatter).context("Failed to parse YAML frontmatter")?;
 
     Ok((parsed.name, parsed.description))
 }
@@ -170,15 +170,30 @@ fn parse_skill_metadata(skill_md_path: &Path) -> anyhow::Result<(String, String)
 /// Extract YAML frontmatter from the top of a Markdown file.
 ///
 /// Returns the YAML string inside the `---` fence.
-fn extract_yaml_frontmatter(raw: &str) -> Option<&str> {
-    // Must start with `---` (optionally preceded by UTF-8 BOM, but we ignore BOM handling here).
-    let raw = raw.strip_prefix("---\n")?;
+fn extract_yaml_frontmatter(raw: &str) -> Option<String> {
+    // We parse via `lines()` so we handle both `\n` and `\r\n` correctly.
+    //
+    // NOTE: `lines()` removes the trailing `\r`, so comparisons to `"---"` work
+    // on Windows files with CRLF line endings.
+    let mut lines = raw.lines();
 
-    // Find the closing `---` fence.
-    let end = raw.find("\n---\n")?;
+    // First line must be the opening fence.
+    if lines.next()? != "---" {
+        return None;
+    }
 
-    // Return YAML section (without fences).
-    Some(&raw[..end])
+    // Collect YAML lines until the closing fence.
+    let mut yaml = String::new();
+    for line in lines {
+        if line == "---" {
+            return Some(yaml);
+        }
+        yaml.push_str(line);
+        yaml.push('\n');
+    }
+
+    // No closing fence.
+    None
 }
 
 #[cfg(test)]
@@ -198,5 +213,12 @@ mod tests {
         let md = "# No frontmatter\n";
         assert!(extract_yaml_frontmatter(md).is_none());
     }
-}
 
+    #[test]
+    fn extract_yaml_frontmatter_windows_crlf() {
+        let md = "---\r\nname: a\r\ndescription: b\r\n---\r\n\r\n# Body\r\n";
+        let yaml = extract_yaml_frontmatter(md).expect("frontmatter");
+        assert!(yaml.contains("name: a"));
+        assert!(yaml.contains("description: b"));
+    }
+}
