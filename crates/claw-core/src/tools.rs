@@ -83,7 +83,10 @@ impl ToolContext {
         }
 
         let mut canonical = std::fs::canonicalize(ancestor).with_context(|| {
-            format!("Failed to canonicalize existing ancestor: {}", ancestor.display())
+            format!(
+                "Failed to canonicalize existing ancestor: {}",
+                ancestor.display()
+            )
         })?;
         for component in suffix.into_iter().rev() {
             canonical.push(component);
@@ -185,7 +188,8 @@ impl ToolExecutor {
                 kind: "function".to_string(),
                 function: ToolFunctionDefinition {
                     name: "list_skills".to_string(),
-                    description: "List discovered skills (name + description + directory).".to_string(),
+                    description: "List discovered skills (name + description + directory)."
+                        .to_string(),
                     parameters: serde_json::json!({
                         "type": "object",
                         "properties": {}
@@ -230,7 +234,8 @@ impl ToolExecutor {
             workdir: Option<String>,
         }
 
-        let args: Args = serde_json::from_value(args).context("Invalid arguments for shell_command")?;
+        let args: Args =
+            serde_json::from_value(args).context("Invalid arguments for shell_command")?;
 
         // Resolve working directory (if provided) under the workspace.
         let workdir = match args.workdir.as_deref() {
@@ -310,7 +315,8 @@ impl ToolExecutor {
             overwrite: Option<bool>,
         }
 
-        let args: Args = serde_json::from_value(args).context("Invalid arguments for write_file")?;
+        let args: Args =
+            serde_json::from_value(args).context("Invalid arguments for write_file")?;
 
         let overwrite = args.overwrite.unwrap_or(true);
 
@@ -325,7 +331,10 @@ impl ToolExecutor {
 
         // Enforce overwrite behavior.
         if !overwrite && tokio::fs::try_exists(&path).await? {
-            anyhow::bail!("File already exists and overwrite=false: {}", path.display());
+            anyhow::bail!(
+                "File already exists and overwrite=false: {}",
+                path.display()
+            );
         }
 
         tokio::fs::write(&path, args.content.as_bytes())
@@ -385,7 +394,8 @@ impl ToolExecutor {
             name: String,
         }
 
-        let args: Args = serde_json::from_value(args).context("Invalid arguments for load_skill")?;
+        let args: Args =
+            serde_json::from_value(args).context("Invalid arguments for load_skill")?;
         self.ctx.skills.load_skill_md(&args.name).await
     }
 }

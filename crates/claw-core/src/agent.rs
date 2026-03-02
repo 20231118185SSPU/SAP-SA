@@ -11,7 +11,7 @@
 //! The daemon (`claw-agentd`) owns task queues, event IDs, and WS connections.
 //! This module is deliberately "pure core": it only needs an event callback.
 
-use crate::agents_md::{format_agents_md_block, AgentsMd};
+use crate::agents_md::{AgentsMd, format_agents_md_block};
 use crate::openai::{ChatCompletionsRequest, ChatMessage, OpenAiClient, ToolCall};
 use crate::skills::SkillRegistry;
 use crate::tools::ToolExecutor;
@@ -155,11 +155,11 @@ impl AgentRunner {
                 // Parse tool arguments (OpenAI provides them as a JSON string).
                 let args_json: serde_json::Value = serde_json::from_str(&call.function.arguments)
                     .with_context(|| {
-                        format!(
-                            "Failed to parse tool arguments JSON for {}",
-                            call.function.name
-                        )
-                    })?;
+                    format!(
+                        "Failed to parse tool arguments JSON for {}",
+                        call.function.name
+                    )
+                })?;
 
                 // Execute.
                 let tool_result = match self.tools.execute(&call.function.name, args_json).await {
@@ -235,4 +235,3 @@ Rules:\n\
         out
     }
 }
-

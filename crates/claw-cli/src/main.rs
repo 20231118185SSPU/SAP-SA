@@ -50,7 +50,9 @@ async fn main() -> anyhow::Result<()> {
     let cfg = load_config_from_file(&args.config)?;
 
     // Determine WS URL.
-    let ws_url = args.ws.unwrap_or_else(|| default_ws_url(&cfg.server.bind, &cfg.server.ws_path));
+    let ws_url = args
+        .ws
+        .unwrap_or_else(|| default_ws_url(&cfg.server.bind, &cfg.server.ws_path));
     // Validate URL early so users get a good error message.
     let _ = url::Url::parse(&ws_url).context("Invalid ws URL")?;
 

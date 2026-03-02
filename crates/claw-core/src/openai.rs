@@ -12,7 +12,7 @@
 //! - Here we extract the smallest useful slice for a minimal agent.
 
 use anyhow::Context as _;
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 
 /// Minimal OpenAI-compatible client.
@@ -47,10 +47,7 @@ impl OpenAiClient {
             .build()
             .context("Failed to build HTTP client")?;
 
-        Ok(Self {
-            http,
-            base_url,
-        })
+        Ok(Self { http, base_url })
     }
 
     /// Compute the `chat/completions` URL.
@@ -77,7 +74,10 @@ impl OpenAiClient {
         // Handle non-2xx responses with a readable error.
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_else(|_| "<failed to read body>".to_string());
+            let body = resp
+                .text()
+                .await
+                .unwrap_or_else(|_| "<failed to read body>".to_string());
 
             // IMPORTANT: do not include the API key in the error.
             // (We keep `self.api_key` only for the header; we never print it.)

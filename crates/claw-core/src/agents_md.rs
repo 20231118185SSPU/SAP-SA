@@ -71,4 +71,3 @@ pub fn is_agents_md_path(path: &Path) -> bool {
     };
     file_name.eq_ignore_ascii_case("Agents.md")
 }
-

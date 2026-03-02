@@ -10,11 +10,11 @@
 //!   - events are buffered and can be replayed on reconnect
 
 use anyhow::Context as _;
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::Router;
 use axum::extract::State;
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use axum::routing::get;
-use axum::Router;
 use clap::Parser;
 use claw_core::agent::{AgentRunner, AgentRunnerConfig, EmitEventFn};
 use claw_core::agents_md::load_agents_md;
@@ -26,9 +26,9 @@ use claw_core::ws_protocol::{ClientMessage, Event, EventKind, ServerMessage};
 use futures_util::{SinkExt as _, StreamExt as _};
 use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{broadcast, mpsc};
 use tracing::Level;
 use uuid::Uuid;
@@ -141,10 +141,7 @@ impl Hub {
         // from a non-async callback (`EmitEventFn`). We keep the critical
         // section small to minimize contention.
         {
-            let mut buf = self
-                .events_buf
-                .lock()
-                .expect("events_buf mutex poisoned");
+            let mut buf = self.events_buf.lock().expect("events_buf mutex poisoned");
             buf.push_back(event.clone());
             while buf.len() > MAX_BUFFERED_EVENTS {
                 buf.pop_front();
@@ -157,10 +154,7 @@ impl Hub {
 
     /// Return all buffered events with `event_id > from_event_id`.
     async fn history_since(&self, from_event_id: u64) -> Vec<Event> {
-        let buf = self
-            .events_buf
-            .lock()
-            .expect("events_buf mutex poisoned");
+        let buf = self.events_buf.lock().expect("events_buf mutex poisoned");
         buf.iter()
             .filter(|e| e.event_id > from_event_id)
             .cloned()
@@ -171,17 +165,18 @@ impl Hub {
     async fn submit_task(&self, task_id: Uuid, task: String) -> anyhow::Result<()> {
         // Ensure idempotency: if we have already seen this task id, do not enqueue again.
         {
-            let mut seen = self
-                .seen_tasks
-                .lock()
-                .expect("seen_tasks mutex poisoned");
+            let mut seen = self.seen_tasks.lock().expect("seen_tasks mutex poisoned");
             if !seen.insert(task_id) {
                 return Ok(());
             }
         }
 
         // Emit an event immediately so clients see that the task is queued.
-        self.publish(EventKind::Log, task_id, "Task accepted and queued.".to_string());
+        self.publish(
+            EventKind::Log,
+            task_id,
+            "Task accepted and queued.".to_string(),
+        );
 
         // Enqueue.
         self.task_tx
@@ -337,8 +332,7 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_max_level(Level::INFO)
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 

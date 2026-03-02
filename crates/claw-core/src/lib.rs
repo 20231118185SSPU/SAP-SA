@@ -9,11 +9,10 @@
 
 // We keep the crate as "small building blocks" so the daemon/CLI stay thin.
 
-pub mod agents_md;
 pub mod agent;
+pub mod agents_md;
 pub mod config;
 pub mod openai;
 pub mod skills;
 pub mod tools;
 pub mod ws_protocol;
-
