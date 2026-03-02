@@ -1,0 +1,47 @@
+# Claw configuration (example).
+#
+# Copy this file to `claw.toml` (which is gitignored) and fill secrets.
+
+[llm]
+# OpenAI-compatible base URL.
+# Example from the request: "https://withapi.mosoft.icu/v1"
+base_url = "https://withapi.mosoft.icu/v1"
+
+# OpenAI-compatible API key.
+# Put real key in `claw.toml` (NOT committed).
+api_key = "sk-REPLACE_ME"
+
+# Model name (OpenAI-compatible).
+# Example from the request: "gpt-5.2"
+model = "gpt-5.2"
+
+# Some providers accept `role: system`, others only accept `role: developer`.
+# This option controls the role-name we use for the "system" instructions.
+# - Empty / missing => defaults to "system"
+# - Example for this provider/channel: "developer"
+system_role_name = "developer"
+
+# Safety cap: maximum reasoning / tool-call steps per task.
+max_steps = 32
+
+[server]
+# Where the daemon listens.
+bind = "127.0.0.1:8765"
+
+# WebSocket path (the daemon serves only WS for now).
+ws_path = "/ws"
+
+[workspace]
+# Workspace root where the agent is allowed to operate.
+# (We keep it explicit so the agent doesn't accidentally operate elsewhere.)
+root_dir = "."
+
+# Instruction file the agent loads and injects into the prompt.
+agents_md = "Agents.md"
+
+[skills]
+# Skill search directories; each skill is a directory containing a `SKILL.md`.
+#
+# `~` is expanded to the user home directory by Claw.
+dirs = ["~/.codex/skills", "~/.agents/skills"]
+

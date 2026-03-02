@@ -1,0 +1,10 @@
+[workspace]
+# Workspace root for the minimal "Claw" agent + CLI.
+#
+# We keep the code in a workspace so the daemon (`claw-agentd`) and the CLI
+# (`claw-cli`) can share types and logic via the `claw-core` crate.
+members = ["crates/claw-core", "crates/claw-agentd", "crates/claw-cli"]
+
+# Cargo resolver v2 is broadly compatible and works well for our dependency set.
+resolver = "2"
+

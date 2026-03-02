@@ -1,0 +1,13 @@
+# Rust build output.
+/target/
+
+# Editor / OS noise.
+.DS_Store
+Thumbs.db
+
+# Local configuration containing secrets (API keys, etc.).
+claw.toml
+
+# Optional local logs.
+*.log
+
