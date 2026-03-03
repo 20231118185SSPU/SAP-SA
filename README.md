@@ -37,10 +37,9 @@ cargo run -p claw-cli
 
 ## Build (size vs speed)
 
-This repo defines two optimized build profiles:
+This repo tunes the standard `--release` profile for both size and speed:
 
-- Fast runtime (default release): `cargo build --release`
-- Smallest binaries: `cargo build --profile release-small`
+- Build: `cargo build --release`
 
 ## Docs
 

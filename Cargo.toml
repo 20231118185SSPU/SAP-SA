@@ -15,12 +15,12 @@ resolver = "2"
 # The user requested: "设置构建为最小体积和最快性能" (minimal size and best performance).
 #
 # Rust/Cargo has an inherent trade-off between "smallest size" and "fastest
-# runtime" because the best size optimizations use `opt-level = "z"`, while the
-# best speed optimizations use `opt-level = 3`.
+# runtime". The user explicitly asked for **one** build configuration that aims
+# for **both** minimal size *and* best runtime performance.
 #
-# To make this **verifiable** and easy to choose, we provide:
-# - `--release`         => fastest runtime (plus a few size-friendly knobs)
-# - `--profile release-small` => smallest binaries (may be slower)
+# We therefore tune the standard `--release` profile to be:
+# - as fast as possible at runtime (`opt-level = 3`, `lto = "fat"`)
+# - as small as practical (`strip = "symbols"`, `panic = "abort"`)
 #
 # Notes:
 # - `lto = "fat"` + `codegen-units = 1` usually improves runtime performance and
@@ -38,8 +38,3 @@ codegen-units = 1
 panic = "abort"
 strip = "symbols"
 debug = 0
-
-[profile.release-small]
-# Smallest practical binaries.
-inherits = "release"
-opt-level = "z"
