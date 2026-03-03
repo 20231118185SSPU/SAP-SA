@@ -8,3 +8,38 @@ members = ["crates/claw-core", "crates/claw-agentd", "crates/claw-cli"]
 # Cargo resolver v2 is broadly compatible and works well for our dependency set.
 resolver = "2"
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Build profiles
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# The user requested: "设置构建为最小体积和最快性能" (minimal size and best performance).
+#
+# Rust/Cargo has an inherent trade-off between "smallest size" and "fastest
+# runtime" because the best size optimizations use `opt-level = "z"`, while the
+# best speed optimizations use `opt-level = 3`.
+#
+# To make this **verifiable** and easy to choose, we provide:
+# - `--release`         => fastest runtime (plus a few size-friendly knobs)
+# - `--profile release-small` => smallest binaries (may be slower)
+#
+# Notes:
+# - `lto = "fat"` + `codegen-units = 1` usually improves runtime performance and
+#   reduces size, at the cost of longer build times.
+# - `panic = "abort"` reduces binary size (no unwinding tables). It also makes
+#   panics abort the process, which is acceptable for this minimal daemon/CLI.
+# - `strip = "symbols"` removes symbol tables from the final binary. This
+#   reduces size and is applied by `rustc` (no external `strip` tool needed).
+
+[profile.release]
+# Fast runtime performance.
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+debug = 0
+
+[profile.release-small]
+# Smallest practical binaries.
+inherits = "release"
+opt-level = "z"

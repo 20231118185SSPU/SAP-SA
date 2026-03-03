@@ -35,6 +35,13 @@ cargo run -p claw-agentd
 cargo run -p claw-cli
 ```
 
+## Build (size vs speed)
+
+This repo defines two optimized build profiles:
+
+- Fast runtime (default release): `cargo build --release`
+- Smallest binaries: `cargo build --profile release-small`
+
 ## Docs
 
 Development docs live in `./docs/development/`.

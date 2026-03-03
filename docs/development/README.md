@@ -25,6 +25,23 @@ cargo run -p claw-agentd
 cargo run -p claw-cli
 ```
 
+## Build profiles (size vs speed)
+
+This repo defines two optimized Cargo profiles in `Cargo.toml`:
+
+- `--release`: fastest runtime performance (also strips symbols)
+- `--profile release-small`: smaller binaries (may be slower)
+
+Examples:
+
+```bash
+# Fast runtime
+cargo build --release
+
+# Small binaries
+cargo build --profile release-small
+```
+
 Interactive commands:
 
 - Type text and press Enter → interrupts current task (if any) and submits a new task
@@ -75,6 +92,7 @@ Event fields:
 - 0.2.1: CLI always requests WS history on connect (prevents missing `final` after disconnect).
 - 0.2.2: TUI ignores key release events (fixes double-typed input on some terminals).
 - 0.2.3: TUI cursor uses Unicode display width (fixes cursor drift for CJK/emoji input).
+- 0.2.4: add optimized build profiles (`--release` / `--profile release-small`).
 
 ## Traceability (extracted from `../zeroclaw`)
 
