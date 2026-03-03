@@ -5,8 +5,11 @@
 This folder documents the minimal Rust agent in `../`:
 
 - `crates/claw-core`: core logic (config, skill loading, OpenAI-compatible client, agent loop)
-- `crates/claw-agentd`: daemon that runs the agent loop and exposes WebSocket
-- `crates/claw-cli`: CLI frontend that talks to the daemon via WebSocket
+- `crates/claw`: backend daemon that runs the agent loop and exposes WebSocket
+
+The terminal frontend is a separate project located at:
+
+- `../claw-cli`
 
 ## Running
 
@@ -16,13 +19,14 @@ This folder documents the minimal Rust agent in `../`:
 3. Start the daemon:
 
 ```bash
-cargo run -p claw-agentd
+cargo run -p claw --release
 ```
 
-4. Start the interactive CLI (bottom input box):
+4. Start the interactive CLI (bottom input box) in the separate CLI project:
 
 ```bash
-cargo run -p claw-cli
+cd ../claw-cli
+cargo run --release
 ```
 
 ## Build (size + speed)
@@ -36,7 +40,7 @@ Example:
 cargo build --release
 ```
 
-Interactive commands:
+Interactive commands (CLI):
 
 - Type text and press Enter → interrupts current task (if any) and submits a new task
 - `/stop` → interrupt current task
@@ -45,7 +49,8 @@ Interactive commands:
 One-shot mode (for scripting):
 
 ```bash
-cargo run -p claw-cli -- run "用一句话解释这个项目的结构"
+cd ../claw-cli
+cargo run --release -- run "用一句话解释这个项目的结构"
 ```
 
 ## WebSocket API (v0)
@@ -88,6 +93,7 @@ Event fields:
 - 0.2.3: TUI cursor uses Unicode display width (fixes cursor drift for CJK/emoji input).
 - 0.2.4: add optimized build profiles (`--release` / `--profile release-small`).
 - 0.2.5: keep one tuned `--release` profile (size + speed).
+- 0.3.0: rename backend daemon to `claw`, split `claw-cli` into `../claw-cli`.
 
 ## Traceability (extracted from `../zeroclaw`)
 

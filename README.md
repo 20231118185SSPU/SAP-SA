@@ -26,13 +26,16 @@
 3. Start the agent daemon (WebSocket server):
 
 ```bash
-cargo run -p claw-agentd
+cargo run -p claw --release
 ```
 
-4. In another terminal, start the interactive CLI (bottom input box):
+4. In another terminal, start the interactive CLI (bottom input box).
+
+   The CLI is a **separate project** located at `../claw-cli`:
 
 ```bash
-cargo run -p claw-cli
+cd ../claw-cli
+cargo run --release
 ```
 
 ## Build (size vs speed)

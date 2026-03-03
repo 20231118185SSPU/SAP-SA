@@ -1,9 +1,14 @@
 [workspace]
-# Workspace root for the minimal "Claw" agent + CLI.
+# Workspace root for the minimal "Claw" backend agent.
 #
-# We keep the code in a workspace so the daemon (`claw-agentd`) and the CLI
-# (`claw-cli`) can share types and logic via the `claw-core` crate.
-members = ["crates/claw-core", "crates/claw-agentd", "crates/claw-cli"]
+# We keep the code in a workspace so:
+# - the backend binary (`claw`) can depend on `claw-core`
+# - core logic stays separated and testable
+#
+# Note:
+# - The terminal frontend (`claw-cli`) is a **separate project** located at
+#   `../claw-cli` (sibling directory), per user request.
+members = ["crates/claw-core", "crates/claw"]
 
 # Cargo resolver v2 is broadly compatible and works well for our dependency set.
 resolver = "2"
@@ -26,7 +31,7 @@ resolver = "2"
 # - `lto = "fat"` + `codegen-units = 1` usually improves runtime performance and
 #   reduces size, at the cost of longer build times.
 # - `panic = "abort"` reduces binary size (no unwinding tables). It also makes
-#   panics abort the process, which is acceptable for this minimal daemon/CLI.
+#   panics abort the process, which is acceptable for this minimal backend daemon.
 # - `strip = "symbols"` removes symbol tables from the final binary. This
 #   reduces size and is applied by `rustc` (no external `strip` tool needed).
 

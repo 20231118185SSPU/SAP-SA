@@ -1,4 +1,4 @@
-//! `claw-agentd` — the minimal Claw agent daemon.
+//! `claw` — the minimal Claw backend agent daemon.
 //!
 //! Responsibilities:
 //! - Load `claw.toml` (TOML config).
@@ -8,6 +8,9 @@
 //! - Ensure that **client disconnects do not stop the agent**:
 //!   - tasks are queued and processed independently of WS connections
 //!   - events are buffered and can be replayed on reconnect
+//!
+//! Frontend note:
+//! - The CLI frontend is a separate project located at `../claw-cli`.
 
 use anyhow::Context as _;
 use axum::Router;

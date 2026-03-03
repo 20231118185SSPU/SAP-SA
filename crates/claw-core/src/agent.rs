@@ -8,7 +8,7 @@
 //! - We repeat until the model produces a final answer (no tool calls) or
 //!   until `max_steps` is reached.
 //!
-//! The daemon (`claw-agentd`) owns task queues, event IDs, and WS connections.
+//! The backend daemon (`claw`) owns task queues, event IDs, and WS connections.
 //! This module is deliberately "pure core": it only needs an event callback.
 
 use crate::agents_md::{AgentsMd, format_agents_md_block};
