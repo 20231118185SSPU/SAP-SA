@@ -1,4 +1,4 @@
-//! Tool implementations for the minimal Claw agent.
+//! Tool implementations for the StudyAdministrator (SA) agent.
 //!
 //! The agent loop relies on **OpenAI tool calling**:
 //! - The model emits `tool_calls` with `function.name` + JSON arguments string.

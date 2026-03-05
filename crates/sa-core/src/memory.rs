@@ -1,4 +1,4 @@
-//! Long-term memory storage for the minimal Claw agent.
+//! Long-term memory storage for the StudyAdministrator (SA) agent.
 //!
 //! The user report includes:
 //! - "没有长期记忆" ("no long-term memory")
@@ -20,7 +20,13 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 /// Default directory (under the workspace root) where we store agent state.
-pub const DEFAULT_STATE_DIR: &str = ".claw";
+pub const DEFAULT_STATE_DIR: &str = ".sa";
+
+/// Legacy directory used by the previous `claw` branding.
+///
+/// We keep this constant so existing users do not silently lose memory after
+/// the rename to SA.
+pub const LEGACY_STATE_DIR: &str = ".claw";
 
 /// Default memory filename (under `DEFAULT_STATE_DIR`).
 pub const DEFAULT_MEMORY_FILE: &str = "memory.jsonl";
@@ -154,9 +160,25 @@ If something important is missing, ask the user or inspect files with tools.\n\n
 
 /// Build the default memory path under a workspace root.
 pub fn default_memory_path(workspace_root: &Path) -> PathBuf {
-    workspace_root
+    let preferred = workspace_root
         .join(DEFAULT_STATE_DIR)
-        .join(DEFAULT_MEMORY_FILE)
+        .join(DEFAULT_MEMORY_FILE);
+
+    // Backward-compatibility: if the new SA path does not exist yet but the old
+    // Claw-branded path exists, keep reading/writing the legacy file so users
+    // retain their memory history across the rename.
+    if preferred.exists() {
+        return preferred;
+    }
+
+    let legacy = workspace_root
+        .join(LEGACY_STATE_DIR)
+        .join(DEFAULT_MEMORY_FILE);
+    if legacy.exists() {
+        return legacy;
+    }
+
+    preferred
 }
 
 /// Compact multi-line text into a single line (for prompt readability).

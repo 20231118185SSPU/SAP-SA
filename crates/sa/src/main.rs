@@ -1,7 +1,7 @@
-//! `claw` — the minimal Claw backend agent daemon.
+//! `sa` — the StudyAdministrator (SA) backend agent daemon.
 //!
 //! Responsibilities:
-//! - Load `claw.toml` (TOML config).
+//! - Load `sa.toml` (TOML config).
 //! - Read `Agents.md` and discover skills (`SKILL.md`).
 //! - Run an autonomous agent loop in the background (OpenAI tool calling).
 //! - Expose a **WebSocket** interface for a CLI frontend.
@@ -10,7 +10,7 @@
 //!   - events are buffered and can be replayed on reconnect
 //!
 //! Frontend note:
-//! - The CLI frontend is a separate project located at `../claw-cli`.
+//! - The CLI frontend is a separate project located at `../sa-cli`.
 
 use anyhow::Context as _;
 use axum::Router;
@@ -19,16 +19,16 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use clap::Parser;
-use claw_core::agent::{AgentRunner, AgentRunnerConfig, EmitEventFn};
-use claw_core::agents_md::{extract_markdown_file_references, load_agents_md};
-use claw_core::cancel::{CancelHandle, cancel_pair};
-use claw_core::config::load_config_from_file;
-use claw_core::memory::{MemoryEntry, MemoryStore, default_memory_path};
-use claw_core::openai::OpenAiClient;
-use claw_core::skills::SkillRegistry;
-use claw_core::tools::{ToolContext, ToolExecutor};
-use claw_core::ws_protocol::{ClientMessage, Event, EventKind, ServerMessage};
 use futures_util::{SinkExt as _, StreamExt as _};
+use sa_core::agent::{AgentRunner, AgentRunnerConfig, EmitEventFn};
+use sa_core::agents_md::{extract_markdown_file_references, load_agents_md};
+use sa_core::cancel::{CancelHandle, cancel_pair};
+use sa_core::config::load_config_from_file;
+use sa_core::memory::{MemoryEntry, MemoryStore, default_memory_path};
+use sa_core::openai::OpenAiClient;
+use sa_core::skills::SkillRegistry;
+use sa_core::tools::{ToolContext, ToolExecutor};
+use sa_core::ws_protocol::{ClientMessage, Event, EventKind, ServerMessage};
 use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -47,8 +47,8 @@ const MAX_BUFFERED_EVENTS: usize = 10_000;
 #[derive(clap::Parser, Debug)]
 #[command(version, about)]
 struct Args {
-    /// Path to `claw.toml`.
-    #[arg(long, default_value = "claw.toml")]
+    /// Path to `sa.toml`.
+    #[arg(long, default_value = "sa.toml")]
     config: PathBuf,
 }
 
@@ -300,7 +300,7 @@ impl Hub {
                         req.task_id,
                         format!("Failed to read Agents.md: {err}"),
                     );
-                    claw_core::agents_md::AgentsMd {
+                    sa_core::agents_md::AgentsMd {
                         path: self.agents_md_path.clone(),
                         content: String::new(),
                         found: false,
@@ -394,7 +394,7 @@ impl Hub {
     /// Preload workspace files referenced by `Agents.md` and return a prompt block.
     async fn preload_agents_md_references(
         &self,
-        agents_md: &claw_core::agents_md::AgentsMd,
+        agents_md: &sa_core::agents_md::AgentsMd,
     ) -> String {
         // If Agents.md is missing or empty, we return a short block for traceability.
         if !agents_md.found || agents_md.content.trim().is_empty() {

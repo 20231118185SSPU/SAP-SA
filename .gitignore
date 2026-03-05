@@ -6,6 +6,7 @@
 Thumbs.db
 
 # Local configuration containing secrets (API keys, etc.).
+sa.toml
 claw.toml
 
 # Local agent instructions (workspace-specific; not committed).
@@ -20,6 +21,7 @@ MEMORY.md
 memory/
 
 # Local agent state (persistent memory, caches, etc.).
+.sa/
 .claw/
 
 # Optional local logs.

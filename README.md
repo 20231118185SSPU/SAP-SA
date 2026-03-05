@@ -1,20 +1,20 @@
-# Claw (minimal agent)
+# StudyAdministrator (SA)
 
-`claw` is a **minimal, runnable, autonomous Rust agent** extracted/simplified from the ideas in
-`../zeroclaw`:
+`SA` is a **minimal, runnable, autonomous learning committee agent** extracted
+and simplified from the ideas in `../zeroclaw`:
 
 - Calls an **OpenAI-compatible** `POST /v1/chat/completions` API.
 - Reads `Agents.md` from the workspace as the base instruction prompt.
 - Discovers and loads `SKILL.md`-based skills (Codex/Agents skills format).
 - Runs a **tool-calling loop** (shell/file ops) to act autonomously.
 - Exposes a **WebSocket** server so a CLI can connect/disconnect without stopping the agent.
-- Persists **long-term memory** to `.claw/memory.jsonl` (gitignored).
+- Persists **long-term memory** to `.sa/memory.jsonl` (gitignored).
 
 ## Quick start
 
 1. Create a local config:
 
-   - Copy `claw.example.toml` to `claw.toml`
+   - Copy `sa.example.toml` to `sa.toml`
    - Fill in `llm.api_key`
 
 2. (Optional but recommended) Create a local `Agents.md` in this folder.
@@ -26,15 +26,15 @@
 3. Start the agent daemon (WebSocket server):
 
 ```bash
-cargo run -p claw --release
+cargo run -p sa --release
 ```
 
 4. In another terminal, start the interactive CLI (bottom input box).
 
-   The CLI is a **separate project** located at `../claw-cli`:
+   The CLI is a **separate project** located at `../sa-cli`:
 
 ```bash
-cd ../claw-cli
+cd ../sa-cli
 cargo run --release
 ```
 

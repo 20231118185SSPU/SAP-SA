@@ -1,4 +1,4 @@
-//! Configuration loading for Claw.
+//! Configuration loading for StudyAdministrator (SA).
 //!
 //! The user request explicitly asked for:
 //! - A TOML configuration file.
@@ -13,7 +13,7 @@ use anyhow::Context as _;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
-/// Root configuration object (maps to the full `claw.toml`).
+/// Root configuration object (maps to the full `sa.toml`).
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     /// LLM/provider configuration (`[llm]`).
@@ -143,11 +143,11 @@ impl SkillsConfig {
     }
 }
 
-/// Load and parse `claw.toml`.
+/// Load and parse `sa.toml`.
 ///
 /// We deliberately load from an explicit path so:
 /// - The daemon and CLI can share the same config loading logic.
-/// - The caller can choose a project-local `claw.toml`.
+/// - The caller can choose a project-local `sa.toml`.
 pub fn load_config_from_file(path: &Path) -> anyhow::Result<Config> {
     // Read the file first so parse errors have a stable "source of truth".
     let raw = std::fs::read_to_string(path)

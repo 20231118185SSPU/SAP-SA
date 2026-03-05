@@ -1,4 +1,4 @@
-//! `claw-core` is the shared implementation of the minimal Claw agent.
+//! `sa-core` is the shared implementation of the StudyAdministrator (SA) agent.
 //!
 //! Goals (from the user request):
 //! - Call an **OpenAI-compatible** API endpoint.

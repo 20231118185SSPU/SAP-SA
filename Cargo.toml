@@ -1,14 +1,14 @@
 [workspace]
-# Workspace root for the minimal "Claw" backend agent.
+# Workspace root for the minimal "StudyAdministrator (SA)" backend agent.
 #
 # We keep the code in a workspace so:
-# - the backend binary (`claw`) can depend on `claw-core`
+# - the backend binary (`sa`) can depend on `sa-core`
 # - core logic stays separated and testable
 #
 # Note:
-# - The terminal frontend (`claw-cli`) is a **separate project** located at
-#   `../claw-cli` (sibling directory), per user request.
-members = ["crates/claw-core", "crates/claw"]
+# - The terminal frontend (`sa-cli`) is a **separate project** located at
+#   `../sa-cli` (sibling directory), per user request.
+members = ["crates/sa-core", "crates/sa"]
 
 # Cargo resolver v2 is broadly compatible and works well for our dependency set.
 resolver = "2"

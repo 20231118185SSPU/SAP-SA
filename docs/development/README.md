@@ -1,31 +1,31 @@
-# Development documentation (Claw)
+# Development documentation (SA)
 
 ## Project overview
 
-This folder documents the minimal Rust agent in `../`:
+This folder documents the StudyAdministrator (SA) backend in `../`:
 
-- `crates/claw-core`: core logic (config, skill loading, OpenAI-compatible client, agent loop)
-- `crates/claw`: backend daemon that runs the agent loop and exposes WebSocket
+- `crates/sa-core`: core logic (config, skill loading, OpenAI-compatible client, agent loop)
+- `crates/sa`: backend daemon that runs the agent loop and exposes WebSocket
 
 The terminal frontend is a separate project located at:
 
-- `../claw-cli`
+- `../sa-cli`
 
 ## Running
 
-1. Create `claw.toml` from `claw.example.toml`.
+1. Create `sa.toml` from `sa.example.toml`.
 2. (Optional) Create a local `Agents.md` (gitignored). If it references files in backticks
    (e.g. `SOUL.md`, `USER.md`), the daemon will preload them into the prompt.
 3. Start the daemon:
 
 ```bash
-cargo run -p claw --release
+cargo run -p sa --release
 ```
 
 4. Start the interactive CLI (bottom input box) in the separate CLI project:
 
 ```bash
-cd ../claw-cli
+cd ../sa-cli
 cargo run --release
 ```
 
@@ -49,7 +49,7 @@ Interactive commands (CLI):
 One-shot mode (for scripting):
 
 ```bash
-cd ../claw-cli
+cd ../sa-cli
 cargo run --release -- run "用一句话解释这个项目的结构"
 ```
 
@@ -82,7 +82,7 @@ Event fields:
 - This is intentionally minimal: no authentication on the WebSocket server.
 - The agent toolset is minimal (shell + basic file ops); expand as needed.
 - Streaming token output is not implemented; events are per-step.
-- Long-term memory is persisted to `.claw/memory.jsonl` (gitignored).
+- Long-term memory is persisted to `.sa/memory.jsonl` (gitignored).
 
 ## Changelog
 
@@ -93,7 +93,8 @@ Event fields:
 - 0.2.3: TUI cursor uses Unicode display width (fixes cursor drift for CJK/emoji input).
 - 0.2.4: add optimized build profiles (`--release` / `--profile release-small`).
 - 0.2.5: keep one tuned `--release` profile (size + speed).
-- 0.3.0: rename backend daemon to `claw`, split `claw-cli` into `../claw-cli`.
+- 0.3.0: split the backend daemon and CLI into separate projects.
+- 0.4.0: rename the backend to StudyAdministrator (SA), rename binaries/config to `sa`.
 
 ## Traceability (extracted from `../zeroclaw`)
 

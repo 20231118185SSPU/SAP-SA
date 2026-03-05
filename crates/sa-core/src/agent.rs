@@ -1,6 +1,6 @@
 //! Minimal autonomous agent loop (tool-calling).
 //!
-//! This is the "heart" of the minimal Claw agent extracted from the large
+//! This is the "heart" of the StudyAdministrator (SA) agent extracted from the large
 //! `zeroclaw` codebase:
 //! - We call an OpenAI-compatible Chat Completions endpoint.
 //! - We provide tool definitions so the model can request actions.
@@ -8,7 +8,7 @@
 //! - We repeat until the model produces a final answer (no tool calls) or
 //!   until `max_steps` is reached.
 //!
-//! The backend daemon (`claw`) owns task queues, event IDs, and WS connections.
+//! The backend daemon (`sa`) owns task queues, event IDs, and WS connections.
 //! This module is deliberately "pure core": it only needs an event callback.
 
 use crate::agents_md::{AgentsMd, format_agents_md_block};
@@ -313,9 +313,10 @@ impl AgentRunner {
     ) -> String {
         // Section 1: agents instructions.
         let mut out = String::new();
-        out.push_str("# Claw minimal agent instructions\n\n");
+        out.push_str("# StudyAdministrator (SA) instructions\n\n");
         out.push_str(
-            "You are an autonomous software agent running locally with tool access.\n\
+            "You are StudyAdministrator (SA), an autonomous learning committee agent running locally with tool access.\n\
+Your responsibilities are to help organize study work, maintain project discipline, and act in a traceable, verifiable, explainable way.\n\
 Your goals are to be **traceable**, **verifiable**, and **explainable**:\n\
 - Prefer concrete commands and file edits over vague descriptions.\n\
 - When unsure, investigate using tools instead of guessing.\n\

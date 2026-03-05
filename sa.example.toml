@@ -1,6 +1,6 @@
-# Claw configuration (example).
+# StudyAdministrator (SA) configuration example.
 #
-# Copy this file to `claw.toml` (which is gitignored) and fill secrets.
+# Copy this file to `sa.toml` (which is gitignored) and fill secrets.
 
 [llm]
 # OpenAI-compatible base URL.
@@ -8,7 +8,7 @@
 base_url = "https://withapi.mosoft.icu/v1"
 
 # OpenAI-compatible API key.
-# Put real key in `claw.toml` (NOT committed).
+# Put real key in `sa.toml` (NOT committed).
 api_key = "sk-REPLACE_ME"
 
 # Model name (OpenAI-compatible).
@@ -42,6 +42,5 @@ agents_md = "Agents.md"
 [skills]
 # Skill search directories; each skill is a directory containing a `SKILL.md`.
 #
-# `~` is expanded to the user home directory by Claw.
+# `~` is expanded to the user home directory by SA.
 dirs = ["~/.codex/skills", "~/.agents/skills"]
-
