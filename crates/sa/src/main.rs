@@ -27,14 +27,19 @@ use sa_core::config::load_config_from_file;
 use sa_core::memory::{MemoryEntry, MemoryStore, default_memory_path};
 use sa_core::openai::OpenAiClient;
 use sa_core::skills::SkillRegistry;
-use sa_core::tools::{ToolContext, ToolExecutor};
-use sa_core::ws_protocol::{ClientMessage, Event, EventKind, ServerMessage};
+use sa_core::tools::{
+    AskQuestionFn, AskRequest, MAX_SUBAGENT_DEPTH, RunSubAgentFn, SendMessageFn, SubAgentRequest,
+    ToolContext, ToolExecutor, ToolRuntime,
+};
+use sa_core::ws_protocol::{
+    ClientMessage, Event, EventKind, QuestionMode, ServerMessage, UserQuestion, UserQuestionAnswer,
+};
 use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::Level;
 use uuid::Uuid;
 
@@ -73,6 +78,15 @@ struct CurrentTask {
     cancel: CancelHandle,
 }
 
+/// One question currently waiting for a user answer.
+#[derive(Debug)]
+struct PendingQuestionEntry {
+    /// Structured question visible to clients.
+    question: UserQuestion,
+    /// One-shot channel used to resume the blocked `Ask` tool.
+    answer_tx: oneshot::Sender<UserQuestionAnswer>,
+}
+
 /// Shared daemon state.
 ///
 /// This object is designed so:
@@ -83,8 +97,8 @@ struct Hub {
     /// Task queue sender (worker loop receives from this).
     task_tx: mpsc::Sender<TaskRequest>,
 
-    /// Broadcast channel for events (WS sessions subscribe).
-    events_tx: broadcast::Sender<Event>,
+    /// Broadcast channel for live server messages (events + questions).
+    events_tx: broadcast::Sender<ServerMessage>,
 
     /// In-memory event buffer for reconnect/history.
     events_buf: Mutex<VecDeque<Event>>,
@@ -97,6 +111,9 @@ struct Hub {
 
     /// Currently running task (if any), so we can cancel it.
     current_task: Mutex<Option<CurrentTask>>,
+
+    /// Questions waiting for a user answer.
+    pending_questions: Mutex<Vec<PendingQuestionEntry>>,
 
     /// Context used for safe path resolution when preloading files.
     preload_ctx: ToolContext,
@@ -129,7 +146,7 @@ impl Hub {
 
         // Broadcast event channel. Capacity controls how many events a slow
         // subscriber can lag behind before it gets a `Lagged` error.
-        let (events_tx, _) = broadcast::channel::<Event>(1024);
+        let (events_tx, _) = broadcast::channel::<ServerMessage>(1024);
 
         // Build hub.
         let hub = Arc::new(Self {
@@ -139,6 +156,7 @@ impl Hub {
             next_event_id: AtomicU64::new(0),
             seen_tasks: Mutex::new(HashSet::new()),
             current_task: Mutex::new(None),
+            pending_questions: Mutex::new(Vec::new()),
             preload_ctx,
             memory: Mutex::new(memory),
             runner,
@@ -188,7 +206,12 @@ impl Hub {
         }
 
         // Broadcast (ignore errors if no receivers).
-        let _ = self.events_tx.send(event);
+        let _ = self.events_tx.send(ServerMessage::Event { event });
+    }
+
+    /// Broadcast a non-history server message to all connected clients.
+    fn broadcast_server_message(&self, msg: ServerMessage) {
+        let _ = self.events_tx.send(msg);
     }
 
     /// Request interruption (cancellation) of a running task.
@@ -240,6 +263,50 @@ impl Hub {
             .collect()
     }
 
+    /// Snapshot the currently pending questions for reconnecting clients.
+    fn pending_questions_snapshot(&self) -> Vec<UserQuestion> {
+        let pending = self
+            .pending_questions
+            .lock()
+            .expect("pending_questions mutex poisoned");
+        pending.iter().map(|entry| entry.question.clone()).collect()
+    }
+
+    /// Validate and deliver an answer coming from a client.
+    fn answer_question(&self, answer: UserQuestionAnswer) -> anyhow::Result<()> {
+        let mut pending = self
+            .pending_questions
+            .lock()
+            .expect("pending_questions mutex poisoned");
+
+        let Some(index) = pending
+            .iter()
+            .position(|entry| entry.question.question_id == answer.question_id)
+        else {
+            anyhow::bail!(
+                "Question not found or already resolved: {}",
+                answer.question_id
+            );
+        };
+
+        validate_user_answer(&pending[index].question, &answer)?;
+
+        let PendingQuestionEntry {
+            question,
+            answer_tx,
+        } = pending.remove(index);
+
+        if answer_tx.send(answer).is_err() {
+            anyhow::bail!("Question waiter dropped before receiving the answer");
+        }
+
+        self.broadcast_server_message(ServerMessage::QuestionResolved {
+            question_id: question.question_id,
+        });
+
+        Ok(())
+    }
+
     /// Submit a task to the queue (idempotent).
     async fn submit_task(&self, task_id: Uuid, task: String) -> anyhow::Result<()> {
         // Ensure idempotency: if we have already seen this task id, do not enqueue again.
@@ -264,6 +331,214 @@ impl Hub {
             .context("Failed to enqueue task")?;
 
         Ok(())
+    }
+
+    /// Ask the user a structured question and wait until an answer arrives.
+    async fn ask_user(
+        &self,
+        task_id: Uuid,
+        request: AskRequest,
+        cancel: &sa_core::cancel::CancelToken,
+    ) -> anyhow::Result<UserQuestionAnswer> {
+        request.validate()?;
+
+        let question = UserQuestion {
+            question_id: Uuid::new_v4(),
+            task_id,
+            prompt: request.prompt,
+            mode: request.mode,
+            options: request.options,
+            allow_free_text: request.allow_free_text,
+        };
+
+        let (answer_tx, answer_rx) = oneshot::channel::<UserQuestionAnswer>();
+        {
+            let mut pending = self
+                .pending_questions
+                .lock()
+                .expect("pending_questions mutex poisoned");
+            pending.push(PendingQuestionEntry {
+                question: question.clone(),
+                answer_tx,
+            });
+        }
+
+        self.broadcast_server_message(ServerMessage::Question {
+            question: question.clone(),
+        });
+
+        let answer = tokio::select! {
+            _ = cancel.cancelled() => {
+                let mut pending = self
+                    .pending_questions
+                    .lock()
+                    .expect("pending_questions mutex poisoned");
+                if let Some(index) = pending
+                    .iter()
+                    .position(|entry| entry.question.question_id == question.question_id)
+                {
+                    pending.remove(index);
+                    self.broadcast_server_message(ServerMessage::QuestionResolved {
+                        question_id: question.question_id,
+                    });
+                }
+                anyhow::bail!("Ask cancelled");
+            }
+            answer = answer_rx => {
+                answer.context("Ask waiter dropped before an answer arrived")?
+            }
+        };
+
+        Ok(answer)
+    }
+
+    /// Build the per-task runtime callbacks used by the tool layer.
+    fn build_tool_runtime(self: &Arc<Self>, task_id: Uuid, depth: u32) -> ToolRuntime {
+        let hub_for_send = Arc::clone(self);
+        let send_message: SendMessageFn = Arc::new(move |message: String| {
+            let hub = Arc::clone(&hub_for_send);
+            Box::pin(async move {
+                hub.publish(
+                    EventKind::Message,
+                    task_id,
+                    decorate_nested_text(depth, &message),
+                );
+                Ok(())
+            })
+        });
+
+        let hub_for_ask = Arc::clone(self);
+        let ask_question: AskQuestionFn = Arc::new(move |request: AskRequest, cancel| {
+            let hub = Arc::clone(&hub_for_ask);
+            Box::pin(async move {
+                let request = AskRequest {
+                    prompt: decorate_nested_prompt(depth, &request.prompt),
+                    ..request
+                };
+                hub.ask_user(task_id, request, &cancel).await
+            })
+        });
+
+        let hub_for_subagent = Arc::clone(self);
+        let run_subagent: RunSubAgentFn = Arc::new(move |request: SubAgentRequest, cancel| {
+            let hub = Arc::clone(&hub_for_subagent);
+            Box::pin(async move { hub.run_subagent(task_id, depth, request, cancel).await })
+        });
+
+        ToolRuntime::new(send_message, ask_question, run_subagent)
+    }
+
+    /// Run a nested sub-agent while keeping all output attached to the
+    /// top-level task event stream.
+    async fn run_subagent(
+        self: &Arc<Self>,
+        task_id: Uuid,
+        parent_depth: u32,
+        request: SubAgentRequest,
+        cancel: sa_core::cancel::CancelToken,
+    ) -> anyhow::Result<String> {
+        let depth = parent_depth.saturating_add(1);
+        if depth > MAX_SUBAGENT_DEPTH {
+            anyhow::bail!(
+                "SubAgent depth limit exceeded (requested depth={}, max={})",
+                depth,
+                MAX_SUBAGENT_DEPTH
+            );
+        }
+
+        let label = request
+            .label
+            .clone()
+            .unwrap_or_else(|| format!("subagent-depth-{depth}"));
+
+        self.publish(
+            EventKind::Log,
+            task_id,
+            format!(
+                "[subagent depth={depth} label={label}] started: {}",
+                request.task
+            ),
+        );
+
+        let agents_md = match load_agents_md(self.agents_md_path.clone()).await {
+            Ok(a) => a,
+            Err(err) => {
+                self.publish(
+                    EventKind::Error,
+                    task_id,
+                    format!("Failed to read Agents.md for subagent: {err}"),
+                );
+                sa_core::agents_md::AgentsMd {
+                    path: self.agents_md_path.clone(),
+                    content: String::new(),
+                    found: false,
+                }
+            }
+        };
+
+        let memory_block = {
+            let mem = self.memory.lock().expect("memory mutex poisoned");
+            mem.prompt_block()
+        };
+        let preload_block = self.preload_agents_md_references(&agents_md).await;
+        let extra_prompt = format!(
+            "{memory_block}\n\n{preload_block}\n\n## Parent-provided SubAgent Context\n\n- depth: {depth}\n- label: {label}\n\n```text\n{}\n```",
+            request.context.trim()
+        );
+
+        let hub_for_emit = Arc::clone(self);
+        let emit_label = label.clone();
+        let emit: EmitEventFn = Arc::new(move |kind, _ignored_task_id, message| {
+            let kind = if matches!(kind, EventKind::Final) {
+                EventKind::Log
+            } else {
+                kind
+            };
+            hub_for_emit.publish(
+                kind,
+                task_id,
+                format!(
+                    "[subagent depth={} label={}] {}",
+                    depth, emit_label, message
+                ),
+            );
+        });
+
+        let runtime = self.build_tool_runtime(task_id, depth);
+        let result = self
+            .runner
+            .run_task(
+                task_id,
+                request.task.clone(),
+                &agents_md,
+                Some(extra_prompt.as_str()),
+                runtime,
+                &cancel,
+                emit,
+            )
+            .await;
+
+        match &result {
+            Ok(final_answer) => {
+                self.publish(
+                    EventKind::Log,
+                    task_id,
+                    format!(
+                        "[subagent depth={depth} label={label}] completed: {}",
+                        final_answer.trim()
+                    ),
+                );
+            }
+            Err(err) => {
+                self.publish(
+                    EventKind::Error,
+                    task_id,
+                    format!("[subagent depth={depth} label={label}] crashed: {err}"),
+                );
+            }
+        }
+
+        result
     }
 
     /// Background worker loop that executes tasks sequentially.
@@ -323,6 +598,7 @@ impl Hub {
             let emit: EmitEventFn = Arc::new(move |kind, task_id, message| {
                 hub_for_emit.publish(kind, task_id, message);
             });
+            let runtime = self.build_tool_runtime(req.task_id, 0);
 
             // Run the agent loop.
             match self
@@ -332,6 +608,7 @@ impl Hub {
                     req.task.clone(),
                     &agents_md,
                     Some(extra_prompt.as_str()),
+                    runtime,
                     &cancel_token,
                     emit,
                 )
@@ -496,6 +773,72 @@ fn expand_date_placeholders(mut refs: Vec<String>) -> Vec<String> {
     out.into_iter().filter(|r| seen.insert(r.clone())).collect()
 }
 
+/// Decorate nested agent text so user-visible messages stay traceable.
+fn decorate_nested_text(depth: u32, text: &str) -> String {
+    if depth == 0 {
+        return text.to_string();
+    }
+
+    format!("[subagent depth={depth}] {text}")
+}
+
+/// Decorate nested agent prompts for `Ask`.
+fn decorate_nested_prompt(depth: u32, prompt: &str) -> String {
+    if depth == 0 {
+        return prompt.to_string();
+    }
+
+    format!("[subagent depth={depth}] {prompt}")
+}
+
+/// Validate a user answer against the question schema that produced it.
+fn validate_user_answer(
+    question: &UserQuestion,
+    answer: &UserQuestionAnswer,
+) -> anyhow::Result<()> {
+    let free_text = answer.free_text.as_deref().map(str::trim).unwrap_or("");
+
+    if !question.allow_free_text && !free_text.is_empty() {
+        anyhow::bail!("This question does not accept free-text input");
+    }
+
+    let mut seen_ids = HashSet::<String>::new();
+    for id in &answer.selected_option_ids {
+        if !seen_ids.insert(id.clone()) {
+            anyhow::bail!("Duplicate option id in answer: {id}");
+        }
+        if !question.options.iter().any(|option| option.id == *id) {
+            anyhow::bail!("Unknown option id in answer: {id}");
+        }
+    }
+
+    match question.mode {
+        QuestionMode::Text => {
+            if !answer.selected_option_ids.is_empty() {
+                anyhow::bail!("Text questions do not accept selected options");
+            }
+            if free_text.is_empty() {
+                anyhow::bail!("Text questions require a free-text answer");
+            }
+        }
+        QuestionMode::SingleChoice => {
+            if answer.selected_option_ids.len() > 1 {
+                anyhow::bail!("Single-choice questions accept at most one selected option");
+            }
+            if answer.selected_option_ids.is_empty() && free_text.is_empty() {
+                anyhow::bail!("Single-choice questions require one selection or free text");
+            }
+        }
+        QuestionMode::MultiChoice => {
+            if answer.selected_option_ids.is_empty() && free_text.is_empty() {
+                anyhow::bail!("Multi-choice questions require at least one selection or free text");
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// WS upgrade handler.
 async fn ws_route(ws: WebSocketUpgrade, State(hub): State<Arc<Hub>>) -> impl IntoResponse {
     ws.on_upgrade(move |socket| ws_session(socket, hub))
@@ -508,6 +851,13 @@ async fn ws_session(socket: WebSocket, hub: Arc<Hub>) {
 
     // Outbound message channel (single writer task owns `ws_tx`).
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<ServerMessage>();
+
+    // Immediately send any questions that were already pending before this
+    // client connected. This makes reconnecting clients able to continue an
+    // interrupted `Ask` interaction.
+    let _ = out_tx.send(ServerMessage::PendingQuestions {
+        questions: hub.pending_questions_snapshot(),
+    });
 
     // Writer task: serialize ServerMessage -> WS text frame.
     let writer = tokio::spawn(async move {
@@ -527,8 +877,8 @@ async fn ws_session(socket: WebSocket, hub: Arc<Hub>) {
     let forwarder = tokio::spawn(async move {
         loop {
             match events_rx.recv().await {
-                Ok(event) => {
-                    let _ = out_tx_events.send(ServerMessage::Event { event });
+                Ok(msg) => {
+                    let _ = out_tx_events.send(msg);
                 }
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
                     let _ = out_tx_events.send(ServerMessage::Error {
@@ -580,6 +930,13 @@ async fn ws_session(socket: WebSocket, hub: Arc<Hub>) {
                         //
                         // NOTE: If the task is not currently running, the hub will ignore it.
                         hub.request_interrupt(task_id);
+                    }
+                    ClientMessage::AnswerQuestion { answer } => {
+                        if let Err(err) = hub.answer_question(answer) {
+                            let _ = out_tx.send(ServerMessage::Error {
+                                message: format!("Failed to answer question: {err}"),
+                            });
+                        }
                     }
                 }
             }

@@ -16,7 +16,7 @@ use crate::cancel::CancelToken;
 use crate::openai::{ChatCompletionsRequest, ChatMessage, OpenAiClient, ToolCall};
 use crate::retry::retry_delay;
 use crate::skills::SkillRegistry;
-use crate::tools::ToolExecutor;
+use crate::tools::{ToolExecutor, ToolRuntime, ToolSession};
 use crate::ws_protocol::EventKind;
 use anyhow::Context as _;
 use std::sync::Arc;
@@ -76,6 +76,7 @@ impl AgentRunner {
         task: String,
         agents_md: &AgentsMd,
         extra_system_prompt: Option<&str>,
+        runtime: ToolRuntime,
         cancel: &CancelToken,
         emit: EmitEventFn,
     ) -> anyhow::Result<String> {
@@ -118,6 +119,12 @@ impl AgentRunner {
 
         // We pre-compute tool definitions once. This keeps requests stable.
         let tool_definitions = self.tools.tool_definitions();
+
+        // Each run gets its own session state.
+        //
+        // This is important for the `Edit` guardrail: "must `Read` before
+        // `Edit`" is enforced per agent/sub-agent session.
+        let mut tool_session = ToolSession::default();
 
         // Consecutive model-call failures. This drives the infinite retry
         // backoff schedule requested by the user.
@@ -265,7 +272,13 @@ impl AgentRunner {
                 // Execute.
                 let tool_result = match self
                     .tools
-                    .execute(&call.function.name, args_json, cancel)
+                    .execute(
+                        &mut tool_session,
+                        &runtime,
+                        &call.function.name,
+                        args_json,
+                        cancel,
+                    )
                     .await
                 {
                     Ok(output) => output,
@@ -331,7 +344,7 @@ Your goals are to be **traceable**, **verifiable**, and **explainable**:\n\
         out.push_str("## Skills (metadata)\n\n");
         out.push_str(
             "Skills are optional instruction bundles stored as directories containing `SKILL.md`.\n\
-Use `list_skills` to discover them and `load_skill` to load details on demand.\n\n",
+Use `Skill` to load details on demand when one of the listed skills is relevant.\n\n",
         );
 
         for item in self.skills.list() {
@@ -345,12 +358,22 @@ Use `list_skills` to discover them and `load_skill` to load details on demand.\n
         out.push_str("\n## Tools\n\n");
         out.push_str(
             "Available tools:\n\
-- `shell_command`: run PowerShell commands inside the workspace.\n\
-- `read_file`, `write_file`, `list_dir`: basic file operations.\n\
-- `list_skills`, `load_skill`: skill discovery/loading.\n\n\
+- `Read`: read a UTF-8 text file inside the workspace.\n\
+- `Write`: create a new UTF-8 text file; it refuses to overwrite an existing file.\n\
+- `Edit`: edit an existing file, but only after that same file has been `Read` in the current agent session.\n\
+- `Bash`: run a command through Git Bash (`bash -lc`) inside the workspace.\n\
+- `Send`: send a user-facing message without waiting for a reply.\n\
+- `Ask`: ask the user a structured question and wait for an answer.\n\
+- `Skill`: load the full `SKILL.md` for a named skill from the list above.\n\
+- `SubAgent`: delegate a focused sub-task to a nested agent; provide the child with explicit context.\n\n\
 Rules:\n\
 - Only operate inside the configured workspace root.\n\
-- Prefer small, incremental changes with verification steps.\n",
+- Prefer small, incremental changes with verification steps.\n\
+- Use `Read` before `Edit`; if `Edit` succeeds and you need another edit, `Read` the file again first.\n\
+- Use `Write` only for brand-new files. If a file already exists, inspect it with `Read` and modify it with `Edit`.\n\
+- Use `Ask` when the user must choose among options or provide missing input.\n\
+- Use `Send` for proactive status updates or findings that do not require blocking for an answer.\n\
+- Use `SubAgent` only when a focused delegated task is clearly narrower than the parent task.\n",
         );
 
         // Additional context injected by the daemon (memory, preloaded files, etc.).

@@ -43,6 +43,7 @@ cargo build --release
 Interactive commands (CLI):
 
 - Type text and press Enter → interrupts current task (if any) and submits a new task
+- If a structured question is pending, Enter answers that question instead of creating a new task
 - `/stop` → interrupt current task
 - `/exit` → quit CLI
 
@@ -62,25 +63,49 @@ Client → Server:
 - `{"type":"submit","task_id":"<optional uuid>","task":"..."}`
 - `{"type":"get_history","from_event_id":123}`
 - `{"type":"interrupt","task_id":"<uuid>"}`
+- `{"type":"answer_question","answer":{...}}`
 
 Server → Client:
 
 - `{"type":"accepted","task_id":"..."}`
 - `{"type":"history","events":[...]}`
 - `{"type":"event","event":{...}}`
+- `{"type":"question","question":{...}}`
+- `{"type":"pending_questions","questions":[...]}` 
+- `{"type":"question_resolved","question_id":"..."}`
 
 Event fields:
 
 - `event_id` (u64): monotonically increasing identifier
 - `ts` (RFC3339 string): server timestamp (UTC)
 - `task_id` (string): which task produced the event
-- `kind` (string): `log` | `tool` | `final` | `error`
+- `kind` (string): `log` | `tool` | `message` | `final` | `error`
 - `message` (string): human-readable text
+
+Structured question fields:
+
+- `question_id` (UUID): used to correlate the answer
+- `task_id` (UUID): top-level task waiting on the answer
+- `prompt` (string): user-facing prompt
+- `mode` (string): `single_choice` | `multi_choice` | `text`
+- `options` (array): selectable options for choice-based prompts
+- `allow_free_text` (bool): whether extra text is allowed
+
+## Built-in tools
+
+- `Read`: read a UTF-8 text file under the workspace root
+- `Write`: create a file only if it does not already exist
+- `Edit`: modify an existing file, but only after `Read` has been used on it in the same agent session
+- `Bash`: run commands through Git Bash (`bash -lc`)
+- `Send`: push a user-facing message into the CLI event stream
+- `Ask`: emit a structured question and block until an answer arrives
+- `Skill`: load a named skill's `SKILL.md`
+- `SubAgent`: run a nested child agent with parent-supplied context; child output is traced back into the parent task stream
 
 ## Known issues
 
 - This is intentionally minimal: no authentication on the WebSocket server.
-- The agent toolset is minimal (shell + basic file ops); expand as needed.
+- `SubAgent` recursion is intentionally bounded by a hard depth limit.
 - Streaming token output is not implemented; events are per-step.
 - Long-term memory is persisted to `.sa/memory.jsonl` (gitignored).
 
@@ -95,6 +120,7 @@ Event fields:
 - 0.2.5: keep one tuned `--release` profile (size + speed).
 - 0.3.0: split the backend daemon and CLI into separate projects.
 - 0.4.0: rename the backend to StudyAdministrator (SA), rename binaries/config to `sa`.
+- 0.5.0: replace the built-in toolset with `Read` / `Write` / `Edit` / `Bash` / `Send` / `Ask` / `Skill` / `SubAgent`, add structured question WS messages, and support nested sub-agents.
 
 ## Traceability (extracted from `../zeroclaw`)
 

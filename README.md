@@ -6,9 +6,21 @@ and simplified from the ideas in `../zeroclaw`:
 - Calls an **OpenAI-compatible** `POST /v1/chat/completions` API.
 - Reads `Agents.md` from the workspace as the base instruction prompt.
 - Discovers and loads `SKILL.md`-based skills (Codex/Agents skills format).
-- Runs a **tool-calling loop** (shell/file ops) to act autonomously.
+- Runs a **tool-calling loop** with built-in `Read` / `Write` / `Edit` / `Bash` /
+  `Send` / `Ask` / `Skill` / `SubAgent`.
 - Exposes a **WebSocket** server so a CLI can connect/disconnect without stopping the agent.
 - Persists **long-term memory** to `.sa/memory.jsonl` (gitignored).
+
+## Built-in tools
+
+- `Read`: read a UTF-8 text file inside the workspace
+- `Write`: create a new file only if it does not already exist
+- `Edit`: edit an existing file, but only after that file has been `Read`
+- `Bash`: run commands through Git Bash (`bash -lc`)
+- `Send`: send a user-facing message to the connected CLI
+- `Ask`: ask a structured question and block until the user answers
+- `Skill`: load a named `SKILL.md`
+- `SubAgent`: launch a nested child agent with explicit parent context
 
 ## Quick start
 
