@@ -10,10 +10,12 @@
 //! - `Bash`: execute a shell command via Git Bash (`bash -lc`).
 //! - `Fetch`: make a direct HTTP request to a known URL.
 //! - `Search`: perform a web search to discover relevant URLs.
+//! - `MemorySearch`: search Markdown memory files on demand.
+//! - `MemoryGet`: read one bounded slice from a Markdown memory file.
 //! - `Send`: send a user-facing message without blocking for a reply.
 //! - `Ask`: ask the user a structured question and wait for the answer.
 //! - `Show`: transmit a file's contents to the user over WebSocket.
-//! - `Skill`: load a skill's `SKILL.md`.
+//! - `Skill`: read `SKILL.md` or another skill-relative file from a named skill.
 //! - `SubAgent`: launch a nested sub-agent and return its final answer.
 //!
 //! Design goals:
@@ -24,6 +26,7 @@
 //!   without coupling this crate to any particular transport.
 
 use crate::cancel::CancelToken;
+use crate::memory::{read_markdown_memory, search_markdown_memory};
 use crate::openai::{ToolDefinition, ToolFunctionDefinition};
 use crate::skills::SkillRegistry;
 use crate::ws_protocol::{
@@ -546,6 +549,60 @@ impl ToolExecutor {
             ToolDefinition {
                 kind: "function".to_string(),
                 function: ToolFunctionDefinition {
+                    name: "MemorySearch".to_string(),
+                    description:
+                        "Search `MEMORY.md`, `memory.md`, and `memory/*.md` for prior decisions, dates, preferences, or todos."
+                            .to_string(),
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "Search query for memory recall."
+                            },
+                            "max_results": {
+                                "type": "integer",
+                                "description": "Optional maximum number of results. Defaults to 5 and is capped at 10."
+                            },
+                            "min_score": {
+                                "type": "number",
+                                "description": "Optional minimum lexical score threshold."
+                            }
+                        },
+                        "required": ["query"]
+                    }),
+                },
+            },
+            ToolDefinition {
+                kind: "function".to_string(),
+                function: ToolFunctionDefinition {
+                    name: "MemoryGet".to_string(),
+                    description:
+                        "Read one allowed memory Markdown file (`MEMORY.md`, `memory.md`, or `memory/*.md`) with an optional line range."
+                            .to_string(),
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "Memory file path. Must be `MEMORY.md`, `memory.md`, or a file under `memory/`."
+                            },
+                            "from": {
+                                "type": "integer",
+                                "description": "Optional 1-based starting line."
+                            },
+                            "lines": {
+                                "type": "integer",
+                                "description": "Optional number of lines to read."
+                            }
+                        },
+                        "required": ["path"]
+                    }),
+                },
+            },
+            ToolDefinition {
+                kind: "function".to_string(),
+                function: ToolFunctionDefinition {
                     name: "Show".to_string(),
                     description: "Display an existing workspace file to the user through the frontend."
                         .to_string(),
@@ -609,13 +666,19 @@ impl ToolExecutor {
                 kind: "function".to_string(),
                 function: ToolFunctionDefinition {
                     name: "Skill".to_string(),
-                    description: "Load the full SKILL.md for a named skill.".to_string(),
+                    description:
+                        "Read `SKILL.md` or another skill-relative text file from a named installed skill without exposing the real host path."
+                            .to_string(),
                     parameters: serde_json::json!({
                         "type": "object",
                         "properties": {
                             "name": {
                                 "type": "string",
                                 "description": "Skill name from the prompt's skill metadata list."
+                            },
+                            "path": {
+                                "type": "string",
+                                "description": "Optional skill-relative path. Defaults to `SKILL.md`."
                             }
                         },
                         "required": ["name"]
@@ -667,6 +730,8 @@ impl ToolExecutor {
             "Bash" => self.bash(args, cancel).await,
             "Fetch" => self.fetch(args, cancel).await,
             "Search" => self.search(args, cancel).await,
+            "MemorySearch" => self.memory_search(args, cancel).await,
+            "MemoryGet" => self.memory_get(args, cancel).await,
             "Send" => self.send(runtime, args, cancel).await,
             "Show" => self.show(runtime, args, cancel).await,
             "Ask" => self.ask(runtime, args, cancel).await,
@@ -1080,6 +1145,66 @@ impl ToolExecutor {
         .to_string())
     }
 
+    /// `MemorySearch`: search Markdown memory files on demand.
+    async fn memory_search(
+        &self,
+        args: serde_json::Value,
+        cancel: &CancelToken,
+    ) -> anyhow::Result<String> {
+        #[derive(Debug, Deserialize)]
+        struct Args {
+            query: String,
+            max_results: Option<usize>,
+            min_score: Option<f64>,
+        }
+
+        let args: Args =
+            serde_json::from_value(args).context("Invalid arguments for MemorySearch")?;
+        if cancel.is_cancelled() {
+            anyhow::bail!("MemorySearch cancelled");
+        }
+
+        let results = search_markdown_memory(
+            &self.ctx.workspace_root,
+            &args.query,
+            args.max_results,
+            args.min_score,
+        )
+        .await?;
+
+        Ok(serde_json::json!({
+            "query": args.query,
+            "results": results,
+            "engine": "markdown_lexical_v1",
+        })
+        .to_string())
+    }
+
+    /// `MemoryGet`: read a bounded slice from one allowed memory file.
+    async fn memory_get(
+        &self,
+        args: serde_json::Value,
+        cancel: &CancelToken,
+    ) -> anyhow::Result<String> {
+        #[derive(Debug, Deserialize)]
+        struct Args {
+            path: String,
+            from: Option<usize>,
+            lines: Option<usize>,
+        }
+
+        let args: Args = serde_json::from_value(args).context("Invalid arguments for MemoryGet")?;
+        if cancel.is_cancelled() {
+            anyhow::bail!("MemoryGet cancelled");
+        }
+
+        let result =
+            read_markdown_memory(&self.ctx.workspace_root, &args.path, args.from, args.lines)
+                .await?;
+
+        Ok(serde_json::to_string(&result)?)
+    }
+
     /// `Send`: forward a message to the user through the daemon/runtime layer.
     async fn send(
         &self,
@@ -1238,7 +1363,7 @@ impl ToolExecutor {
         .to_string())
     }
 
-    /// `Skill`: load a full `SKILL.md` by name.
+    /// `Skill`: read `SKILL.md` or another skill-relative file by skill name.
     async fn skill(&self, args: serde_json::Value, cancel: &CancelToken) -> anyhow::Result<String> {
         if cancel.is_cancelled() {
             anyhow::bail!("Skill cancelled");
@@ -1247,6 +1372,7 @@ impl ToolExecutor {
         #[derive(Debug, Deserialize)]
         struct Args {
             name: String,
+            path: Option<String>,
         }
 
         let args: Args = serde_json::from_value(args).context("Invalid arguments for Skill")?;
@@ -1254,12 +1380,16 @@ impl ToolExecutor {
             anyhow::bail!("Skill not found: {}", args.name);
         };
 
-        let content = self.ctx.skills.load_skill_md(&args.name).await?;
+        let (path, content) = self
+            .ctx
+            .skills
+            .load_skill_file(&args.name, args.path.as_deref())
+            .await?;
 
         Ok(serde_json::json!({
             "name": skill.name,
             "description": skill.description,
-            "dir": skill.dir.display().to_string(),
+            "path": path,
             "content": content,
         })
         .to_string())

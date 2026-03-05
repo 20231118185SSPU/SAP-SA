@@ -24,7 +24,7 @@ use sa_core::agent::{AgentRunner, AgentRunnerConfig, EmitEventFn};
 use sa_core::agents_md::{extract_markdown_file_references, load_agents_md};
 use sa_core::cancel::{CancelHandle, cancel_pair};
 use sa_core::config::load_config_from_file;
-use sa_core::memory::{MemoryEntry, MemoryStore, default_memory_path};
+use sa_core::memory::{build_prompt_block as build_memory_prompt_block, is_memory_reference};
 use sa_core::openai::OpenAiClient;
 use sa_core::skills::SkillRegistry;
 use sa_core::tools::{
@@ -125,9 +125,6 @@ struct Hub {
     /// Context used for safe path resolution when preloading files.
     preload_ctx: ToolContext,
 
-    /// Persistent long-term memory (JSONL on disk).
-    memory: Mutex<MemoryStore>,
-
     /// The agent runner (OpenAI + tools loop).
     runner: AgentRunner,
 
@@ -142,12 +139,7 @@ struct Hub {
 
 impl Hub {
     /// Create a new hub and spawn the background worker.
-    fn new(
-        runner: AgentRunner,
-        agents_md_path: PathBuf,
-        preload_ctx: ToolContext,
-        memory: MemoryStore,
-    ) -> Arc<Self> {
+    fn new(runner: AgentRunner, agents_md_path: PathBuf, preload_ctx: ToolContext) -> Arc<Self> {
         // Task queue capacity (small but adequate for minimal agent).
         let (task_tx, task_rx) = mpsc::channel::<TaskRequest>(128);
 
@@ -166,7 +158,6 @@ impl Hub {
             pending_questions: Mutex::new(Vec::new()),
             recent_shows: Mutex::new(VecDeque::new()),
             preload_ctx,
-            memory: Mutex::new(memory),
             runner,
             agents_md_path,
         });
@@ -303,6 +294,25 @@ impl Hub {
         }
 
         self.broadcast_server_message(ServerMessage::Show { file });
+    }
+
+    /// Build the OpenClaw-style root memory prompt block.
+    ///
+    /// We only inject stable root memory files (`MEMORY.md` / `memory.md`) for
+    /// top-level tasks. Daily memory remains on-demand via `MemorySearch` /
+    /// `MemoryGet`.
+    async fn memory_prompt_block(&self, task_id: Uuid) -> String {
+        match build_memory_prompt_block(&self.preload_ctx.workspace_root).await {
+            Ok(block) => block,
+            Err(err) => {
+                self.publish(
+                    EventKind::Error,
+                    task_id,
+                    format!("Failed to build memory prompt block: {err}"),
+                );
+                "## Memory Context\n\n- (failed to load memory bootstrap files)\n".to_string()
+            }
+        }
     }
 
     /// Validate and deliver an answer coming from a client.
@@ -525,13 +535,9 @@ impl Hub {
             }
         };
 
-        let memory_block = {
-            let mem = self.memory.lock().expect("memory mutex poisoned");
-            mem.prompt_block()
-        };
         let preload_block = self.preload_agents_md_references(&agents_md).await;
         let extra_prompt = format!(
-            "{memory_block}\n\n{preload_block}\n\n## Parent-provided SubAgent Context\n\n- depth: {depth}\n- label: {label}\n\n```text\n{}\n```",
+            "{preload_block}\n\n## Parent-provided SubAgent Context\n\n- depth: {depth}\n- label: {label}\n\n```text\n{}\n```",
             request.context.trim()
         );
 
@@ -633,12 +639,9 @@ impl Hub {
             };
 
             // Extra context injected into the system prompt:
-            // - persistent memory snapshot
-            // - proactive preloading of files referenced in Agents.md
-            let memory_block = {
-                let mem = self.memory.lock().expect("memory mutex poisoned");
-                mem.prompt_block()
-            };
+            // - root memory files (`MEMORY.md` / `memory.md`)
+            // - proactive preloading of non-memory files referenced in Agents.md
+            let memory_block = self.memory_prompt_block(req.task_id).await;
             let preload_block = self.preload_agents_md_references(&agents_md).await;
             let extra_prompt = format!("{memory_block}\n\n{preload_block}");
 
@@ -667,32 +670,7 @@ impl Hub {
                     // The agent runner already emits `Final`, but we keep an explicit
                     // completion log for clarity.
                     self.publish(EventKind::Log, req.task_id, "Task finished.".to_string());
-
-                    // Persist memory entry (best-effort).
-                    //
-                    // We skip persisting on cancellation to keep memory signal high.
-                    if !cancel_token.is_cancelled()
-                        && !final_text.starts_with("Task cancelled by user interrupt")
-                    {
-                        let entry = MemoryEntry {
-                            ts: chrono::Utc::now(),
-                            task_id: req.task_id,
-                            user_task: req.task.trim().to_string(),
-                            final_answer: final_text.trim().to_string(),
-                        };
-
-                        let mut mem = self.memory.lock().expect("memory mutex poisoned");
-                        if let Err(err) = mem.append(entry) {
-                            self.publish(
-                                EventKind::Error,
-                                req.task_id,
-                                format!(
-                                    "Failed to persist memory to {}: {err}",
-                                    mem.path().display()
-                                ),
-                            );
-                        }
-                    }
+                    let _ = final_text;
                 }
                 Err(err) => {
                     let msg = format!("Task crashed: {err}");
@@ -740,6 +718,13 @@ impl Hub {
 
         let mut loaded = 0usize;
         for r in refs {
+            if is_memory_reference(&r) {
+                out.push_str(&format!(
+                    "- `{r}`: skipped; use `MemorySearch` / `MemoryGet` for memory files\n"
+                ));
+                continue;
+            }
+
             if loaded >= max_files {
                 out.push_str("- (truncated: too many referenced files)\n");
                 break;
@@ -1065,13 +1050,6 @@ async fn main() -> anyhow::Result<()> {
     let tool_ctx = ToolContext::new(workspace_root, Arc::clone(&skills))?;
     let preload_ctx = tool_ctx.clone();
 
-    // Load persistent memory store (JSONL).
-    //
-    // This provides "long-term memory" across tasks and daemon restarts.
-    let memory_path = default_memory_path(&tool_ctx.workspace_root);
-    let memory_store = MemoryStore::load_or_new(memory_path)?;
-    tracing::info!("Memory file: {}", memory_store.path().display());
-
     let tools = ToolExecutor::new(tool_ctx);
 
     // Build LLM client.
@@ -1089,7 +1067,7 @@ async fn main() -> anyhow::Result<()> {
     let runner = AgentRunner::new(llm, tools, Arc::clone(&skills), runner_cfg);
 
     // Hub (spawns worker loop).
-    let hub = Hub::new(runner, agents_md_path, preload_ctx, memory_store);
+    let hub = Hub::new(runner, agents_md_path, preload_ctx);
 
     // Build HTTP router (WS only).
     let app = Router::new()

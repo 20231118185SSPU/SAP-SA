@@ -7,9 +7,9 @@ and simplified from the ideas in `../zeroclaw`:
 - Uses a **Chinese built-in framework prompt** adapted from `zeroclaw`, then injects local `Agents.md`.
 - Discovers and loads `SKILL.md`-based skills (Codex/Agents skills format).
 - Runs a **tool-calling loop** with built-in `Read` / `Write` / `Edit` / `Bash` /
-  `Fetch` / `Search` / `Send` / `Show` / `Ask` / `Skill` / `SubAgent`.
+  `Fetch` / `Search` / `MemorySearch` / `MemoryGet` / `Send` / `Show` / `Ask` / `Skill` / `SubAgent`.
 - Exposes a **WebSocket** server so a CLI can connect/disconnect without stopping the agent.
-- Persists **long-term memory** to `.sa/memory.jsonl` (gitignored).
+- Loads long-term memory from workspace Markdown files (`MEMORY.md`, `memory.md`, `memory/*.md`) in an OpenClaw-style workflow.
 
 ## Built-in tools
 
@@ -19,15 +19,18 @@ and simplified from the ideas in `../zeroclaw`:
 - `Bash`: run commands through Git Bash (`bash -lc`)
 - `Fetch`: send an HTTP request to a known URL
 - `Search`: search the web and return candidate titles/snippets/URLs
+- `MemorySearch`: search Markdown memory files on demand
+- `MemoryGet`: read a bounded slice from one memory Markdown file
 - `Send`: send a user-facing message to the connected CLI
 - `Show`: display a workspace file in the CLI's dedicated show pane
 - `Ask`: ask a structured question and block until the user answers
-- `Skill`: load a named `SKILL.md`
+- `Skill`: read `SKILL.md` or another skill-relative file without exposing the real skill install path
 - `SubAgent`: launch a nested child agent with explicit parent context
 
 Best-practice behavior baked into the prompt:
 
 - Use `Search` before `Fetch` when the exact URL is unknown.
+- Use `MemorySearch` before answering history/preferences/todos, then `MemoryGet` only for the needed lines.
 - Keep `Send` short.
 - Use `Show` for dense output (reports, generated files, long explanations, code) instead of flooding the user with plain text.
 
@@ -41,8 +44,10 @@ Best-practice behavior baked into the prompt:
 2. (Optional but recommended) Create a local `Agents.md` in this folder.
 
    - It is **gitignored** by default.
-   - You can reference additional persona/memory files in backticks (e.g. `SOUL.md`, `USER.md`);
+   - You can reference additional persona/context files in backticks (e.g. `SOUL.md`, `USER.md`);
      the daemon will preload them and inject into the prompt.
+   - Memory files follow a separate OpenClaw-style flow: keep curated memory in `MEMORY.md` / `memory.md`,
+     daily notes in `memory/*.md`, and let the agent use `MemorySearch` / `MemoryGet` on demand.
 
 3. Start the agent daemon (WebSocket server):
 

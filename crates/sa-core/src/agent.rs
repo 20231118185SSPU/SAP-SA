@@ -340,17 +340,21 @@ impl AgentRunner {
 - `Bash`：通过 Git Bash 执行命令（`bash -lc`）。\n\
 - `Search`：在不知道具体页面时先做网络搜索，拿到候选标题、摘要和 URL。\n\
 - `Fetch`：对已知 URL 发起直接 HTTP 请求，获取正文或接口响应。\n\
+- `MemorySearch`：按需搜索 `MEMORY.md`、`memory.md` 和 `memory/*.md`。\n\
+- `MemoryGet`：读取某个记忆 Markdown 文件的具体片段。\n\
 - `Send`：向用户发送简短消息，不阻塞等待回复。\n\
 - `Show`：把一个已存在的文件直接展示给用户；适合高信息密度内容。\n\
 - `Ask`：向用户发起结构化提问，并等待用户选择或输入。\n\
-- `Skill`：按名称加载某个技能目录中的 `SKILL.md`。\n\
+- `Skill`：按技能名读取 `SKILL.md` 或技能目录中的其他相对文件；真实宿主目录不会暴露给你。\n\
 - `SubAgent`：启动子代理，传入父代理整理好的上下文，让子代理独立完成聚焦子任务。\n\n\
 重要用法约定：\n\
 - 当你不知道网址、文档入口或权威来源时，先用 `Search`，再用 `Fetch` 深入读取。\n\
+- 当问题涉及过去做过什么、已有决定、日期、偏好、待办、长期约定时，先用 `MemorySearch`，再按需要用 `MemoryGet` 拉取精确片段。\n\
 - `Send` 要言简意赅，只同步状态、结论、下一步或一个明确提醒，不要长篇铺陈。\n\
 - `Show` 用于展示高密度信息，例如代码、文档、报告、表格、生成结果、长说明；先用一句简短 `Send` 告诉用户该看什么，再 `Show` 文件。\n\
 - `Read` / `Edit` / `Write` 要遵守工作流：已存在文件先 `Read`，修改用 `Edit`，只有新文件才用 `Write`。\n\
 - `Ask` 用于缺少关键信息、需要用户做选择、确认取舍，或需要结构化输入的情况。\n\
+- `Skill` 的默认入口是 `SKILL.md`；如果 `SKILL.md` 引用了同技能目录下的其他相对文件，再继续用 `Skill` 读取这些相对路径。\n\
 - `SubAgent` 只用于边界清晰、上下文可明确封装的子任务；传给子代理的上下文必须具体、可执行、可验证。\n\n",
         );
 
@@ -372,20 +376,28 @@ impl AgentRunner {
 - 当外部动作存在明显风险或信息不足时，先 `Ask`，不要自作主张。\n\n",
         );
 
+        out.push_str("## 记忆检索\n\n");
+        out.push_str(
+            "在回答与过去工作、历史决定、时间点、人物信息、用户偏好、约定事项或待办相关的问题前，优先检查工作区记忆。\n\
+推荐流程：\n\
+- 先用 `MemorySearch` 在 `MEMORY.md`、`memory.md`、`memory/*.md` 中搜索。\n\
+- 如果搜索命中，再用 `MemoryGet` 只读取必要的文件片段，避免把整份记忆一次性塞进上下文。\n\
+- 如果没有命中或证据不足，明确说明你查过但仍不确定，不要假装记得。\n\n",
+        );
+
         if !self.skills.list().is_empty() {
             out.push_str("## 技能授权\n\n");
             out.push_str("所有已注册技能都已经过授权，可以按需使用。用户的任务如果明显需要某项技能，就直接用 `Skill` 读取它，不要凭空编造“策略限制”来回避。\n\n");
 
             out.push_str("## 可用技能\n\n");
             out.push_str("技能是保存在本地目录中的说明包，每个技能目录至少包含一个 `SKILL.md`。\n");
-            out.push_str("当某项技能与你的任务相关时，用 `Skill` 按名称加载其完整内容，再遵循其中的流程。\n\n");
+            out.push_str("当某项技能与你的任务相关时，先用 `Skill` 读取该技能的 `SKILL.md`，再按其中引用的相对路径继续读取技能内文件。\n");
+            out.push_str(
+                "你不会看到技能在宿主机上的真实安装目录；只能通过技能名和技能内相对路径访问。\n\n",
+            );
 
             for item in self.skills.list() {
-                let _ = writeln!(
-                    out,
-                    "- `{}`：{}（目录：`{}`）",
-                    item.name, item.description, item.dir
-                );
+                let _ = writeln!(out, "- `{}`：{}", item.name, item.description);
             }
             out.push('\n');
         }

@@ -14,8 +14,9 @@ The terminal frontend is a separate project located at:
 ## Running
 
 1. Create `sa.toml` from `sa.example.toml`.
-2. (Optional) Create a local `Agents.md` (gitignored). If it references files in backticks
-   (e.g. `SOUL.md`, `USER.md`), the daemon will preload them into the prompt.
+2. (Optional) Create a local `Agents.md` (gitignored). If it references persona/context files in
+   backticks (e.g. `SOUL.md`, `USER.md`), the daemon will preload them into the prompt.
+   Memory files are handled separately through `MemorySearch` / `MemoryGet`.
 3. Start the daemon:
 
 ```bash
@@ -101,10 +102,12 @@ Structured question fields:
 - `Bash`: run commands through Git Bash (`bash -lc`)
 - `Fetch`: perform a direct HTTP request to a known URL
 - `Search`: perform a web search and return candidate titles/snippets/URLs
+- `MemorySearch`: search `MEMORY.md`, `memory.md`, and `memory/*.md` for relevant snippets
+- `MemoryGet`: read one allowed memory Markdown file by path and optional line range
 - `Send`: push a user-facing message into the CLI event stream
 - `Show`: read an existing workspace file and push its payload to the CLI over WebSocket
 - `Ask`: emit a structured question and block until an answer arrives
-- `Skill`: load a named skill's `SKILL.md`
+- `Skill`: read `SKILL.md` or another skill-relative file from a named skill; host install paths stay hidden
 - `SubAgent`: run a nested child agent with parent-supplied context; child output is traced back into the parent task stream
 
 ## Known issues
@@ -112,7 +115,7 @@ Structured question fields:
 - This is intentionally minimal: no authentication on the WebSocket server.
 - `SubAgent` recursion is intentionally bounded by a hard depth limit.
 - Streaming token output is not implemented; events are per-step.
-- Long-term memory is persisted to `.sa/memory.jsonl` (gitignored).
+- Memory search is currently lexical Markdown search, not embedding-based semantic search.
 - `Search` currently uses DuckDuckGo's lightweight HTML endpoint and a small internal parser; if that HTML changes, result extraction may need maintenance.
 
 ## Changelog
@@ -128,6 +131,7 @@ Structured question fields:
 - 0.4.0: rename the backend to StudyAdministrator (SA), rename binaries/config to `sa`.
 - 0.5.0: replace the built-in toolset with `Read` / `Write` / `Edit` / `Bash` / `Send` / `Ask` / `Skill` / `SubAgent`, add structured question WS messages, and support nested sub-agents.
 - 0.6.0: switch the built-in prompt to a Chinese ZeroClaw-style framework prompt, add `Fetch` / `Search` / `Show`, and add WS file-display messages for reconnecting CLI clients.
+- 0.7.0: switch memory to OpenClaw-style Markdown files (`MEMORY.md`, `memory/*.md`), add `MemorySearch` / `MemoryGet`, and harden `Skill` into a path-isolated skill file reader.
 
 ## Traceability (extracted from `../zeroclaw`)
 

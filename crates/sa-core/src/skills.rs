@@ -20,6 +20,12 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+/// Maximum skill file size we allow to be read into the model context.
+///
+/// This mirrors the spirit of the workspace `Read` tool: skills are text
+/// instructions, not arbitrary multi-megabyte payloads.
+const MAX_SKILL_FILE_BYTES: u64 = 200_000;
+
 /// YAML frontmatter at the top of `SKILL.md`.
 ///
 /// We only care about `name` and `description` because they are the minimum
@@ -52,8 +58,6 @@ pub struct SkillListItem {
     pub name: String,
     /// Skill description.
     pub description: String,
-    /// Skill directory (string form for JSON).
-    pub dir: String,
 }
 
 /// Registry of all discovered skills.
@@ -90,6 +94,9 @@ impl SkillRegistry {
                 }
 
                 let skill_md_path = entry.path().to_path_buf();
+                let skill_md_path = std::fs::canonicalize(&skill_md_path).with_context(|| {
+                    format!("Failed to canonicalize {}", skill_md_path.display())
+                })?;
                 let dir = skill_md_path
                     .parent()
                     .map(Path::to_path_buf)
@@ -121,7 +128,6 @@ impl SkillRegistry {
             .map(|s| SkillListItem {
                 name: s.name.clone(),
                 description: s.description.clone(),
-                dir: s.dir.display().to_string(),
             })
             .collect();
 
@@ -130,15 +136,49 @@ impl SkillRegistry {
         items
     }
 
-    /// Load the full `SKILL.md` file for a skill by name.
-    pub async fn load_skill_md(&self, name: &str) -> anyhow::Result<String> {
+    /// Load one UTF-8 text file from inside a skill directory.
+    ///
+    /// - `path = None` or `path = "SKILL.md"` reads the main skill file.
+    /// - Other values are interpreted as skill-relative paths.
+    /// - The resolved path must remain inside the skill directory after
+    ///   canonicalization; path traversal and symlink escapes are rejected.
+    pub async fn load_skill_file(
+        &self,
+        name: &str,
+        path: Option<&str>,
+    ) -> anyhow::Result<(String, String)> {
         let Some(skill) = self.by_name.get(name) else {
             anyhow::bail!("Skill not found: {name}");
         };
 
-        tokio::fs::read_to_string(&skill.skill_md_path)
+        let requested = normalize_skill_relative_path(path.unwrap_or("SKILL.md"))?;
+        let candidate = skill.dir.join(&requested);
+        let resolved = tokio::fs::canonicalize(&candidate)
             .await
-            .with_context(|| format!("Failed to read {}", skill.skill_md_path.display()))
+            .with_context(|| format!("Skill file not found: {}", requested))?;
+        if !resolved.starts_with(&skill.dir) {
+            anyhow::bail!("Skill path escapes the skill root: {}", requested);
+        }
+
+        let meta = tokio::fs::metadata(&resolved)
+            .await
+            .with_context(|| format!("Failed to stat skill file: {}", requested))?;
+        if !meta.is_file() {
+            anyhow::bail!("Skill path must point to a file: {}", requested);
+        }
+        if meta.len() > MAX_SKILL_FILE_BYTES {
+            anyhow::bail!(
+                "Skill file is too large to load ({} bytes): {}",
+                meta.len(),
+                requested
+            );
+        }
+
+        let content = tokio::fs::read_to_string(&resolved)
+            .await
+            .with_context(|| format!("Failed to read skill file: {}", requested))?;
+
+        Ok((requested, content))
     }
 
     /// Get a reference to a `Skill` by name (if present).
@@ -196,9 +236,40 @@ fn extract_yaml_frontmatter(raw: &str) -> Option<String> {
     None
 }
 
+/// Normalize a skill-relative path into a stable slash form and reject obvious
+/// traversal attempts before filesystem access.
+fn normalize_skill_relative_path(raw: &str) -> anyhow::Result<String> {
+    let normalized = raw
+        .trim()
+        .trim_start_matches("./")
+        .trim_start_matches(".\\")
+        .replace('\\', "/");
+
+    if normalized.is_empty() {
+        anyhow::bail!("Skill path must not be empty");
+    }
+    if Path::new(&normalized).is_absolute() {
+        anyhow::bail!("Skill path must be relative, not absolute");
+    }
+    if normalized.split('/').any(|part| part == "..") {
+        anyhow::bail!("Skill path must not contain `..`");
+    }
+
+    Ok(normalized)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use uuid::Uuid;
+
+    /// Create a unique temporary skill directory root.
+    fn unique_temp_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("sa-skills-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
 
     #[test]
     fn extract_yaml_frontmatter_happy_path() {
@@ -220,5 +291,51 @@ mod tests {
         let yaml = extract_yaml_frontmatter(md).expect("frontmatter");
         assert!(yaml.contains("name: a"));
         assert!(yaml.contains("description: b"));
+    }
+
+    #[tokio::test]
+    async fn load_skill_file_reads_relative_file_without_exposing_root() {
+        let root = unique_temp_dir();
+        let skill_dir = root.join("writer");
+        fs::create_dir_all(skill_dir.join("references")).expect("create skill dir");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: writer\ndescription: writes things\n---\n\nSee `references/style.md`.",
+        )
+        .expect("write SKILL.md");
+        fs::write(
+            skill_dir.join("references").join("style.md"),
+            "Keep prose concise.",
+        )
+        .expect("write style.md");
+
+        let registry = SkillRegistry::scan(&[root]).expect("scan skills");
+        let (path, content) = registry
+            .load_skill_file("writer", Some("references/style.md"))
+            .await
+            .expect("load skill file");
+
+        assert_eq!(path, "references/style.md");
+        assert_eq!(content, "Keep prose concise.");
+    }
+
+    #[tokio::test]
+    async fn load_skill_file_rejects_path_traversal() {
+        let root = unique_temp_dir();
+        let skill_dir = root.join("writer");
+        fs::create_dir_all(&skill_dir).expect("create skill dir");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: writer\ndescription: writes things\n---\n\nBody",
+        )
+        .expect("write SKILL.md");
+
+        let registry = SkillRegistry::scan(&[root]).expect("scan skills");
+        let err = registry
+            .load_skill_file("writer", Some("../outside.md"))
+            .await
+            .expect_err("path traversal must fail");
+
+        assert!(err.to_string().contains("must not contain"));
     }
 }
