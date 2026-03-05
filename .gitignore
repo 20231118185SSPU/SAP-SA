@@ -9,14 +9,7 @@ Thumbs.db
 sa.toml
 claw.toml
 
-# Local agent instructions (workspace-specific; not committed).
-Agents.md
-
-# Optional local persona / memory files (commonly referenced by Agents.md).
-SOUL.md
-USER.md
-IDENTITY.md
-HEARTBEAT.md
+# Local memory files (often sensitive; still kept local).
 MEMORY.md
 memory/
 
