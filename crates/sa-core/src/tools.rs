@@ -8,8 +8,11 @@
 //! - `Edit`: edit an existing UTF-8 text file; the file must have been `Read`
 //!   earlier in the same agent session.
 //! - `Bash`: execute a shell command via Git Bash (`bash -lc`).
+//! - `Fetch`: make a direct HTTP request to a known URL.
+//! - `Search`: perform a web search to discover relevant URLs.
 //! - `Send`: send a user-facing message without blocking for a reply.
 //! - `Ask`: ask the user a structured question and wait for the answer.
+//! - `Show`: transmit a file's contents to the user over WebSocket.
 //! - `Skill`: load a skill's `SKILL.md`.
 //! - `SubAgent`: launch a nested sub-agent and return its final answer.
 //!
@@ -23,8 +26,11 @@
 use crate::cancel::CancelToken;
 use crate::openai::{ToolDefinition, ToolFunctionDefinition};
 use crate::skills::SkillRegistry;
-use crate::ws_protocol::{QuestionMode, QuestionOption, UserQuestionAnswer};
+use crate::ws_protocol::{
+    QuestionMode, QuestionOption, UserQuestionAnswer, UserVisibleFile, UserVisibleFileEncoding,
+};
 use anyhow::Context as _;
+use base64::Engine as _;
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::ffi::OsString;
@@ -50,6 +56,12 @@ const DEFAULT_BASH_TIMEOUT: Duration = Duration::from_secs(300);
 /// bound so one tool call cannot hang indefinitely.
 const MAX_BASH_TIMEOUT: Duration = Duration::from_secs(1_800);
 
+/// Maximum response bytes returned by `Fetch`.
+const MAX_FETCH_RESPONSE_BYTES: usize = 200_000;
+
+/// Maximum file size transported by `Show`.
+const MAX_SHOW_FILE_BYTES: usize = 512 * 1024;
+
 /// Safety limit for nested sub-agents.
 ///
 /// The user explicitly asked for recursive sub-agents. We still need a hard
@@ -70,6 +82,10 @@ pub type AskQuestionFn = Arc<
         + Sync
         + 'static,
 >;
+
+/// Callback used by `Show`.
+pub type ShowFileFn =
+    Arc<dyn Fn(UserVisibleFile) -> ToolFuture<anyhow::Result<()>> + Send + Sync + 'static>;
 
 /// Callback used by `SubAgent`.
 pub type RunSubAgentFn = Arc<
@@ -165,6 +181,8 @@ pub struct ToolRuntime {
     send_message: SendMessageFn,
     /// Blocking "ask the user" channel.
     ask_question: AskQuestionFn,
+    /// Structured file display channel.
+    show_file: ShowFileFn,
     /// Nested-agent launcher.
     run_subagent: RunSubAgentFn,
 }
@@ -174,11 +192,13 @@ impl ToolRuntime {
     pub fn new(
         send_message: SendMessageFn,
         ask_question: AskQuestionFn,
+        show_file: ShowFileFn,
         run_subagent: RunSubAgentFn,
     ) -> Self {
         Self {
             send_message,
             ask_question,
+            show_file,
             run_subagent,
         }
     }
@@ -193,11 +213,13 @@ impl ToolRuntime {
         let ask_question: AskQuestionFn = Arc::new(|_request, _cancel| {
             Box::pin(async { anyhow::bail!("Ask runtime is not configured") })
         });
+        let show_file: ShowFileFn =
+            Arc::new(|_file| Box::pin(async { anyhow::bail!("Show runtime is not configured") }));
         let run_subagent: RunSubAgentFn = Arc::new(|_request, _cancel| {
             Box::pin(async { anyhow::bail!("SubAgent runtime is not configured") })
         });
 
-        Self::new(send_message, ask_question, run_subagent)
+        Self::new(send_message, ask_question, show_file, run_subagent)
     }
 
     /// Invoke the `Send` callback.
@@ -212,6 +234,11 @@ impl ToolRuntime {
         cancel: CancelToken,
     ) -> anyhow::Result<UserQuestionAnswer> {
         (self.ask_question)(request, cancel).await
+    }
+
+    /// Invoke the `Show` callback.
+    pub async fn show_file(&self, file: UserVisibleFile) -> anyhow::Result<()> {
+        (self.show_file)(file).await
     }
 
     /// Invoke the `SubAgent` callback.
@@ -445,6 +472,62 @@ impl ToolExecutor {
             ToolDefinition {
                 kind: "function".to_string(),
                 function: ToolFunctionDefinition {
+                    name: "Fetch".to_string(),
+                    description: "Send a direct HTTP request to a known URL and return the response body."
+                        .to_string(),
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "url": {
+                                "type": "string",
+                                "description": "HTTP or HTTPS URL to request."
+                            },
+                            "method": {
+                                "type": "string",
+                                "description": "HTTP method. Defaults to GET."
+                            },
+                            "headers": {
+                                "type": "object",
+                                "description": "Optional request headers as string key/value pairs."
+                            },
+                            "body": {
+                                "type": "string",
+                                "description": "Optional UTF-8 request body."
+                            },
+                            "max_bytes": {
+                                "type": "integer",
+                                "description": "Optional response size cap in bytes. Defaults to 200000 and is capped at 200000."
+                            }
+                        },
+                        "required": ["url"]
+                    }),
+                },
+            },
+            ToolDefinition {
+                kind: "function".to_string(),
+                function: ToolFunctionDefinition {
+                    name: "Search".to_string(),
+                    description: "Search the web for relevant pages, returning titles, snippets, and URLs."
+                        .to_string(),
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "Search query."
+                            },
+                            "max_results": {
+                                "type": "integer",
+                                "description": "Maximum number of results to return. Defaults to 5 and is capped at 10."
+                            }
+                        },
+                        "required": ["query"]
+                    }),
+                },
+            },
+            ToolDefinition {
+                kind: "function".to_string(),
+                function: ToolFunctionDefinition {
                     name: "Send".to_string(),
                     description: "Send a user-facing message without waiting for a reply."
                         .to_string(),
@@ -457,6 +540,28 @@ impl ToolExecutor {
                             }
                         },
                         "required": ["message"]
+                    }),
+                },
+            },
+            ToolDefinition {
+                kind: "function".to_string(),
+                function: ToolFunctionDefinition {
+                    name: "Show".to_string(),
+                    description: "Display an existing workspace file to the user through the frontend."
+                        .to_string(),
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "Existing file path, relative to the workspace root or absolute under it."
+                            },
+                            "title": {
+                                "type": "string",
+                                "description": "Optional user-facing title shown above the file content."
+                            }
+                        },
+                        "required": ["path"]
                     }),
                 },
             },
@@ -560,7 +665,10 @@ impl ToolExecutor {
             "Write" => self.write(args, cancel).await,
             "Edit" => self.edit(session, args, cancel).await,
             "Bash" => self.bash(args, cancel).await,
+            "Fetch" => self.fetch(args, cancel).await,
+            "Search" => self.search(args, cancel).await,
             "Send" => self.send(runtime, args, cancel).await,
+            "Show" => self.show(runtime, args, cancel).await,
             "Ask" => self.ask(runtime, args, cancel).await,
             "Skill" => self.skill(args, cancel).await,
             "SubAgent" => self.subagent(runtime, args, cancel).await,
@@ -806,6 +914,172 @@ impl ToolExecutor {
         }))
     }
 
+    /// `Fetch`: make a direct HTTP request to a known URL.
+    async fn fetch(&self, args: serde_json::Value, cancel: &CancelToken) -> anyhow::Result<String> {
+        #[derive(Debug, Deserialize)]
+        struct Args {
+            url: String,
+            method: Option<String>,
+            #[serde(default)]
+            headers: serde_json::Map<String, serde_json::Value>,
+            body: Option<String>,
+            max_bytes: Option<usize>,
+        }
+
+        let args: Args = serde_json::from_value(args).context("Invalid arguments for Fetch")?;
+        if cancel.is_cancelled() {
+            anyhow::bail!("Fetch cancelled");
+        }
+
+        let url = validate_network_url(&args.url)?;
+        let method = args
+            .method
+            .as_deref()
+            .unwrap_or("GET")
+            .parse::<reqwest::Method>()
+            .context("Fetch method must be a valid HTTP method")?;
+        let max_bytes = args
+            .max_bytes
+            .unwrap_or(MAX_FETCH_RESPONSE_BYTES)
+            .min(MAX_FETCH_RESPONSE_BYTES);
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .user_agent("StudyAdministrator/0.6 Fetch")
+            .build()
+            .context("Failed to build Fetch HTTP client")?;
+
+        let mut request = client.request(method.clone(), url.clone());
+        for (name, value) in args.headers {
+            let Some(value) = value.as_str() else {
+                anyhow::bail!("Fetch headers must be string key/value pairs");
+            };
+            request = request.header(&name, value);
+        }
+        if let Some(body) = args.body {
+            request = request.body(body);
+        }
+
+        let response = tokio::select! {
+            _ = cancel.cancelled() => {
+                anyhow::bail!("Fetch cancelled");
+            }
+            response = request.send() => {
+                response.context("Fetch request failed")?
+            }
+        };
+
+        let status = response.status();
+        let final_url = response.url().to_string();
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(ToOwned::to_owned);
+        let headers = response.headers().clone();
+
+        let body_bytes = tokio::select! {
+            _ = cancel.cancelled() => {
+                anyhow::bail!("Fetch cancelled");
+            }
+            body = response.bytes() => {
+                body.context("Failed to read Fetch response body")?
+            }
+        };
+
+        let truncated = body_bytes.len() > max_bytes;
+        let clipped = if truncated {
+            &body_bytes[..max_bytes]
+        } else {
+            body_bytes.as_ref()
+        };
+
+        let body_text = String::from_utf8_lossy(clipped).to_string();
+        let response_headers = headers
+            .iter()
+            .filter_map(|(name, value)| {
+                value.to_str().ok().map(|value| {
+                    (
+                        name.as_str().to_string(),
+                        serde_json::Value::String(value.to_string()),
+                    )
+                })
+            })
+            .collect::<serde_json::Map<_, _>>();
+
+        Ok(serde_json::json!({
+            "url": final_url,
+            "method": method.as_str(),
+            "status": status.as_u16(),
+            "content_type": content_type,
+            "headers": response_headers,
+            "bytes": body_bytes.len(),
+            "truncated": truncated,
+            "body": body_text,
+        })
+        .to_string())
+    }
+
+    /// `Search`: discover relevant URLs before a more targeted `Fetch`.
+    async fn search(
+        &self,
+        args: serde_json::Value,
+        cancel: &CancelToken,
+    ) -> anyhow::Result<String> {
+        #[derive(Debug, Deserialize)]
+        struct Args {
+            query: String,
+            max_results: Option<usize>,
+        }
+
+        let args: Args = serde_json::from_value(args).context("Invalid arguments for Search")?;
+        if cancel.is_cancelled() {
+            anyhow::bail!("Search cancelled");
+        }
+        if args.query.trim().is_empty() {
+            anyhow::bail!("Search query must not be empty");
+        }
+
+        let max_results = args.max_results.unwrap_or(5).clamp(1, 10);
+        let url = reqwest::Url::parse_with_params(
+            "https://html.duckduckgo.com/html/",
+            &[("q", args.query.trim())],
+        )
+        .context("Failed to build Search URL")?;
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .user_agent("StudyAdministrator/0.6 Search")
+            .build()
+            .context("Failed to build Search HTTP client")?;
+
+        let response = tokio::select! {
+            _ = cancel.cancelled() => {
+                anyhow::bail!("Search cancelled");
+            }
+            response = client.get(url).send() => {
+                response.context("Search request failed")?
+            }
+        };
+
+        let html = tokio::select! {
+            _ = cancel.cancelled() => {
+                anyhow::bail!("Search cancelled");
+            }
+            body = response.text() => {
+                body.context("Failed to read Search response body")?
+            }
+        };
+
+        let results = extract_duckduckgo_results(&html, max_results);
+
+        Ok(serde_json::json!({
+            "query": args.query,
+            "results": results,
+        })
+        .to_string())
+    }
+
     /// `Send`: forward a message to the user through the daemon/runtime layer.
     async fn send(
         &self,
@@ -832,6 +1106,78 @@ impl ToolExecutor {
         Ok(serde_json::json!({
             "sent": true,
             "message": args.message,
+        })
+        .to_string())
+    }
+
+    /// `Show`: transport a file payload to the user-facing frontend.
+    async fn show(
+        &self,
+        runtime: &ToolRuntime,
+        args: serde_json::Value,
+        cancel: &CancelToken,
+    ) -> anyhow::Result<String> {
+        if cancel.is_cancelled() {
+            anyhow::bail!("Show cancelled");
+        }
+
+        #[derive(Debug, Deserialize)]
+        struct Args {
+            path: String,
+            title: Option<String>,
+        }
+
+        let args: Args = serde_json::from_value(args).context("Invalid arguments for Show")?;
+        let path = self.ctx.resolve_under_workspace(&args.path)?;
+        let meta = tokio::fs::metadata(&path)
+            .await
+            .with_context(|| format!("Failed to stat file for Show: {}", path.display()))?;
+        if !meta.is_file() {
+            anyhow::bail!(
+                "Show requires a file path, not a directory: {}",
+                path.display()
+            );
+        }
+        if meta.len() as usize > MAX_SHOW_FILE_BYTES {
+            anyhow::bail!(
+                "Show refuses files larger than {} bytes: {}",
+                MAX_SHOW_FILE_BYTES,
+                path.display()
+            );
+        }
+
+        let bytes = tokio::fs::read(&path)
+            .await
+            .with_context(|| format!("Failed to read file for Show: {}", path.display()))?;
+
+        let (encoding, content) = match std::str::from_utf8(&bytes) {
+            Ok(text) => (UserVisibleFileEncoding::Utf8, text.to_string()),
+            Err(_) => (
+                UserVisibleFileEncoding::Base64,
+                base64::engine::general_purpose::STANDARD.encode(&bytes),
+            ),
+        };
+
+        let file = UserVisibleFile {
+            show_id: uuid::Uuid::new_v4(),
+            task_id: uuid::Uuid::nil(),
+            path: path.display().to_string(),
+            title: args.title.filter(|title| !title.trim().is_empty()),
+            media_type: guess_media_type(&path, &encoding),
+            encoding,
+            content,
+            bytes: bytes.len(),
+        };
+
+        runtime.show_file(file.clone()).await?;
+
+        Ok(serde_json::json!({
+            "shown": true,
+            "path": file.path,
+            "title": file.title,
+            "bytes": file.bytes,
+            "media_type": file.media_type,
+            "encoding": file.encoding,
         })
         .to_string())
     }
@@ -974,6 +1320,266 @@ fn candidate_bash_programs() -> Vec<PathBuf> {
     out
 }
 
+/// Validate that a network URL is HTTP(S) and therefore appropriate for
+/// `Fetch`.
+fn validate_network_url(raw: &str) -> anyhow::Result<reqwest::Url> {
+    let url = reqwest::Url::parse(raw).context("Fetch URL must be a valid absolute URL")?;
+    match url.scheme() {
+        "http" | "https" => Ok(url),
+        other => anyhow::bail!("Fetch only allows http/https URLs, got scheme `{other}`"),
+    }
+}
+
+/// Extract a bounded list of search results from DuckDuckGo's lightweight HTML
+/// page.
+///
+/// The parser stays dependency-light on purpose: this crate is intentionally
+/// small and we only need a few stable fields (title, URL, snippet).
+fn extract_duckduckgo_results(html: &str, max_results: usize) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+    let mut cursor = 0usize;
+
+    while out.len() < max_results {
+        let Some(anchor_rel) = html[cursor..]
+            .find("result__a")
+            .or_else(|| html[cursor..].find("result-link"))
+        else {
+            break;
+        };
+        let anchor_idx = cursor + anchor_rel;
+        let Some(tag_start) = html[..anchor_idx].rfind("<a") else {
+            cursor = anchor_idx + 1;
+            continue;
+        };
+        let Some(tag_end_rel) = html[anchor_idx..].find("</a>") else {
+            break;
+        };
+        let tag_end = anchor_idx + tag_end_rel + "</a>".len();
+        let anchor_html = &html[tag_start..tag_end];
+
+        let href = extract_href(anchor_html)
+            .map(|href| normalize_duckduckgo_result_url(&href))
+            .unwrap_or_default();
+        let title = extract_anchor_text(anchor_html);
+
+        // Look at a small fragment after the anchor and try a few known snippet
+        // markers used by DuckDuckGo HTML/Lite pages.
+        let next_anchor = html[tag_end..]
+            .find("result__a")
+            .or_else(|| html[tag_end..].find("result-link"))
+            .map(|idx| tag_end + idx)
+            .unwrap_or_else(|| html.len());
+        let snippet_fragment = &html[tag_end..next_anchor.min(tag_end.saturating_add(4_000))];
+        let snippet = extract_html_fragment(snippet_fragment, "result__snippet")
+            .or_else(|| extract_html_fragment(snippet_fragment, "result-snippet"))
+            .or_else(|| extract_html_fragment(snippet_fragment, "snippet"))
+            .unwrap_or_default();
+
+        if !title.is_empty() && !href.is_empty() {
+            out.push(serde_json::json!({
+                "title": title,
+                "url": href,
+                "snippet": snippet,
+            }));
+        }
+
+        cursor = tag_end;
+    }
+
+    out
+}
+
+/// Extract a best-effort href from an anchor tag.
+fn extract_href(anchor_html: &str) -> Option<String> {
+    let href_pos = anchor_html.find("href=")?;
+    let quote = anchor_html[href_pos + 5..].chars().next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+
+    let value_start = href_pos + 6;
+    let value_end_rel = anchor_html[value_start..].find(quote)?;
+    let value = &anchor_html[value_start..value_start + value_end_rel];
+    Some(decode_html_entities(value.trim()))
+}
+
+/// Extract visible text from an anchor by stripping simple HTML tags.
+fn extract_anchor_text(anchor_html: &str) -> String {
+    let content_start = match anchor_html.find('>') {
+        Some(idx) => idx + 1,
+        None => return String::new(),
+    };
+    let content_end = match anchor_html.rfind("</a>") {
+        Some(idx) if idx >= content_start => idx,
+        _ => anchor_html.len(),
+    };
+
+    strip_html_tags(&anchor_html[content_start..content_end])
+}
+
+/// Extract a text fragment from an HTML snippet using a class marker.
+fn extract_html_fragment(fragment: &str, class_marker: &str) -> Option<String> {
+    let marker_idx = fragment.find(class_marker)?;
+    let tag_start = fragment[..marker_idx].rfind('<')?;
+    let tag_name_end = fragment[tag_start + 1..]
+        .find(|ch: char| ch == '>' || ch.is_whitespace())
+        .map(|idx| tag_start + 1 + idx)?;
+    let tag_name = &fragment[tag_start + 1..tag_name_end];
+    let open_end_rel = fragment[marker_idx..].find('>')?;
+    let content_start = marker_idx + open_end_rel + 1;
+    let close_marker = format!("</{tag_name}>");
+    let close_tag_rel = fragment[content_start..].find(&close_marker)?;
+    let close_tag = content_start + close_tag_rel;
+
+    if close_tag <= tag_start {
+        return None;
+    }
+
+    let raw = &fragment[content_start..close_tag];
+    let cleaned = strip_html_tags(raw);
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned)
+    }
+}
+
+/// Remove simple HTML tags and decode common entities.
+fn strip_html_tags(raw: &str) -> String {
+    let mut out = String::new();
+    let mut in_tag = false;
+
+    for ch in raw.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(ch),
+            _ => {}
+        }
+    }
+
+    decode_html_entities(out.trim())
+}
+
+/// Normalize DuckDuckGo redirect links into their destination URL.
+fn normalize_duckduckgo_result_url(raw: &str) -> String {
+    let raw = raw.trim();
+    let candidate = if raw.starts_with("//") {
+        format!("https:{raw}")
+    } else {
+        raw.to_string()
+    };
+
+    let Ok(url) = reqwest::Url::parse(&candidate) else {
+        return candidate;
+    };
+
+    if url.domain() == Some("duckduckgo.com") || url.domain() == Some("html.duckduckgo.com") {
+        if let Some((_, value)) = url.query_pairs().find(|(key, _)| key == "uddg") {
+            return value.into_owned();
+        }
+    }
+
+    url.to_string()
+}
+
+/// Decode a small set of HTML entities commonly returned by search result
+/// pages.
+fn decode_html_entities(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let bytes = raw.as_bytes();
+    let mut idx = 0usize;
+
+    while idx < bytes.len() {
+        if bytes[idx] != b'&' {
+            out.push(bytes[idx] as char);
+            idx += 1;
+            continue;
+        }
+
+        let Some(end_rel) = raw[idx..].find(';') else {
+            out.push('&');
+            idx += 1;
+            continue;
+        };
+        let end = idx + end_rel;
+        let entity = &raw[idx + 1..end];
+        let decoded = match entity {
+            "amp" => Some('&'),
+            "lt" => Some('<'),
+            "gt" => Some('>'),
+            "quot" => Some('"'),
+            "apos" | "#39" | "#x27" => Some('\''),
+            "nbsp" => Some(' '),
+            "#47" | "#x2F" => Some('/'),
+            _ => decode_numeric_entity(entity),
+        };
+
+        if let Some(ch) = decoded {
+            out.push(ch);
+        } else {
+            out.push('&');
+            out.push_str(entity);
+            out.push(';');
+        }
+        idx = end + 1;
+    }
+
+    out
+}
+
+/// Decode `&#...;` or `&#x...;` entities.
+fn decode_numeric_entity(entity: &str) -> Option<char> {
+    if let Some(hex) = entity
+        .strip_prefix("#x")
+        .or_else(|| entity.strip_prefix("#X"))
+    {
+        let value = u32::from_str_radix(hex, 16).ok()?;
+        return char::from_u32(value);
+    }
+
+    let dec = entity.strip_prefix('#')?;
+    let value = dec.parse::<u32>().ok()?;
+    char::from_u32(value)
+}
+
+/// Infer a reasonable media type for `Show`.
+fn guess_media_type(path: &Path, encoding: &UserVisibleFileEncoding) -> String {
+    match encoding {
+        UserVisibleFileEncoding::Base64 => {
+            let ext = path
+                .extension()
+                .and_then(|value| value.to_str())
+                .map(|value| value.to_ascii_lowercase());
+            match ext.as_deref() {
+                Some("png") => "image/png".to_string(),
+                Some("jpg") | Some("jpeg") => "image/jpeg".to_string(),
+                Some("gif") => "image/gif".to_string(),
+                Some("webp") => "image/webp".to_string(),
+                Some("pdf") => "application/pdf".to_string(),
+                Some("zip") => "application/zip".to_string(),
+                _ => "application/octet-stream".to_string(),
+            }
+        }
+        UserVisibleFileEncoding::Utf8 => {
+            let ext = path
+                .extension()
+                .and_then(|value| value.to_str())
+                .map(|value| value.to_ascii_lowercase());
+            match ext.as_deref() {
+                Some("md") => "text/markdown".to_string(),
+                Some("json") => "application/json".to_string(),
+                Some("toml") => "application/toml".to_string(),
+                Some("yaml") | Some("yml") => "application/yaml".to_string(),
+                Some("rs") => "text/x-rust".to_string(),
+                Some("sh") => "text/x-shellscript".to_string(),
+                Some("txt") | Some("log") => "text/plain".to_string(),
+                _ => "text/plain; charset=utf-8".to_string(),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1000,6 +1606,39 @@ mod tests {
             .resolve_under_workspace("..\\outside.txt")
             .expect_err("path traversal must fail");
         assert!(err.to_string().contains("escapes workspace root"));
+    }
+
+    #[test]
+    fn validate_network_url_rejects_non_http() {
+        let err = validate_network_url("file:///tmp/secret.txt")
+            .expect_err("non-http URL must be rejected");
+        assert!(err.to_string().contains("http/https"));
+    }
+
+    #[test]
+    fn normalize_duckduckgo_redirect_extracts_uddg() {
+        let url = normalize_duckduckgo_result_url(
+            "https://duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fguide",
+        );
+        assert_eq!(url, "https://example.com/guide");
+    }
+
+    #[test]
+    fn extract_duckduckgo_results_parses_title_url_and_snippet() {
+        let html = r#"
+<div class="result">
+  <a rel="nofollow" class="result__a" href="https://duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fpage">
+    Example &amp; Guide
+  </a>
+  <a class="result__snippet">A <b>useful</b> summary.</a>
+</div>
+"#;
+
+        let results = extract_duckduckgo_results(html, 5);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["title"], "Example & Guide");
+        assert_eq!(results[0]["url"], "https://example.com/page");
+        assert_eq!(results[0]["snippet"], "A useful summary.");
     }
 
     #[tokio::test]

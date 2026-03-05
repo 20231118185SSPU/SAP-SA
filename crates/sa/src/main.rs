@@ -28,11 +28,12 @@ use sa_core::memory::{MemoryEntry, MemoryStore, default_memory_path};
 use sa_core::openai::OpenAiClient;
 use sa_core::skills::SkillRegistry;
 use sa_core::tools::{
-    AskQuestionFn, AskRequest, MAX_SUBAGENT_DEPTH, RunSubAgentFn, SendMessageFn, SubAgentRequest,
-    ToolContext, ToolExecutor, ToolRuntime,
+    AskQuestionFn, AskRequest, MAX_SUBAGENT_DEPTH, RunSubAgentFn, SendMessageFn, ShowFileFn,
+    SubAgentRequest, ToolContext, ToolExecutor, ToolRuntime,
 };
 use sa_core::ws_protocol::{
     ClientMessage, Event, EventKind, QuestionMode, ServerMessage, UserQuestion, UserQuestionAnswer,
+    UserVisibleFile,
 };
 use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
@@ -47,6 +48,9 @@ use uuid::Uuid;
 ///
 /// The buffer is used so a CLI can reconnect and request event history.
 const MAX_BUFFERED_EVENTS: usize = 10_000;
+
+/// Max number of recent `Show` payloads kept for reconnecting clients.
+const MAX_BUFFERED_SHOWS: usize = 32;
 
 /// CLI arguments.
 #[derive(clap::Parser, Debug)]
@@ -115,6 +119,9 @@ struct Hub {
     /// Questions waiting for a user answer.
     pending_questions: Mutex<Vec<PendingQuestionEntry>>,
 
+    /// Recent files explicitly shown to the user.
+    recent_shows: Mutex<VecDeque<UserVisibleFile>>,
+
     /// Context used for safe path resolution when preloading files.
     preload_ctx: ToolContext,
 
@@ -157,6 +164,7 @@ impl Hub {
             seen_tasks: Mutex::new(HashSet::new()),
             current_task: Mutex::new(None),
             pending_questions: Mutex::new(Vec::new()),
+            recent_shows: Mutex::new(VecDeque::new()),
             preload_ctx,
             memory: Mutex::new(memory),
             runner,
@@ -270,6 +278,31 @@ impl Hub {
             .lock()
             .expect("pending_questions mutex poisoned");
         pending.iter().map(|entry| entry.question.clone()).collect()
+    }
+
+    /// Snapshot the most recent `Show` payloads for reconnecting clients.
+    fn recent_shows_snapshot(&self) -> Vec<UserVisibleFile> {
+        let shows = self
+            .recent_shows
+            .lock()
+            .expect("recent_shows mutex poisoned");
+        shows.iter().cloned().collect()
+    }
+
+    /// Store and broadcast a user-visible file payload.
+    fn publish_show(&self, file: UserVisibleFile) {
+        {
+            let mut shows = self
+                .recent_shows
+                .lock()
+                .expect("recent_shows mutex poisoned");
+            shows.push_back(file.clone());
+            while shows.len() > MAX_BUFFERED_SHOWS {
+                shows.pop_front();
+            }
+        }
+
+        self.broadcast_server_message(ServerMessage::Show { file });
     }
 
     /// Validate and deliver an answer coming from a client.
@@ -419,13 +452,29 @@ impl Hub {
             })
         });
 
+        let hub_for_show = Arc::clone(self);
+        let show_file: ShowFileFn = Arc::new(move |mut file: UserVisibleFile| {
+            let hub = Arc::clone(&hub_for_show);
+            Box::pin(async move {
+                file.task_id = task_id;
+                if depth > 0 {
+                    file.title = Some(match file.title {
+                        Some(title) => format!("[subagent depth={depth}] {title}"),
+                        None => format!("[subagent depth={depth}] {}", file.path),
+                    });
+                }
+                hub.publish_show(file);
+                Ok(())
+            })
+        });
+
         let hub_for_subagent = Arc::clone(self);
         let run_subagent: RunSubAgentFn = Arc::new(move |request: SubAgentRequest, cancel| {
             let hub = Arc::clone(&hub_for_subagent);
             Box::pin(async move { hub.run_subagent(task_id, depth, request, cancel).await })
         });
 
-        ToolRuntime::new(send_message, ask_question, run_subagent)
+        ToolRuntime::new(send_message, ask_question, show_file, run_subagent)
     }
 
     /// Run a nested sub-agent while keeping all output attached to the
@@ -857,6 +906,9 @@ async fn ws_session(socket: WebSocket, hub: Arc<Hub>) {
     // interrupted `Ask` interaction.
     let _ = out_tx.send(ServerMessage::PendingQuestions {
         questions: hub.pending_questions_snapshot(),
+    });
+    let _ = out_tx.send(ServerMessage::RecentShows {
+        files: hub.recent_shows_snapshot(),
     });
 
     // Writer task: serialize ServerMessage -> WS text frame.

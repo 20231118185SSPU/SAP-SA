@@ -75,6 +75,14 @@ pub enum ServerMessage {
     #[serde(rename = "question_resolved")]
     QuestionResolved { question_id: Uuid },
 
+    /// A user-visible file payload emitted by the `Show` tool.
+    #[serde(rename = "show")]
+    Show { file: UserVisibleFile },
+
+    /// Snapshot of the most recent `Show` payloads for reconnecting clients.
+    #[serde(rename = "recent_shows")]
+    RecentShows { files: Vec<UserVisibleFile> },
+
     /// A protocol-level error (bad request, parse error, etc.).
     #[serde(rename = "error")]
     Error { message: String },
@@ -164,6 +172,46 @@ pub struct UserQuestionAnswer {
     /// Optional free-text input from the user.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub free_text: Option<String>,
+}
+
+/// A file payload explicitly shown to the user by the `Show` tool.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserVisibleFile {
+    /// Unique show id.
+    pub show_id: Uuid,
+
+    /// Top-level task that produced this file.
+    pub task_id: Uuid,
+
+    /// Original workspace-relative or absolute path resolved by the backend.
+    pub path: String,
+
+    /// Optional user-facing title.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+
+    /// Best-effort media type hint.
+    pub media_type: String,
+
+    /// How to interpret `content`.
+    pub encoding: UserVisibleFileEncoding,
+
+    /// Text body or base64-encoded bytes, depending on `encoding`.
+    pub content: String,
+
+    /// Original byte size before transport encoding.
+    pub bytes: usize,
+}
+
+/// How a shown file's `content` field is encoded.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UserVisibleFileEncoding {
+    /// UTF-8 text sent directly.
+    Utf8,
+
+    /// Binary bytes encoded as base64 text.
+    Base64,
 }
 
 /// Event kind (used for CLI coloring/filtering later).
