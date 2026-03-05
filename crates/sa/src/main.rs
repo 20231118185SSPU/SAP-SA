@@ -20,7 +20,7 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use clap::Parser;
 use futures_util::{SinkExt as _, StreamExt as _};
-use sa_core::agent::{AgentRunner, AgentRunnerConfig, EmitEventFn};
+use sa_core::agent::{AgentRunner, AgentRunnerConfig, DrainQueuedUserMessagesFn, EmitEventFn};
 use sa_core::agents_md::{extract_markdown_file_references, load_agents_md};
 use sa_core::cancel::{CancelHandle, cancel_pair};
 use sa_core::config::load_config_from_file;
@@ -81,6 +81,9 @@ struct CurrentTask {
     task_id: Uuid,
     /// Cancellation handle for the task.
     cancel: CancelHandle,
+    /// Follow-up user messages that should be injected into the same session
+    /// once the current model/tool step reaches a safe boundary.
+    follow_up_messages: Arc<Mutex<VecDeque<String>>>,
 }
 
 /// One question currently waiting for a user answer.
@@ -111,7 +114,11 @@ struct Hub {
     /// Monotonic event id generator.
     next_event_id: AtomicU64,
 
-    /// Set of task ids already accepted (idempotency for retries).
+    /// Set of submit ids already accepted (idempotency for retries).
+    ///
+    /// This now covers both:
+    /// - top-level tasks
+    /// - queued follow-up messages sent while a task is still running
     seen_tasks: Mutex<HashSet<Uuid>>,
 
     /// Currently running task (if any), so we can cancel it.
@@ -351,14 +358,44 @@ impl Hub {
         Ok(())
     }
 
-    /// Submit a task to the queue (idempotent).
+    /// Accept one user message (idempotent).
+    ///
+    /// Behavior:
+    /// - if no task is currently running, this becomes a new top-level task
+    /// - if a task is currently running, this is queued as a follow-up user
+    ///   turn for that same session
+    /// - if the current task is already being cancelled, the message is queued
+    ///   as the next top-level task instead of being attached to the doomed run
     async fn submit_task(&self, task_id: Uuid, task: String) -> anyhow::Result<()> {
-        // Ensure idempotency: if we have already seen this task id, do not enqueue again.
+        // Ensure idempotency: if we have already seen this submit id, do not process it again.
         {
             let mut seen = self.seen_tasks.lock().expect("seen_tasks mutex poisoned");
             if !seen.insert(task_id) {
                 return Ok(());
             }
+        }
+
+        let current = self
+            .current_task
+            .lock()
+            .expect("current_task mutex poisoned")
+            .clone();
+
+        if let Some(info) = current.filter(|info| !info.cancel.is_cancelled()) {
+            {
+                let mut queued = info
+                    .follow_up_messages
+                    .lock()
+                    .expect("follow_up_messages mutex poisoned");
+                queued.push_back(task);
+            }
+
+            self.publish(
+                EventKind::Log,
+                info.task_id,
+                format!("Queued a follow-up message for the current task (submit_id={task_id})."),
+            );
+            return Ok(());
         }
 
         // Emit an event immediately so clients see that the task is queued.
@@ -570,6 +607,7 @@ impl Hub {
                 Some(extra_prompt.as_str()),
                 runtime,
                 &cancel,
+                None,
                 emit,
             )
             .await;
@@ -604,6 +642,7 @@ impl Hub {
             //
             // This is the backend part of: "the CLI can send messages anytime to interrupt".
             let (cancel_handle, cancel_token) = cancel_pair();
+            let follow_up_messages = Arc::new(Mutex::new(VecDeque::<String>::new()));
             {
                 let mut current = self
                     .current_task
@@ -612,6 +651,7 @@ impl Hub {
                 *current = Some(CurrentTask {
                     task_id: req.task_id,
                     cancel: cancel_handle,
+                    follow_up_messages: Arc::clone(&follow_up_messages),
                 });
             }
 
@@ -651,6 +691,12 @@ impl Hub {
             let emit: EmitEventFn = Arc::new(move |kind, task_id, message| {
                 hub_for_emit.publish(kind, task_id, message);
             });
+            let drain_queued_user_messages: DrainQueuedUserMessagesFn = Arc::new(move || {
+                let mut queued = follow_up_messages
+                    .lock()
+                    .expect("follow_up_messages mutex poisoned");
+                queued.drain(..).collect()
+            });
             let runtime = self.build_tool_runtime(req.task_id, 0);
 
             // Run the agent loop.
@@ -663,6 +709,7 @@ impl Hub {
                     Some(extra_prompt.as_str()),
                     runtime,
                     &cancel_token,
+                    Some(drain_queued_user_messages),
                     emit,
                 )
                 .await

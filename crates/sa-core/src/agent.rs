@@ -27,6 +27,16 @@ use uuid::Uuid;
 /// The daemon will wrap these events with event IDs and broadcast them to clients.
 pub type EmitEventFn = Arc<dyn Fn(EventKind, Uuid, String) + Send + Sync>;
 
+/// Callback used by the backend to drain follow-up user messages that arrived
+/// while the current task was still running.
+///
+/// Why a callback instead of directly sharing backend state here?
+/// - `sa-core` stays independent from the daemon implementation details.
+/// - The daemon decides where queued input lives.
+/// - The agent loop only needs a simple "give me any pending user turns now"
+///   primitive before it issues the next model request.
+pub type DrainQueuedUserMessagesFn = Arc<dyn Fn() -> Vec<String> + Send + Sync>;
+
 /// Configuration for a single `AgentRunner`.
 #[derive(Debug, Clone)]
 pub struct AgentRunnerConfig {
@@ -80,6 +90,7 @@ impl AgentRunner {
         extra_system_prompt: Option<&str>,
         runtime: ToolRuntime,
         cancel: &CancelToken,
+        drain_queued_user_messages: Option<DrainQueuedUserMessagesFn>,
         emit: EmitEventFn,
     ) -> anyhow::Result<String> {
         // Make it visible in the event stream whether `Agents.md` was found.
@@ -141,6 +152,13 @@ impl AgentRunner {
                 (emit)(EventKind::Final, task_id, msg.clone());
                 return Ok(msg);
             }
+
+            drain_follow_up_messages(
+                task_id,
+                &mut messages,
+                drain_queued_user_messages.as_ref(),
+                &emit,
+            );
 
             (emit)(
                 EventKind::Log,
@@ -237,6 +255,15 @@ impl AgentRunner {
 
             // If no tool calls => done.
             if tool_calls.is_empty() {
+                if drain_follow_up_messages(
+                    task_id,
+                    &mut messages,
+                    drain_queued_user_messages.as_ref(),
+                    &emit,
+                ) {
+                    continue;
+                }
+
                 let final_text = messages
                     .last()
                     .and_then(|m| m.content.clone())
@@ -469,7 +496,7 @@ SubAgent 是保护主上下文窗口的利器。用不用子代理的判断标�
             "- 你运行在本地自治代理环境中，同学通过外部交互层向你发送任务、接收消息、查看文件和回答问题。\n\
 - 你的普通文字回复默认视作不存在，不会直接显示给同学；只有 `Send`、`Ask` 和 `Show` 会进入对同学可见的交互层。需要让同学看到内容时，必须使用这些工具，通常优先用 `Send`。\n\
 - `Show` 会把文件直接展示给同学，因此它比长篇普通文本更适合承载高密度信息。\n\
-- 同学可能随时发送新消息来打断当前任务并启动新的任务；你的行为应该保持可中断、可恢复、可解释。\n\
+- 同学可能在你运行过程中继续发送新消息；这些消息通常会被排队，并在下一次模型请求前插入当前会话。只有同学显式中断时，你才会被取消。你的行为应该保持可中断、可恢复、可解释。\n\
 - 如果工具输出包含敏感信息，也不要在面向同学的文本中重复它们。\n\n",
         );
 
@@ -485,6 +512,51 @@ SubAgent 是保护主上下文窗口的利器。用不用子代理的判断标�
 
         out
     }
+}
+
+/// Drain any queued follow-up user messages and append them to the current
+/// conversation history as fresh user turns.
+///
+/// This is the core of the "don't interrupt on normal send" behavior:
+/// - while the model/tool work is busy, new user messages are buffered outside
+///   the agent loop,
+/// - once we reach a safe point before the next model request, we splice those
+///   messages into the same conversation,
+/// - the model then sees them as ordinary subsequent user turns.
+fn drain_follow_up_messages(
+    task_id: Uuid,
+    messages: &mut Vec<ChatMessage>,
+    drain_queued_user_messages: Option<&DrainQueuedUserMessagesFn>,
+    emit: &EmitEventFn,
+) -> bool {
+    let Some(drain) = drain_queued_user_messages else {
+        return false;
+    };
+
+    let queued: Vec<String> = (drain)()
+        .into_iter()
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+        .collect();
+
+    if queued.is_empty() {
+        return false;
+    }
+
+    (emit)(
+        EventKind::Log,
+        task_id,
+        format!(
+            "Injecting {} queued follow-up message(s) into the current session.",
+            queued.len()
+        ),
+    );
+
+    for text in queued {
+        messages.push(ChatMessage::text("user", text));
+    }
+
+    true
 }
 
 /// Normalize third-party skill descriptions so prompt wording stays consistent

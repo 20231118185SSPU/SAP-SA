@@ -57,6 +57,11 @@ impl CancelHandle {
         // We ignore the error because receivers may already be dropped.
         let _ = self.tx.send(true);
     }
+
+    /// Return `true` if cancellation has already been requested.
+    pub fn is_cancelled(&self) -> bool {
+        *self.tx.borrow()
+    }
 }
 
 impl CancelToken {

@@ -55,9 +55,9 @@ cargo build --release
 
 Interactive commands (CLI):
 
-- Type text and press Enter → interrupts current task (if any) and submits a new task
-- If a structured question is pending, Enter answers that question instead of creating a new task
-- `/stop` → interrupt current task
+- Type text and press Enter → sends a normal message; if a task is already running, the backend queues it as a follow-up turn instead of interrupting immediately
+- Pending `Ask` questions use a dedicated answer box; press `Tab` to switch focus between the answer box and the normal message box
+- `Esc` → interrupt current task
 - `/exit` → quit CLI
 
 One-shot mode (for scripting):
