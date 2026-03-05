@@ -26,6 +26,7 @@
 //!   without coupling this crate to any particular transport.
 
 use crate::cancel::CancelToken;
+use crate::mcp_client::McpRegistry;
 use crate::memory::{read_markdown_memory, search_markdown_memory};
 use crate::openai::{ToolDefinition, ToolFunctionDefinition};
 use crate::skills::SkillRegistry;
@@ -362,21 +363,32 @@ impl ToolSession {
 }
 
 /// Concrete tool executor.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ToolExecutor {
     /// Shared tool context.
     pub ctx: ToolContext,
+    /// Optional external MCP registry.
+    mcp_registry: Option<Arc<McpRegistry>>,
+}
+
+impl std::fmt::Debug for ToolExecutor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ToolExecutor")
+            .field("ctx", &self.ctx)
+            .field("has_mcp_registry", &self.mcp_registry.is_some())
+            .finish()
+    }
 }
 
 impl ToolExecutor {
     /// Create a new executor.
-    pub fn new(ctx: ToolContext) -> Self {
-        Self { ctx }
+    pub fn new(ctx: ToolContext, mcp_registry: Option<Arc<McpRegistry>>) -> Self {
+        Self { ctx, mcp_registry }
     }
 
     /// Tool definitions advertised to the model.
     pub fn tool_definitions(&self) -> Vec<ToolDefinition> {
-        vec![
+        let mut definitions = vec![
             ToolDefinition {
                 kind: "function".to_string(),
                 function: ToolFunctionDefinition {
@@ -711,7 +723,13 @@ impl ToolExecutor {
                     }),
                 },
             },
-        ]
+        ];
+
+        if let Some(registry) = &self.mcp_registry {
+            definitions.extend(registry.tool_definitions());
+        }
+
+        definitions
     }
 
     /// Execute one tool call.
@@ -737,7 +755,14 @@ impl ToolExecutor {
             "Ask" => self.ask(runtime, args, cancel).await,
             "Skill" => self.skill(args, cancel).await,
             "SubAgent" => self.subagent(runtime, args, cancel).await,
-            _ => anyhow::bail!("Unknown tool: {name}"),
+            _ => {
+                if let Some(registry) = &self.mcp_registry {
+                    if registry.has_tool(name) {
+                        return registry.call_tool(name, args).await;
+                    }
+                }
+                anyhow::bail!("Unknown tool: {name}")
+            }
         }
     }
 
@@ -1774,7 +1799,7 @@ mod tests {
     #[tokio::test]
     async fn write_refuses_existing_file() {
         let ctx = test_context();
-        let executor = ToolExecutor::new(ctx.clone());
+        let executor = ToolExecutor::new(ctx.clone(), None);
         let path = ctx.workspace_root.join("already.txt");
         fs::write(&path, "hello").expect("seed file");
 
@@ -1795,7 +1820,7 @@ mod tests {
     #[tokio::test]
     async fn edit_requires_read_first() {
         let ctx = test_context();
-        let executor = ToolExecutor::new(ctx.clone());
+        let executor = ToolExecutor::new(ctx.clone(), None);
         let mut session = ToolSession::default();
         let cancel = crate::cancel::cancel_pair().1;
 
@@ -1820,7 +1845,7 @@ mod tests {
     #[tokio::test]
     async fn edit_invalidates_read_marker_after_success() {
         let ctx = test_context();
-        let executor = ToolExecutor::new(ctx.clone());
+        let executor = ToolExecutor::new(ctx.clone(), None);
         let mut session = ToolSession::default();
         let cancel = crate::cancel::cancel_pair().1;
 

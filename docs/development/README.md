@@ -20,17 +20,22 @@ The terminal frontend is a separate project located at:
    - `model`
    - `system_role_name`
    - `reasoning_effort` (optional; for GPT-family reasoning depth such as `low`, `high`, `xhigh`)
-3. `AGENTS.md` and related context files are now tracked in the repository. If `AGENTS.md`
+3. (Optional) Configure `[mcp]` if you want external MCP tools:
+   - `enabled = true`
+   - one or more `[[mcp.servers]]`
+   - supported transports: `stdio`, `http`, `sse`
+   - registered tool names are prefixed as `<server>__<tool>`
+4. `AGENTS.md` and related context files are now tracked in the repository. If `AGENTS.md`
    references persona/context files in backticks (e.g. `SOUL.md`, `USER.md`), the daemon will
    preload them into the prompt. Memory files are handled separately through
    `MemorySearch` / `MemoryGet`.
-4. Start the daemon:
+5. Start the daemon:
 
 ```bash
 cargo run -p sa --release
 ```
 
-5. Start the interactive CLI (bottom input box) in the separate CLI project:
+6. Start the interactive CLI (bottom input box) in the separate CLI project:
 
 ```bash
 cd ../sa-cli
@@ -117,6 +122,9 @@ Structured question fields:
 - `Skill`: read `SKILL.md` or another skill-relative file from a named skill; host install paths stay hidden
 - `SubAgent`: run a nested child agent with parent-supplied context; child output is traced back into the parent task stream
 
+If MCP is enabled, additional dynamic tools are appended at startup. These use
+the name format `<server>__<tool>` and are dispatched through the MCP client.
+
 ## Known issues
 
 - This is intentionally minimal: no authentication on the WebSocket server.
@@ -124,6 +132,7 @@ Structured question fields:
 - Streaming token output is not implemented; events are per-step.
 - Memory search is currently lexical Markdown search, not embedding-based semantic search.
 - `Search` currently uses DuckDuckGo's lightweight HTML endpoint and a small internal parser; if that HTML changes, result extraction may need maintenance.
+- MCP support currently covers tools only; MCP resources and prompts are not yet wired into SA.
 
 ## Changelog
 

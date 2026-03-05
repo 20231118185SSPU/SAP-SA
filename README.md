@@ -84,7 +84,31 @@
 - 模型需要具体技能内容时，通过 `Skill` 工具按名称读取
 - 不向模型暴露宿主机上的真实技能安装路径
 
-### 4. 记忆系统
+### 4. MCP 工具系统
+
+`SA` 支持连接外部 MCP（Model Context Protocol）工具服务器。
+
+当前支持的传输类型：
+
+- `stdio`
+- `http`
+- `sse`
+
+加载方式：
+
+- 在 `sa.toml` 中配置 `[mcp]`
+- 启动时连接所有配置的 MCP server
+- 成功连接后，把它们暴露的工具自动注册进 Agent 工具表
+- 工具名会带服务器前缀，格式为：`<server>__<tool>`
+
+例如：
+
+- `filesystem__read_file`
+- `browser__navigate`
+
+连接失败不会阻止 `SA` 启动；失败的 MCP server 会被记录日志并跳过。
+
+### 5. 记忆系统
 
 记忆系统采用 OpenClaw 风格：
 
@@ -99,7 +123,7 @@
   - `MemorySearch`
   - `MemoryGet`
 
-### 5. 自治工具调用循环
+### 6. 自治工具调用循环
 
 后端会重复执行以下循环直到任务完成：
 
@@ -145,6 +169,8 @@
   - 按技能名读取 `SKILL.md` 或技能目录下的相对文件
 - `SubAgent`
   - 启动一个子代理并返回其最终结果
+
+此外，如果配置了 MCP server，工具表中还会出现动态注册的 MCP 工具。
 
 ## 目录结构
 
@@ -196,6 +222,20 @@ system_role_name = "developer"
 ```toml
 [llm]
 reasoning_effort = "high"
+```
+
+如果要启用 MCP，可以继续配置：
+
+```toml
+[mcp]
+enabled = true
+
+[[mcp.servers]]
+name = "filesystem"
+transport = "stdio"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "."]
+tool_timeout_secs = 180
 ```
 
 ### 2. 启动后端
@@ -262,6 +302,7 @@ cargo build --release
 - `MemorySearch` 当前是 Markdown 词法检索，不是向量语义检索
 - `SubAgent` 有递归深度上限，避免无限递归
 - CLI 只是过渡性的测试前端，不是最终产品形态
+- 当前只接入了 MCP 的 tool 能力，还没有接入 MCP resources / prompts
 
 ## 版本节点
 

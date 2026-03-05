@@ -60,3 +60,31 @@ agents_md = "Agents.md"
 #
 # `~` is expanded to the user home directory by SA.
 dirs = ["~/.codex/skills", "~/.agents/skills"]
+
+[mcp]
+# Enable external MCP (Model Context Protocol) tool servers.
+enabled = false
+
+# Configure one or more MCP servers.
+#
+# Stdio example:
+# [[mcp.servers]]
+# name = "filesystem"
+# transport = "stdio"
+# command = "npx"
+# args = ["-y", "@modelcontextprotocol/server-filesystem", "."]
+# tool_timeout_secs = 180
+#
+# HTTP example:
+# [[mcp.servers]]
+# name = "remote"
+# transport = "http"
+# url = "https://example.com/mcp"
+# tool_timeout_secs = 180
+#
+# SSE example:
+# [[mcp.servers]]
+# name = "remote-sse"
+# transport = "sse"
+# url = "https://example.com/mcp/sse"
+# tool_timeout_secs = 180

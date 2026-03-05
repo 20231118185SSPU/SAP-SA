@@ -28,6 +28,10 @@ pub struct Config {
     /// Skills discovery configuration (`[skills]`).
     #[serde(default)]
     pub skills: SkillsConfig,
+
+    /// External MCP server configuration (`[mcp]`).
+    #[serde(default)]
+    pub mcp: McpConfig,
 }
 
 /// LLM/provider configuration (`[llm]` section).
@@ -163,6 +167,58 @@ pub struct SkillsConfig {
     pub dirs: Vec<String>,
 }
 
+/// Transport type for MCP server connections.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum McpTransport {
+    /// Spawn a local process and communicate over stdin/stdout.
+    #[default]
+    Stdio,
+    /// Connect via HTTP POST.
+    Http,
+    /// Connect via HTTP + Server-Sent Events.
+    Sse,
+}
+
+/// Configuration for one external MCP server.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct McpServerConfig {
+    /// Display name used as the tool prefix (`<server>__<tool>`).
+    pub name: String,
+    /// Transport type.
+    #[serde(default)]
+    pub transport: McpTransport,
+    /// URL for HTTP/SSE transports.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Executable for stdio transport.
+    #[serde(default)]
+    pub command: String,
+    /// Arguments for stdio transport.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Extra environment variables for stdio transport.
+    #[serde(default)]
+    pub env: std::collections::HashMap<String, String>,
+    /// Extra HTTP headers for HTTP/SSE transports.
+    #[serde(default)]
+    pub headers: std::collections::HashMap<String, String>,
+    /// Optional per-call timeout in seconds.
+    #[serde(default)]
+    pub tool_timeout_secs: Option<u64>,
+}
+
+/// External MCP client configuration (`[mcp]`).
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct McpConfig {
+    /// Whether MCP support is enabled.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Configured MCP servers.
+    #[serde(default)]
+    pub servers: Vec<McpServerConfig>,
+}
+
 impl SkillsConfig {
     /// Resolve the configured skill directories into paths.
     ///
@@ -183,8 +239,10 @@ pub fn load_config_from_file(path: &Path) -> anyhow::Result<Config> {
         .with_context(|| format!("Failed to read config file: {}", path.display()))?;
 
     // Parse TOML into typed config.
-    toml::from_str::<Config>(&raw)
-        .with_context(|| format!("Failed to parse TOML config file: {}", path.display()))
+    let config = toml::from_str::<Config>(&raw)
+        .with_context(|| format!("Failed to parse TOML config file: {}", path.display()))?;
+    validate_mcp_config(&config.mcp)?;
+    Ok(config)
 }
 
 /// Best-effort expansion of `~` (tilde) to the current user's home directory.
@@ -216,9 +274,73 @@ pub fn expand_tilde(path: &str) -> PathBuf {
     home.join(rest)
 }
 
+/// Hard safety ceiling for MCP per-tool call timeouts.
+const MCP_MAX_TOOL_TIMEOUT_SECS: u64 = 600;
+
+/// Validate MCP configuration early so startup errors are explicit.
+fn validate_mcp_config(config: &McpConfig) -> anyhow::Result<()> {
+    let mut seen_names = std::collections::HashSet::<String>::new();
+
+    for (index, server) in config.servers.iter().enumerate() {
+        let name = server.name.trim();
+        if name.is_empty() {
+            anyhow::bail!("mcp.servers[{index}].name must not be empty");
+        }
+        if !seen_names.insert(name.to_ascii_lowercase()) {
+            anyhow::bail!("mcp.servers contains duplicate name: {name}");
+        }
+
+        if let Some(timeout) = server.tool_timeout_secs {
+            if timeout == 0 {
+                anyhow::bail!("mcp.servers[{index}].tool_timeout_secs must be greater than 0");
+            }
+            if timeout > MCP_MAX_TOOL_TIMEOUT_SECS {
+                anyhow::bail!(
+                    "mcp.servers[{index}].tool_timeout_secs exceeds max {MCP_MAX_TOOL_TIMEOUT_SECS}"
+                );
+            }
+        }
+
+        match server.transport {
+            McpTransport::Stdio => {
+                if server.command.trim().is_empty() {
+                    anyhow::bail!(
+                        "mcp.servers[{index}] with transport=stdio requires non-empty command"
+                    );
+                }
+            }
+            McpTransport::Http | McpTransport::Sse => {
+                let url = server
+                    .url
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "mcp.servers[{index}] with transport={} requires url",
+                            match server.transport {
+                                McpTransport::Http => "http",
+                                McpTransport::Sse => "sse",
+                                McpTransport::Stdio => "stdio",
+                            }
+                        )
+                    })?;
+                let parsed = reqwest::Url::parse(url)
+                    .with_context(|| format!("mcp.servers[{index}].url is not a valid URL"))?;
+                if !matches!(parsed.scheme(), "http" | "https") {
+                    anyhow::bail!("mcp.servers[{index}].url must use http/https");
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::LlmConfig;
+    use super::{LlmConfig, McpConfig, McpServerConfig, McpTransport, validate_mcp_config};
+    use std::collections::HashMap;
 
     fn sample_llm() -> LlmConfig {
         LlmConfig {
@@ -246,5 +368,57 @@ mod tests {
         let mut cfg = sample_llm();
         cfg.reasoning_effort = Some("  xhigh  ".to_string());
         assert_eq!(cfg.effective_reasoning_effort(), Some("xhigh"));
+    }
+
+    #[test]
+    fn mcp_validation_rejects_duplicate_server_names() {
+        let config = McpConfig {
+            enabled: true,
+            servers: vec![
+                McpServerConfig {
+                    name: "fs".to_string(),
+                    transport: McpTransport::Stdio,
+                    url: None,
+                    command: "server-a".to_string(),
+                    args: Vec::new(),
+                    env: HashMap::new(),
+                    headers: HashMap::new(),
+                    tool_timeout_secs: None,
+                },
+                McpServerConfig {
+                    name: "FS".to_string(),
+                    transport: McpTransport::Stdio,
+                    url: None,
+                    command: "server-b".to_string(),
+                    args: Vec::new(),
+                    env: HashMap::new(),
+                    headers: HashMap::new(),
+                    tool_timeout_secs: None,
+                },
+            ],
+        };
+
+        let err = validate_mcp_config(&config).expect_err("duplicate names must fail");
+        assert!(err.to_string().contains("duplicate name"));
+    }
+
+    #[test]
+    fn mcp_validation_rejects_missing_stdio_command() {
+        let config = McpConfig {
+            enabled: true,
+            servers: vec![McpServerConfig {
+                name: "fs".to_string(),
+                transport: McpTransport::Stdio,
+                url: None,
+                command: "   ".to_string(),
+                args: Vec::new(),
+                env: HashMap::new(),
+                headers: HashMap::new(),
+                tool_timeout_secs: None,
+            }],
+        };
+
+        let err = validate_mcp_config(&config).expect_err("stdio command must be required");
+        assert!(err.to_string().contains("requires non-empty command"));
     }
 }

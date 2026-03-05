@@ -24,6 +24,7 @@ use sa_core::agent::{AgentRunner, AgentRunnerConfig, EmitEventFn};
 use sa_core::agents_md::{extract_markdown_file_references, load_agents_md};
 use sa_core::cancel::{CancelHandle, cancel_pair};
 use sa_core::config::load_config_from_file;
+use sa_core::mcp_client::McpRegistry;
 use sa_core::memory::{build_prompt_block as build_memory_prompt_block, is_memory_reference};
 use sa_core::openai::OpenAiClient;
 use sa_core::skills::SkillRegistry;
@@ -1046,11 +1047,39 @@ async fn main() -> anyhow::Result<()> {
     let skills = Arc::new(SkillRegistry::scan(&skill_dirs)?);
     tracing::info!("Discovered {} skill(s).", skills.list().len());
 
+    // Connect external MCP servers before freezing the tool registry.
+    let mcp_registry = if cfg.mcp.enabled && !cfg.mcp.servers.is_empty() {
+        tracing::info!(
+            "Initializing MCP client — {} server(s) configured",
+            cfg.mcp.servers.len()
+        );
+        match McpRegistry::connect_all(&cfg.mcp.servers).await {
+            Ok(registry) if !registry.is_empty() => {
+                tracing::info!(
+                    "MCP: {} tool(s) registered from {} server(s)",
+                    registry.tool_count(),
+                    registry.server_count()
+                );
+                Some(Arc::new(registry))
+            }
+            Ok(_) => {
+                tracing::warn!("MCP enabled, but no MCP servers connected successfully.");
+                None
+            }
+            Err(error) => {
+                tracing::error!("MCP registry failed to initialize: {error:#}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Build tools.
     let tool_ctx = ToolContext::new(workspace_root, Arc::clone(&skills))?;
     let preload_ctx = tool_ctx.clone();
 
-    let tools = ToolExecutor::new(tool_ctx);
+    let tools = ToolExecutor::new(tool_ctx, mcp_registry);
 
     // Build LLM client.
     //
