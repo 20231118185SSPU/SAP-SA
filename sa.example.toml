@@ -21,6 +21,22 @@ model = "gpt-5.2"
 # - Example for this provider/channel: "developer"
 system_role_name = "developer"
 
+# Optional reasoning depth / effort for GPT-family reasoning models.
+#
+# This is forwarded as the OpenAI-compatible top-level `reasoning_effort`
+# request field when set.
+#
+# Common values include:
+# - "none"
+# - "minimal"
+# - "low"
+# - "medium"
+# - "high"
+# - "xhigh"
+#
+# Leave it empty / unset to omit the field completely.
+# reasoning_effort = "high"
+
 # Safety cap: maximum reasoning / tool-call steps per task.
 max_steps = 32
 

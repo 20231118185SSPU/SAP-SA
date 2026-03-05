@@ -178,6 +178,13 @@ pub struct ChatCompletionsRequest {
     /// Chat messages.
     pub messages: Vec<ChatMessage>,
 
+    /// Optional reasoning depth / effort for GPT-family reasoning models.
+    ///
+    /// This is forwarded as the OpenAI-compatible top-level
+    /// `reasoning_effort` field when configured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+
     /// Tool definitions (OpenAI function-calling style).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<ToolDefinition>>,
@@ -298,5 +305,40 @@ impl ChatCompletionsResponse {
         self.choices
             .first()
             .ok_or_else(|| anyhow::anyhow!("OpenAI response contained no choices"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ChatCompletionsRequest, ChatMessage};
+
+    #[test]
+    fn request_serializes_reasoning_effort_when_present() {
+        let req = ChatCompletionsRequest {
+            model: "gpt-5.2".to_string(),
+            messages: vec![ChatMessage::text("user", "hello")],
+            reasoning_effort: Some("xhigh".to_string()),
+            tools: None,
+            tool_choice: None,
+            stream: Some(false),
+        };
+
+        let value = serde_json::to_value(req).expect("serialize request");
+        assert_eq!(value["reasoning_effort"], "xhigh");
+    }
+
+    #[test]
+    fn request_omits_reasoning_effort_when_absent() {
+        let req = ChatCompletionsRequest {
+            model: "gpt-5.2".to_string(),
+            messages: vec![ChatMessage::text("user", "hello")],
+            reasoning_effort: None,
+            tools: None,
+            tool_choice: None,
+            stream: Some(false),
+        };
+
+        let value = serde_json::to_value(req).expect("serialize request");
+        assert!(value.get("reasoning_effort").is_none());
     }
 }

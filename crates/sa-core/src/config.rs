@@ -49,6 +49,25 @@ pub struct LlmConfig {
     #[serde(default)]
     pub system_role_name: Option<String>,
 
+    /// Optional reasoning depth / effort passed through to compatible GPT
+    /// models.
+    ///
+    /// Common values seen on GPT-family reasoning models include:
+    /// - `none`
+    /// - `minimal`
+    /// - `low`
+    /// - `medium`
+    /// - `high`
+    /// - `xhigh`
+    ///
+    /// We intentionally keep this as a free-form string because:
+    /// - different OpenAI-compatible providers may expose different subsets
+    /// - future providers may add new values
+    ///
+    /// If this field is absent or blank, we omit it from the request body.
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+
     /// Maximum tool-calling steps per task (safety cap).
     #[serde(default = "default_max_steps")]
     pub max_steps: u32,
@@ -77,6 +96,16 @@ impl LlmConfig {
 
         // Otherwise use the user-provided role name (e.g. "developer").
         trimmed
+    }
+
+    /// Return the effective reasoning effort, if configured.
+    pub fn effective_reasoning_effort(&self) -> Option<&str> {
+        let raw = self.reasoning_effort.as_deref()?;
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        Some(trimmed)
     }
 }
 
@@ -185,4 +214,37 @@ pub fn expand_tilde(path: &str) -> PathBuf {
     // treating it as an absolute path.
     let rest = rest.trim_start_matches(['/', '\\']);
     home.join(rest)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LlmConfig;
+
+    fn sample_llm() -> LlmConfig {
+        LlmConfig {
+            base_url: "https://example.com/v1".to_string(),
+            api_key: "sk-test".to_string(),
+            model: "gpt-5.2".to_string(),
+            system_role_name: None,
+            reasoning_effort: None,
+            max_steps: 32,
+        }
+    }
+
+    #[test]
+    fn effective_reasoning_effort_is_none_when_unset_or_blank() {
+        let cfg = sample_llm();
+        assert_eq!(cfg.effective_reasoning_effort(), None);
+
+        let mut cfg = sample_llm();
+        cfg.reasoning_effort = Some("   ".to_string());
+        assert_eq!(cfg.effective_reasoning_effort(), None);
+    }
+
+    #[test]
+    fn effective_reasoning_effort_trims_value() {
+        let mut cfg = sample_llm();
+        cfg.reasoning_effort = Some("  xhigh  ".to_string());
+        assert_eq!(cfg.effective_reasoning_effort(), Some("xhigh"));
+    }
 }

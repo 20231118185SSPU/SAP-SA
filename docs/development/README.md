@@ -14,16 +14,23 @@ The terminal frontend is a separate project located at:
 ## Running
 
 1. Create `sa.toml` from `sa.example.toml`.
-2. (Optional) Create a local `Agents.md` (gitignored). If it references persona/context files in
-   backticks (e.g. `SOUL.md`, `USER.md`), the daemon will preload them into the prompt.
-   Memory files are handled separately through `MemorySearch` / `MemoryGet`.
-3. Start the daemon:
+2. Configure `[llm]` as needed:
+   - `base_url`
+   - `api_key`
+   - `model`
+   - `system_role_name`
+   - `reasoning_effort` (optional; for GPT-family reasoning depth such as `low`, `high`, `xhigh`)
+3. `AGENTS.md` and related context files are now tracked in the repository. If `AGENTS.md`
+   references persona/context files in backticks (e.g. `SOUL.md`, `USER.md`), the daemon will
+   preload them into the prompt. Memory files are handled separately through
+   `MemorySearch` / `MemoryGet`.
+4. Start the daemon:
 
 ```bash
 cargo run -p sa --release
 ```
 
-4. Start the interactive CLI (bottom input box) in the separate CLI project:
+5. Start the interactive CLI (bottom input box) in the separate CLI project:
 
 ```bash
 cd ../sa-cli

@@ -40,9 +40,20 @@
 - `api_key`
 - `model`
 - `system_role_name`
+- `reasoning_effort`
 - `max_steps`
 
 其中 `system_role_name` 用于兼容一些只接受 `developer` 而不是 `system` 的渠道。
+`reasoning_effort` 用于给支持的 GPT 推理模型设置思维深度，常见值包括：
+
+- `none`
+- `minimal`
+- `low`
+- `medium`
+- `high`
+- `xhigh`
+
+如果不填写，就不会向兼容接口发送这个字段。
 
 ### 2. 工作区上下文注入
 
@@ -178,6 +189,13 @@ copy sa.example.toml sa.toml
 ```toml
 [llm]
 system_role_name = "developer"
+```
+
+如果要调节模型的思维深度，可以继续配置：
+
+```toml
+[llm]
+reasoning_effort = "high"
 ```
 
 ### 2. 启动后端

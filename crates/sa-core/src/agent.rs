@@ -34,6 +34,8 @@ pub struct AgentRunnerConfig {
     pub model: String,
     /// The role name used for "system instructions" (`system` or `developer`).
     pub system_role_name: String,
+    /// Optional reasoning depth / effort forwarded to compatible GPT models.
+    pub reasoning_effort: Option<String>,
     /// Maximum tool-call steps per task.
     pub max_steps: u32,
 }
@@ -150,6 +152,7 @@ impl AgentRunner {
             let req = ChatCompletionsRequest {
                 model: self.cfg.model.clone(),
                 messages: messages.clone(),
+                reasoning_effort: self.cfg.reasoning_effort.clone(),
                 tools: Some(tool_definitions.clone()),
                 tool_choice: Some(serde_json::json!("auto")),
                 stream: Some(false),
