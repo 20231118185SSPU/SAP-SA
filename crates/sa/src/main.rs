@@ -34,7 +34,7 @@ use sa_core::tools::{
 };
 use sa_core::ws_protocol::{
     ClientMessage, Event, EventKind, QuestionMode, ServerMessage, UserQuestion, UserQuestionAnswer,
-    UserVisibleFile,
+    UserVisibleFile, UserVisibleFileEncoding,
 };
 use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
@@ -199,6 +199,8 @@ impl Hub {
             message,
         };
 
+        self.mirror_user_visible_event(&event);
+
         // Store in buffer.
         //
         // NOTE: We use a standard mutex here because `publish` must be callable
@@ -218,7 +220,67 @@ impl Hub {
 
     /// Broadcast a non-history server message to all connected clients.
     fn broadcast_server_message(&self, msg: ServerMessage) {
+        self.mirror_user_visible_server_message(&msg);
         let _ = self.events_tx.send(msg);
+    }
+
+    /// Mirror user-visible frontend payloads to the backend terminal so manual
+    /// testing is easier.
+    ///
+    /// This is intentionally limited to the content the frontend actually
+    /// surfaces (`Send` / `Ask` / `Show`) so the daemon terminal does not get
+    /// flooded with internal progress logs.
+    fn mirror_user_visible_event(&self, event: &Event) {
+        if matches!(event.kind, EventKind::Message) {
+            eprintln!("[frontend][send][task={}] {}", event.task_id, event.message);
+        }
+    }
+
+    /// Mirror non-event user-visible WS messages (`Ask` / `Show`) to the
+    /// backend terminal.
+    fn mirror_user_visible_server_message(&self, msg: &ServerMessage) {
+        match msg {
+            ServerMessage::Question { question } => {
+                eprintln!(
+                    "[frontend][ask][task={}][id={}] {}",
+                    question.task_id, question.question_id, question.prompt
+                );
+                for (index, option) in question.options.iter().enumerate() {
+                    match option.description.as_deref() {
+                        Some(description) => eprintln!(
+                            "  {}. {} [{}] - {}",
+                            index + 1,
+                            option.label,
+                            option.id,
+                            description
+                        ),
+                        None => eprintln!("  {}. {} [{}]", index + 1, option.label, option.id),
+                    }
+                }
+                if question.allow_free_text {
+                    eprintln!("  free text: allowed");
+                }
+            }
+            ServerMessage::Show { file } => {
+                let title = file.title.as_deref().unwrap_or(&file.path);
+                eprintln!(
+                    "[frontend][show][task={}][title={}] path={} media_type={} bytes={}",
+                    file.task_id, title, file.path, file.media_type, file.bytes
+                );
+                match file.encoding {
+                    UserVisibleFileEncoding::Utf8 => {
+                        eprintln!("{}", file.content);
+                    }
+                    UserVisibleFileEncoding::Base64 => {
+                        eprintln!(
+                            "<binary payload omitted; {} bytes encoded as base64>",
+                            file.bytes
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Request interruption (cancellation) of a running task.
