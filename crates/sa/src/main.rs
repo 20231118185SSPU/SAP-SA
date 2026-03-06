@@ -199,7 +199,9 @@ impl Hub {
             message,
         };
 
-        self.mirror_user_visible_event(&event);
+        self.mirror_server_message(&ServerMessage::Event {
+            event: event.clone(),
+        });
 
         // Store in buffer.
         //
@@ -220,26 +222,28 @@ impl Hub {
 
     /// Broadcast a non-history server message to all connected clients.
     fn broadcast_server_message(&self, msg: ServerMessage) {
-        self.mirror_user_visible_server_message(&msg);
+        self.mirror_server_message(&msg);
         let _ = self.events_tx.send(msg);
     }
 
-    /// Mirror user-visible frontend payloads to the backend terminal so manual
-    /// testing is easier.
+    /// Mirror one outbound frontend message to the backend terminal.
     ///
-    /// This is intentionally limited to the content the frontend actually
-    /// surfaces (`Send` / `Ask` / `Show`) so the daemon terminal does not get
-    /// flooded with internal progress logs.
-    fn mirror_user_visible_event(&self, event: &Event) {
-        if matches!(event.kind, EventKind::Message) {
-            eprintln!("[frontend][send][task={}] {}", event.task_id, event.message);
-        }
-    }
-
-    /// Mirror non-event user-visible WS messages (`Ask` / `Show`) to the
-    /// backend terminal.
-    fn mirror_user_visible_server_message(&self, msg: &ServerMessage) {
+    /// This is intentionally verbose for debugging because the current CLI does
+    /// not render the whole stream.
+    fn mirror_server_message(&self, msg: &ServerMessage) {
         match msg {
+            ServerMessage::Accepted { task_id } => {
+                eprintln!("[frontend][accepted][task={task_id}]");
+            }
+            ServerMessage::History { events } => {
+                eprintln!("[frontend][history][count={}]", events.len());
+                for event in events {
+                    mirror_event_line("[frontend][history-event]", event);
+                }
+            }
+            ServerMessage::Event { event } => {
+                mirror_event_line("[frontend][event]", event);
+            }
             ServerMessage::Question { question } => {
                 eprintln!(
                     "[frontend][ask][task={}][id={}] {}",
@@ -261,25 +265,30 @@ impl Hub {
                     eprintln!("  free text: allowed");
                 }
             }
-            ServerMessage::Show { file } => {
-                let title = file.title.as_deref().unwrap_or(&file.path);
-                eprintln!(
-                    "[frontend][show][task={}][title={}] path={} media_type={} bytes={}",
-                    file.task_id, title, file.path, file.media_type, file.bytes
-                );
-                match file.encoding {
-                    UserVisibleFileEncoding::Utf8 => {
-                        eprintln!("{}", file.content);
-                    }
-                    UserVisibleFileEncoding::Base64 => {
-                        eprintln!(
-                            "<binary payload omitted; {} bytes encoded as base64>",
-                            file.bytes
-                        );
-                    }
+            ServerMessage::PendingQuestions { questions } => {
+                eprintln!("[frontend][pending_questions][count={}]", questions.len());
+                for question in questions {
+                    eprintln!(
+                        "  [task={}][id={}] {}",
+                        question.task_id, question.question_id, question.prompt
+                    );
                 }
             }
-            _ => {}
+            ServerMessage::QuestionResolved { question_id } => {
+                eprintln!("[frontend][question_resolved][id={question_id}]");
+            }
+            ServerMessage::Show { file } => {
+                mirror_shown_file("[frontend][show]", file);
+            }
+            ServerMessage::RecentShows { files } => {
+                eprintln!("[frontend][recent_shows][count={}]", files.len());
+                for file in files {
+                    mirror_shown_file("  [recent_show]", file);
+                }
+            }
+            ServerMessage::Error { message } => {
+                eprintln!("[frontend][error] {message}");
+            }
         }
     }
 
@@ -983,6 +992,56 @@ fn validate_user_answer(
     Ok(())
 }
 
+/// Mirror one event in a stable multi-line format.
+fn mirror_event_line(prefix: &str, event: &Event) {
+    let header = format!(
+        "{prefix}[kind={:?}][task={}][event_id={}][ts={}] ",
+        event.kind, event.task_id, event.event_id, event.ts
+    );
+
+    let mut lines = event.message.lines();
+    match lines.next() {
+        Some(first) => {
+            eprintln!("{header}{first}");
+            for line in lines {
+                eprintln!("{}{}", " ".repeat(header.len()), line);
+            }
+        }
+        None => eprintln!("{header}"),
+    }
+}
+
+/// Mirror one `Show` payload in a stable format.
+fn mirror_shown_file(prefix: &str, file: &UserVisibleFile) {
+    let title = file.title.as_deref().unwrap_or(&file.path);
+    eprintln!(
+        "{prefix}[task={}][title={}] path={} media_type={} bytes={}",
+        file.task_id, title, file.path, file.media_type, file.bytes
+    );
+    match file.encoding {
+        UserVisibleFileEncoding::Utf8 => {
+            eprintln!("{}", file.content);
+        }
+        UserVisibleFileEncoding::Base64 => {
+            eprintln!(
+                "<binary payload omitted; {} bytes encoded as base64>",
+                file.bytes
+            );
+        }
+    }
+}
+
+/// Send one direct per-connection message and mirror it to the backend
+/// terminal.
+fn send_direct_server_message(
+    hub: &Arc<Hub>,
+    out_tx: &mpsc::UnboundedSender<ServerMessage>,
+    msg: ServerMessage,
+) {
+    hub.mirror_server_message(&msg);
+    let _ = out_tx.send(msg);
+}
+
 /// WS upgrade handler.
 async fn ws_route(ws: WebSocketUpgrade, State(hub): State<Arc<Hub>>) -> impl IntoResponse {
     ws.on_upgrade(move |socket| ws_session(socket, hub))
@@ -999,12 +1058,20 @@ async fn ws_session(socket: WebSocket, hub: Arc<Hub>) {
     // Immediately send any questions that were already pending before this
     // client connected. This makes reconnecting clients able to continue an
     // interrupted `Ask` interaction.
-    let _ = out_tx.send(ServerMessage::PendingQuestions {
-        questions: hub.pending_questions_snapshot(),
-    });
-    let _ = out_tx.send(ServerMessage::RecentShows {
-        files: hub.recent_shows_snapshot(),
-    });
+    send_direct_server_message(
+        &hub,
+        &out_tx,
+        ServerMessage::PendingQuestions {
+            questions: hub.pending_questions_snapshot(),
+        },
+    );
+    send_direct_server_message(
+        &hub,
+        &out_tx,
+        ServerMessage::RecentShows {
+            files: hub.recent_shows_snapshot(),
+        },
+    );
 
     // Writer task: serialize ServerMessage -> WS text frame.
     let writer = tokio::spawn(async move {
@@ -1021,6 +1088,7 @@ async fn ws_session(socket: WebSocket, hub: Arc<Hub>) {
     // Event forwarder task: broadcast -> out_tx.
     let mut events_rx = hub.events_tx.subscribe();
     let out_tx_events = out_tx.clone();
+    let hub_for_forwarder = Arc::clone(&hub);
     let forwarder = tokio::spawn(async move {
         loop {
             match events_rx.recv().await {
@@ -1028,9 +1096,13 @@ async fn ws_session(socket: WebSocket, hub: Arc<Hub>) {
                     let _ = out_tx_events.send(msg);
                 }
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    let _ = out_tx_events.send(ServerMessage::Error {
-                        message: format!("Lagged in event stream; skipped {skipped} events"),
-                    });
+                    send_direct_server_message(
+                        &hub_for_forwarder,
+                        &out_tx_events,
+                        ServerMessage::Error {
+                            message: format!("Lagged in event stream; skipped {skipped} events"),
+                        },
+                    );
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
             }
@@ -1045,9 +1117,13 @@ async fn ws_session(socket: WebSocket, hub: Arc<Hub>) {
                 let msg = match parsed {
                     Ok(msg) => msg,
                     Err(err) => {
-                        let _ = out_tx.send(ServerMessage::Error {
-                            message: format!("Invalid JSON: {err}"),
-                        });
+                        send_direct_server_message(
+                            &hub,
+                            &out_tx,
+                            ServerMessage::Error {
+                                message: format!("Invalid JSON: {err}"),
+                            },
+                        );
                         continue;
                     }
                 };
@@ -1058,18 +1134,30 @@ async fn ws_session(socket: WebSocket, hub: Arc<Hub>) {
                         let task_id = task_id.unwrap_or_else(Uuid::new_v4);
 
                         // Acknowledge immediately.
-                        let _ = out_tx.send(ServerMessage::Accepted { task_id });
+                        send_direct_server_message(
+                            &hub,
+                            &out_tx,
+                            ServerMessage::Accepted { task_id },
+                        );
 
                         // Enqueue (idempotent).
                         if let Err(err) = hub.submit_task(task_id, task).await {
-                            let _ = out_tx.send(ServerMessage::Error {
-                                message: format!("Failed to submit task: {err}"),
-                            });
+                            send_direct_server_message(
+                                &hub,
+                                &out_tx,
+                                ServerMessage::Error {
+                                    message: format!("Failed to submit task: {err}"),
+                                },
+                            );
                         }
                     }
                     ClientMessage::GetHistory { from_event_id } => {
                         let events = hub.history_since(from_event_id).await;
-                        let _ = out_tx.send(ServerMessage::History { events });
+                        send_direct_server_message(
+                            &hub,
+                            &out_tx,
+                            ServerMessage::History { events },
+                        );
                     }
                     ClientMessage::Interrupt { task_id } => {
                         // Cancellation is implemented in the worker loop. Here we only
@@ -1080,9 +1168,13 @@ async fn ws_session(socket: WebSocket, hub: Arc<Hub>) {
                     }
                     ClientMessage::AnswerQuestion { answer } => {
                         if let Err(err) = hub.answer_question(answer) {
-                            let _ = out_tx.send(ServerMessage::Error {
-                                message: format!("Failed to answer question: {err}"),
-                            });
+                            send_direct_server_message(
+                                &hub,
+                                &out_tx,
+                                ServerMessage::Error {
+                                    message: format!("Failed to answer question: {err}"),
+                                },
+                            );
                         }
                     }
                 }
