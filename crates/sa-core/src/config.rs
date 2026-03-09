@@ -9,6 +9,7 @@
 //!   - Some OpenAI-compatible providers reject `role: "system"` and only accept
 //!     `role: "developer"`; the config makes this adjustable.
 
+use crate::compact::CompactionConfig;
 use anyhow::Context as _;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -28,6 +29,10 @@ pub struct Config {
     /// Skills discovery configuration (`[skills]`).
     #[serde(default)]
     pub skills: SkillsConfig,
+
+    /// Long-session history compaction configuration (`[compaction]`).
+    #[serde(default)]
+    pub compaction: CompactionConfig,
 
     /// External MCP server configuration (`[mcp]`).
     #[serde(default)]
@@ -339,7 +344,7 @@ fn validate_mcp_config(config: &McpConfig) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{LlmConfig, McpConfig, McpServerConfig, McpTransport, validate_mcp_config};
+    use super::{Config, LlmConfig, McpConfig, McpServerConfig, McpTransport, validate_mcp_config};
     use std::collections::HashMap;
 
     fn sample_llm() -> LlmConfig {
@@ -368,6 +373,62 @@ mod tests {
         let mut cfg = sample_llm();
         cfg.reasoning_effort = Some("  xhigh  ".to_string());
         assert_eq!(cfg.effective_reasoning_effort(), Some("xhigh"));
+    }
+
+    #[test]
+    fn compaction_defaults_load_when_section_is_missing() {
+        let raw = r#"
+[llm]
+base_url = "https://example.com/v1"
+api_key = "sk-test"
+model = "gpt-5.2"
+
+[server]
+bind = "127.0.0.1:8765"
+ws_path = "/ws"
+
+[workspace]
+root_dir = "."
+agents_md = "Agents.md"
+"#;
+
+        let cfg =
+            toml::from_str::<Config>(raw).expect("config without compaction section should parse");
+        assert!(cfg.compaction.enabled);
+        assert_eq!(cfg.compaction.trigger_tokens, 24_000);
+        assert_eq!(cfg.compaction.keep_recent_tokens, 8_000);
+        assert_eq!(cfg.compaction.reserve_summary_tokens, 4_096);
+        assert_eq!(cfg.compaction.min_messages_to_compact, 8);
+    }
+
+    #[test]
+    fn compaction_partial_override_preserves_other_defaults() {
+        let raw = r#"
+[llm]
+base_url = "https://example.com/v1"
+api_key = "sk-test"
+model = "gpt-5.2"
+
+[server]
+bind = "127.0.0.1:8765"
+ws_path = "/ws"
+
+[workspace]
+root_dir = "."
+agents_md = "Agents.md"
+
+[compaction]
+trigger_tokens = 12345
+keep_recent_tokens = 6789
+"#;
+
+        let cfg = toml::from_str::<Config>(raw)
+            .expect("config with partial compaction override should parse");
+        assert!(cfg.compaction.enabled);
+        assert_eq!(cfg.compaction.trigger_tokens, 12_345);
+        assert_eq!(cfg.compaction.keep_recent_tokens, 6_789);
+        assert_eq!(cfg.compaction.reserve_summary_tokens, 4_096);
+        assert_eq!(cfg.compaction.min_messages_to_compact, 8);
     }
 
     #[test]

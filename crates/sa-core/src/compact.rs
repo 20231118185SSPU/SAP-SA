@@ -22,6 +22,7 @@
 use crate::cancel::CancelToken;
 use crate::openai::{ChatCompletionsRequest, ChatMessage, OpenAiClient, ToolCall};
 use anyhow::Context as _;
+use serde::Deserialize;
 use std::fmt::Write as _;
 
 /// Synthetic message prefix used to inject the compaction checkpoint back into
@@ -136,30 +137,61 @@ pub const TURN_PREFIX_SUMMARIZATION_PROMPT: &str = r#"这是一个因过长而�
 /// receive authoritative token usage metadata from the provider for every
 /// message. We therefore rely on a heuristic and compact before the history is
 /// likely to become problematic.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct CompactionConfig {
     /// Master kill-switch.
+    #[serde(default = "default_compaction_enabled")]
     pub enabled: bool,
     /// Approximate total history size at which compaction should trigger.
+    #[serde(default = "default_compaction_trigger_tokens")]
     pub trigger_tokens: usize,
     /// Approximate token budget to preserve as the recent suffix.
+    #[serde(default = "default_compaction_keep_recent_tokens")]
     pub keep_recent_tokens: usize,
     /// Max tokens reserved for the summarization response itself.
+    #[serde(default = "default_compaction_reserve_summary_tokens")]
     pub reserve_summary_tokens: usize,
     /// Refuse to compact extremely short conversations.
+    #[serde(default = "default_compaction_min_messages_to_compact")]
     pub min_messages_to_compact: usize,
 }
 
 impl Default for CompactionConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
-            trigger_tokens: 24_000,
-            keep_recent_tokens: 8_000,
-            reserve_summary_tokens: 4_096,
-            min_messages_to_compact: 8,
+            enabled: default_compaction_enabled(),
+            trigger_tokens: default_compaction_trigger_tokens(),
+            keep_recent_tokens: default_compaction_keep_recent_tokens(),
+            reserve_summary_tokens: default_compaction_reserve_summary_tokens(),
+            min_messages_to_compact: default_compaction_min_messages_to_compact(),
         }
     }
+}
+
+/// Default value for `CompactionConfig.enabled`.
+const fn default_compaction_enabled() -> bool {
+    true
+}
+
+/// Default value for `CompactionConfig.trigger_tokens`.
+const fn default_compaction_trigger_tokens() -> usize {
+    24_000
+}
+
+/// Default value for `CompactionConfig.keep_recent_tokens`.
+const fn default_compaction_keep_recent_tokens() -> usize {
+    8_000
+}
+
+/// Default value for `CompactionConfig.reserve_summary_tokens`.
+const fn default_compaction_reserve_summary_tokens() -> usize {
+    4_096
+}
+
+/// Default value for `CompactionConfig.min_messages_to_compact`.
+const fn default_compaction_min_messages_to_compact() -> usize {
+    8
 }
 
 /// Persistent in-memory state carried across compaction runs in one SA task.

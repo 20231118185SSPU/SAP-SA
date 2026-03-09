@@ -1585,7 +1585,7 @@ async fn main() -> anyhow::Result<()> {
         system_role_name,
         reasoning_effort,
         max_steps: cfg.llm.max_steps,
-        compaction: CompactionConfig::default(),
+        compaction: cfg.compaction,
     };
     let runner = AgentRunner::new(llm, tools, Arc::clone(&skills), runner_cfg);
 

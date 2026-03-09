@@ -40,6 +40,22 @@ system_role_name = "developer"
 # Safety cap: maximum reasoning / tool-call steps per task.
 max_steps = 32
 
+[compaction]
+# Whether SA should automatically compress long-running conversation history.
+enabled = true
+
+# Approximate total history size at which compaction is triggered.
+trigger_tokens = 24000
+
+# Approximate recent-history budget kept verbatim after compaction.
+keep_recent_tokens = 8000
+
+# Budget reserved for the summary generated during compaction.
+reserve_summary_tokens = 4096
+
+# Refuse to compact very short conversations.
+min_messages_to_compact = 8
+
 [server]
 # Where the daemon listens.
 bind = "127.0.0.1:8765"
