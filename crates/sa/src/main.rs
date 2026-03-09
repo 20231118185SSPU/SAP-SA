@@ -1,4 +1,4 @@
-//! `sa` 鈥?the StudyAdministrator (SA) backend agent daemon.
+//! `sa` 閳?the StudyAdministrator (SA) backend agent daemon.
 //!
 //! Responsibilities:
 //! - Load `sa.toml` (TOML config).
@@ -15,7 +15,7 @@
 use anyhow::Context as _;
 use axum::Router;
 use axum::extract::State;
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade, close_code};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use clap::Parser;
@@ -56,6 +56,9 @@ const MAX_BUFFERED_EVENTS: usize = 10_000;
 
 /// Max number of recent `Show` payloads kept for reconnecting clients.
 const MAX_BUFFERED_SHOWS: usize = 32;
+
+/// Close-frame reason used after a handshake rejection.
+const WS_HANDSHAKE_REJECT_CLOSE_REASON: &str = "sa handshake rejected";
 
 /// CLI arguments.
 #[derive(clap::Parser, Debug)]
@@ -933,7 +936,7 @@ impl Hub {
 /// Expand special placeholders in referenced paths.
 ///
 /// Currently supported:
-/// - `YYYY-MM-DD` 鈫?replaced with today's date, and also yesterday's date
+/// - `YYYY-MM-DD` 閳?replaced with today's date, and also yesterday's date
 ///   (to match common "load today + yesterday" instructions).
 fn expand_date_placeholders(mut refs: Vec<String>) -> Vec<String> {
     let mut out = Vec::new();
@@ -1088,54 +1091,142 @@ async fn send_handshake_server_message(
     Ok(())
 }
 
+/// Close one connection after the handshake has already been rejected.
+async fn close_rejected_handshake(
+    connection_id: Uuid,
+    stage: &'static str,
+    ws_tx: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+) {
+    let close_frame = CloseFrame {
+        code: close_code::POLICY,
+        reason: WS_HANDSHAKE_REJECT_CLOSE_REASON.into(),
+    };
+
+    match ws_tx.send(Message::Close(Some(close_frame.clone()))).await {
+        Ok(()) => {
+            tracing::warn!(
+                %connection_id,
+                stage,
+                close_code = close_frame.code,
+                close_reason = %close_frame.reason,
+                "Closed WS connection after handshake rejection"
+            );
+        }
+        Err(err) => {
+            tracing::warn!(
+                %connection_id,
+                stage,
+                %err,
+                "Failed to close WS connection after handshake rejection"
+            );
+        }
+    }
+}
+
+/// Reject the handshake, send `hello_reject`, and then explicitly close the socket.
+async fn reject_handshake(
+    hub: &Arc<Hub>,
+    connection_id: Uuid,
+    stage: &'static str,
+    server_version: &str,
+    ws_tx: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    reason: impl Into<String>,
+) {
+    let reason = reason.into();
+    tracing::warn!(
+        %connection_id,
+        stage,
+        reason = %reason,
+        "Rejecting WS handshake"
+    );
+
+    if let Err(err) = send_handshake_server_message(
+        hub,
+        ws_tx,
+        ServerMessage::HelloReject {
+            reject: build_hello_reject(reason, server_version),
+        },
+    )
+    .await
+    {
+        tracing::warn!(
+            %connection_id,
+            stage,
+            %err,
+            "Failed to send hello_reject for rejected WS handshake"
+        );
+    }
+
+    close_rejected_handshake(connection_id, stage, ws_tx).await;
+}
+
 /// WS upgrade handler.
 async fn ws_route(ws: WebSocketUpgrade, State(hub): State<Arc<Hub>>) -> impl IntoResponse {
     ws.on_upgrade(move |socket| ws_session(socket, hub))
 }
 
-/// Handle a single WS connection.
+/// Handle a single WS connection with the production handshake timeout.
 async fn ws_session(socket: WebSocket, hub: Arc<Hub>) {
+    ws_session_with_timeout(
+        socket,
+        hub,
+        std::time::Duration::from_secs(WS_HANDSHAKE_TIMEOUT_SECS),
+    )
+    .await;
+}
+
+/// Handle a single WS connection with an explicit handshake timeout.
+///
+/// Tests use this variant directly so timeout behavior can be verified without
+/// sleeping for the full production timeout.
+async fn ws_session_with_timeout(
+    socket: WebSocket,
+    hub: Arc<Hub>,
+    handshake_timeout: std::time::Duration,
+) {
+    let connection_id = Uuid::new_v4();
+    let handshake_timeout_ms = handshake_timeout.as_millis() as u64;
     let server_version = env!("CARGO_PKG_VERSION");
+
+    tracing::info!(
+        %connection_id,
+        handshake_timeout_ms,
+        "WS connection opened"
+    );
 
     // We split the socket so we can read and write concurrently.
     let (mut ws_tx, mut ws_rx) = socket.split();
 
     // Mandatory client-first handshake.
-    let first_frame = match tokio::time::timeout(
-        std::time::Duration::from_secs(WS_HANDSHAKE_TIMEOUT_SECS),
-        ws_rx.next(),
-    )
-    .await
-    {
+    let first_frame = match tokio::time::timeout(handshake_timeout, ws_rx.next()).await {
         Ok(Some(Ok(frame))) => frame,
         Ok(Some(Err(err))) => {
-            let _ = send_handshake_server_message(
+            reject_handshake(
                 &hub,
+                connection_id,
+                "read_initial_frame",
+                server_version,
                 &mut ws_tx,
-                ServerMessage::HelloReject {
-                    reject: build_hello_reject(
-                        format!("Failed to read initial handshake frame: {err}"),
-                        server_version,
-                    ),
-                },
+                format!("Failed to read initial handshake frame: {err}"),
             )
             .await;
             return;
         }
-        Ok(None) => return,
+        Ok(None) => {
+            tracing::info!(
+                %connection_id,
+                "WS peer closed the connection before completing the handshake"
+            );
+            return;
+        }
         Err(_) => {
-            let _ = send_handshake_server_message(
+            reject_handshake(
                 &hub,
+                connection_id,
+                "handshake_timeout",
+                server_version,
                 &mut ws_tx,
-                ServerMessage::HelloReject {
-                    reject: build_hello_reject(
-                        format!(
-                            "Handshake timed out after {} seconds",
-                            WS_HANDSHAKE_TIMEOUT_SECS
-                        ),
-                        server_version,
-                    ),
-                },
+                format!("Handshake timed out after {} ms", handshake_timeout_ms),
             )
             .await;
             return;
@@ -1143,15 +1234,13 @@ async fn ws_session(socket: WebSocket, hub: Arc<Hub>) {
     };
 
     let Message::Text(first_text) = first_frame else {
-        let _ = send_handshake_server_message(
+        reject_handshake(
             &hub,
+            connection_id,
+            "first_frame_not_text",
+            server_version,
             &mut ws_tx,
-            ServerMessage::HelloReject {
-                reject: build_hello_reject(
-                    "The first client frame must be a UTF-8 JSON text frame",
-                    server_version,
-                ),
-            },
+            "The first client frame must be a UTF-8 JSON text frame",
         )
         .await;
         return;
@@ -1160,15 +1249,13 @@ async fn ws_session(socket: WebSocket, hub: Arc<Hub>) {
     let first_msg = match serde_json::from_str::<ClientMessage>(&first_text) {
         Ok(msg) => msg,
         Err(err) => {
-            let _ = send_handshake_server_message(
+            reject_handshake(
                 &hub,
+                connection_id,
+                "invalid_handshake_json",
+                server_version,
                 &mut ws_tx,
-                ServerMessage::HelloReject {
-                    reject: build_hello_reject(
-                        format!("Invalid handshake JSON: {err}"),
-                        server_version,
-                    ),
-                },
+                format!("Invalid handshake JSON: {err}"),
             )
             .await;
             return;
@@ -1178,18 +1265,16 @@ async fn ws_session(socket: WebSocket, hub: Arc<Hub>) {
     let client_hello = match first_msg {
         ClientMessage::ClientHello { hello } => hello,
         other => {
-            let _ = send_handshake_server_message(
+            reject_handshake(
                 &hub,
+                connection_id,
+                "first_message_wrong_type",
+                server_version,
                 &mut ws_tx,
-                ServerMessage::HelloReject {
-                    reject: build_hello_reject(
-                        format!(
-                            "The first client message must be `client_hello`, got `{:?}`",
-                            other
-                        ),
-                        server_version,
-                    ),
-                },
+                format!(
+                    "The first client message must be `client_hello`, got `{:?}`",
+                    other
+                ),
             )
             .await;
             return;
@@ -1201,15 +1286,13 @@ async fn ws_session(socket: WebSocket, hub: Arc<Hub>) {
         &hub.ws_identity,
         std::time::SystemTime::now(),
     ) {
-        let _ = send_handshake_server_message(
+        reject_handshake(
             &hub,
+            connection_id,
+            "client_hello_verification_failed",
+            server_version,
             &mut ws_tx,
-            ServerMessage::HelloReject {
-                reject: build_hello_reject(
-                    format!("Client hello verification failed: {err}"),
-                    server_version,
-                ),
-            },
+            format!("Client hello verification failed: {err}"),
         )
         .await;
         return;
@@ -1219,22 +1302,20 @@ async fn ws_session(socket: WebSocket, hub: Arc<Hub>) {
         match build_server_hello(&hub.ws_identity, server_version, &client_hello.client_nonce) {
             Ok(hello) => hello,
             Err(err) => {
-                let _ = send_handshake_server_message(
+                reject_handshake(
                     &hub,
+                    connection_id,
+                    "build_server_hello_failed",
+                    server_version,
                     &mut ws_tx,
-                    ServerMessage::HelloReject {
-                        reject: build_hello_reject(
-                            format!("Failed to build server hello: {err}"),
-                            server_version,
-                        ),
-                    },
+                    format!("Failed to build server hello: {err}"),
                 )
                 .await;
                 return;
             }
         };
 
-    if send_handshake_server_message(
+    if let Err(err) = send_handshake_server_message(
         &hub,
         &mut ws_tx,
         ServerMessage::ServerHello {
@@ -1242,10 +1323,23 @@ async fn ws_session(socket: WebSocket, hub: Arc<Hub>) {
         },
     )
     .await
-    .is_err()
     {
+        tracing::warn!(
+            %connection_id,
+            %err,
+            "Failed to send server_hello during WS handshake"
+        );
         return;
     }
+
+    tracing::info!(
+        %connection_id,
+        client_name = %client_hello.client_name,
+        client_version = %client_hello.client_version,
+        machine_hint = %client_hello.machine_hint,
+        time_bucket = client_hello.time_bucket,
+        "Accepted WS handshake"
+    );
 
     // Outbound message channel (single writer task owns `ws_tx`).
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<ServerMessage>();
@@ -1451,7 +1545,7 @@ async fn main() -> anyhow::Result<()> {
     // Connect external MCP servers before freezing the tool registry.
     let mcp_registry = if cfg.mcp.enabled && !cfg.mcp.servers.is_empty() {
         tracing::info!(
-            "Initializing MCP client 鈥?{} server(s) configured",
+            "Initializing MCP client 閳?{} server(s) configured",
             cfg.mcp.servers.len()
         );
         match McpRegistry::connect_all(&cfg.mcp.servers).await {
@@ -1522,4 +1616,328 @@ async fn main() -> anyhow::Result<()> {
         .context("Server crashed")?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hex::encode as hex_encode;
+    use sa_core::ws_identity::{
+        EXPECTED_CLIENT_NAME, WS_ALLOWED_SKEW_BUCKETS, WS_HASH_ALGO, WS_PROTOCOL_ID,
+        WS_TIME_STEP_SECS, build_client_hello, current_time_bucket,
+    };
+    use sha2::{Digest, Sha256};
+    use tempfile::TempDir;
+    use tokio_tungstenite::connect_async;
+    use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
+    use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode as TungsteniteCloseCode;
+
+    /// Test-only copy of the client proof label so the integration tests can build
+    /// boundary-case handshakes against the live WS server.
+    const TEST_CLIENT_PROOF_LABEL: &str = "sa-frontend-proof/v1";
+
+    /// One running ephemeral WS server used by handshake integration tests.
+    struct TestServer {
+        addr: std::net::SocketAddr,
+        _workspace: TempDir,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for TestServer {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    /// Minimal `Hub` factory for WS handshake tests.
+    fn build_test_hub(workspace: &TempDir) -> Arc<Hub> {
+        let skills = Arc::new(SkillRegistry::scan(&[]).expect("empty skill registry should build"));
+        let tool_ctx = ToolContext::new(workspace.path().to_path_buf(), Arc::clone(&skills))
+            .expect("tool context should build for temp workspace");
+        let preload_ctx = tool_ctx.clone();
+        let tools = ToolExecutor::new(tool_ctx, None);
+        let llm = OpenAiClient::new("http://127.0.0.1:1".to_string(), "test-key".to_string())
+            .expect("test OpenAI client should build");
+        let runner = AgentRunner::new(
+            llm,
+            tools,
+            skills,
+            AgentRunnerConfig {
+                model: "test-model".to_string(),
+                system_role_name: "developer".to_string(),
+                reasoning_effort: None,
+                max_steps: 1,
+            },
+        );
+
+        Hub::new(
+            runner,
+            workspace.path().join("AGENTS.md"),
+            preload_ctx,
+            load_local_identity().expect("local WS identity should load"),
+        )
+    }
+
+    /// Spawn one live WS server bound to an ephemeral local port.
+    async fn spawn_test_server(handshake_timeout: std::time::Duration) -> TestServer {
+        let workspace = TempDir::new().expect("temp workspace should be created");
+        let hub = build_test_hub(&workspace);
+        let app = Router::new()
+            .route(
+                "/ws",
+                get(
+                    move |ws: WebSocketUpgrade, State(hub): State<Arc<Hub>>| async move {
+                        ws.on_upgrade(move |socket| {
+                            ws_session_with_timeout(socket, hub, handshake_timeout)
+                        })
+                    },
+                ),
+            )
+            .with_state(hub);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let addr = listener
+            .local_addr()
+            .expect("test listener should expose local addr");
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test WS server should keep serving until aborted");
+        });
+
+        TestServer {
+            addr,
+            _workspace: workspace,
+            task,
+        }
+    }
+
+    /// Connect one tungstenite client to the ephemeral test server.
+    async fn connect_test_client(
+        server: &TestServer,
+    ) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>
+    {
+        let (stream, _) = connect_async(format!("ws://{}/ws", server.addr))
+            .await
+            .expect("test client should connect to local WS server");
+        stream
+    }
+
+    /// Read one WS frame with a small timeout so failed tests do not hang.
+    async fn next_ws_frame(
+        ws: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    ) -> TungsteniteMessage {
+        tokio::time::timeout(std::time::Duration::from_secs(2), ws.next())
+            .await
+            .expect("timed out waiting for WS frame")
+            .expect("WS stream ended unexpectedly")
+            .expect("failed to read WS frame")
+    }
+
+    /// Parse the next JSON text frame as one backend server message.
+    async fn next_server_message(
+        ws: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    ) -> ServerMessage {
+        match next_ws_frame(ws).await {
+            TungsteniteMessage::Text(text) => {
+                serde_json::from_str(&text).expect("server text frame should contain valid JSON")
+            }
+            other => panic!("expected a text server frame, got {other:?}"),
+        }
+    }
+
+    /// Assert that the next frame is a close frame emitted by the backend.
+    async fn assert_next_frame_is_policy_close(
+        ws: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    ) {
+        match next_ws_frame(ws).await {
+            TungsteniteMessage::Close(Some(frame)) => {
+                assert_eq!(frame.code, TungsteniteCloseCode::Policy);
+                assert_eq!(frame.reason, WS_HANDSHAKE_REJECT_CLOSE_REASON);
+            }
+            other => panic!("expected a close frame after handshake rejection, got {other:?}"),
+        }
+    }
+
+    /// Build the exact client proof used by the WS handshake.
+    fn compute_client_proof(
+        machine_fingerprint: &str,
+        client_version: &str,
+        time_bucket: i64,
+        client_nonce: &str,
+    ) -> String {
+        let material = format!(
+            "{TEST_CLIENT_PROOF_LABEL}|{WS_PROTOCOL_ID}|{EXPECTED_CLIENT_NAME}|{client_version}|{time_bucket}|{machine_fingerprint}|{client_nonce}"
+        );
+        let mut hasher = Sha256::new();
+        hasher.update(material.as_bytes());
+        hex_encode(hasher.finalize())
+    }
+
+    /// Build one custom hello so tests can isolate bucket skew from proof mismatch.
+    fn build_client_hello_with_bucket(
+        local_identity: &LocalIdentity,
+        client_version: &str,
+        time_bucket: i64,
+        client_nonce: &str,
+    ) -> sa_core::ws_protocol::ClientHello {
+        sa_core::ws_protocol::ClientHello {
+            protocol: WS_PROTOCOL_ID.to_string(),
+            hash_algo: WS_HASH_ALGO.to_string(),
+            time_step_secs: WS_TIME_STEP_SECS,
+            allowed_skew_buckets: WS_ALLOWED_SKEW_BUCKETS,
+            client_name: EXPECTED_CLIENT_NAME.to_string(),
+            client_version: client_version.to_string(),
+            time_bucket,
+            machine_hint: local_identity.machine_hint.clone(),
+            client_nonce: client_nonce.to_string(),
+            proof: compute_client_proof(
+                &local_identity.machine_fingerprint,
+                client_version,
+                time_bucket,
+                client_nonce,
+            ),
+        }
+    }
+
+    /// Serialize and send one client handshake message.
+    async fn send_client_hello(
+        ws: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        hello: sa_core::ws_protocol::ClientHello,
+    ) {
+        let text = serde_json::to_string(&ClientMessage::ClientHello { hello })
+            .expect("client hello should serialize");
+        ws.send(TungsteniteMessage::Text(text.into()))
+            .await
+            .expect("client hello should be sent");
+    }
+
+    #[tokio::test]
+    async fn handshake_rejects_wrong_first_message_and_closes() {
+        let server = spawn_test_server(std::time::Duration::from_millis(250)).await;
+        let mut ws = connect_test_client(&server).await;
+
+        let submit = serde_json::to_string(&ClientMessage::Submit {
+            task_id: None,
+            task: "hello".to_string(),
+        })
+        .expect("submit should serialize");
+        ws.send(TungsteniteMessage::Text(submit.into()))
+            .await
+            .expect("submit frame should be sent");
+
+        match next_server_message(&mut ws).await {
+            ServerMessage::HelloReject { reject } => {
+                assert!(
+                    reject
+                        .reason
+                        .contains("first client message must be `client_hello`")
+                );
+            }
+            other => panic!("expected hello_reject, got {other:?}"),
+        }
+
+        assert_next_frame_is_policy_close(&mut ws).await;
+    }
+
+    #[tokio::test]
+    async fn handshake_timeout_rejects_and_closes() {
+        let server = spawn_test_server(std::time::Duration::from_millis(75)).await;
+        let mut ws = connect_test_client(&server).await;
+
+        match next_server_message(&mut ws).await {
+            ServerMessage::HelloReject { reject } => {
+                assert!(reject.reason.contains("Handshake timed out after 75 ms"));
+            }
+            other => panic!("expected hello_reject after timeout, got {other:?}"),
+        }
+
+        assert_next_frame_is_policy_close(&mut ws).await;
+    }
+
+    #[tokio::test]
+    async fn handshake_rejects_time_bucket_skew_and_closes() {
+        let server = spawn_test_server(std::time::Duration::from_millis(250)).await;
+        let mut ws = connect_test_client(&server).await;
+        let local_identity = load_local_identity().expect("local identity should load");
+        let now_bucket = current_time_bucket().expect("current bucket should resolve");
+        let hello = build_client_hello_with_bucket(
+            &local_identity,
+            "test-client",
+            now_bucket + 2,
+            "bucket-skew-nonce",
+        );
+
+        send_client_hello(&mut ws, hello).await;
+
+        match next_server_message(&mut ws).await {
+            ServerMessage::HelloReject { reject } => {
+                assert!(reject.reason.contains("outside the accepted window"));
+            }
+            other => panic!("expected hello_reject for bucket skew, got {other:?}"),
+        }
+
+        assert_next_frame_is_policy_close(&mut ws).await;
+    }
+
+    #[tokio::test]
+    async fn handshake_rejects_proof_mismatch_and_closes() {
+        let server = spawn_test_server(std::time::Duration::from_millis(250)).await;
+        let mut ws = connect_test_client(&server).await;
+        let local_identity = load_local_identity().expect("local identity should load");
+        let mut hello = build_client_hello(&local_identity, "test-client")
+            .expect("valid client hello should build");
+        hello.proof =
+            "0000000000000000000000000000000000000000000000000000000000000000".to_string();
+
+        send_client_hello(&mut ws, hello).await;
+
+        match next_server_message(&mut ws).await {
+            ServerMessage::HelloReject { reject } => {
+                assert!(reject.reason.contains("proof mismatch"));
+            }
+            other => panic!("expected hello_reject for proof mismatch, got {other:?}"),
+        }
+
+        assert_next_frame_is_policy_close(&mut ws).await;
+    }
+
+    #[tokio::test]
+    async fn handshake_accepts_valid_client_hello_before_normal_messages() {
+        let server = spawn_test_server(std::time::Duration::from_millis(250)).await;
+        let mut ws = connect_test_client(&server).await;
+        let local_identity = load_local_identity().expect("local identity should load");
+        let hello = build_client_hello(&local_identity, "test-client")
+            .expect("valid client hello should build");
+
+        send_client_hello(&mut ws, hello).await;
+
+        match next_server_message(&mut ws).await {
+            ServerMessage::ServerHello { hello } => {
+                assert_eq!(hello.server_name, "sa");
+                assert_eq!(hello.protocol, WS_PROTOCOL_ID);
+            }
+            other => panic!("expected server_hello, got {other:?}"),
+        }
+
+        match next_server_message(&mut ws).await {
+            ServerMessage::PendingQuestions { questions } => assert!(questions.is_empty()),
+            other => panic!("expected pending_questions after handshake, got {other:?}"),
+        }
+
+        match next_server_message(&mut ws).await {
+            ServerMessage::RecentShows { files } => assert!(files.is_empty()),
+            other => panic!("expected recent_shows after handshake, got {other:?}"),
+        }
+    }
 }
