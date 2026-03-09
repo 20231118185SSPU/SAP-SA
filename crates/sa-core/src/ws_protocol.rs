@@ -110,8 +110,6 @@ pub struct ClientHello {
     pub client_version: String,
     /// UTC time bucket used to derive the proof.
     pub time_bucket: i64,
-    /// Short hint derived from the local machine fingerprint.
-    pub machine_hint: String,
     /// Client-generated nonce to bind the server proof to this exact handshake.
     pub client_nonce: String,
     /// Hex-encoded SHA-256 proof.
@@ -135,7 +133,8 @@ pub struct ServerHello {
     pub server_version: String,
     /// UTC time bucket used to derive the proof.
     pub time_bucket: i64,
-    /// Short hint derived from the local machine fingerprint.
+    /// Best-effort backend machine hint for audit/debugging. This is not part
+    /// of the proof verification path.
     pub machine_hint: String,
     /// Echo of the client's nonce.
     pub client_nonce: String,

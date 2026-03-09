@@ -7,12 +7,12 @@
 //! - the backend then returns its own proof,
 //! - the frontend verifies the backend before using the connection.
 //!
-//! The proof material combines:
-//! - a 5-second UTC time bucket,
-//! - a local machine fingerprint derived from hostname + MAC,
-//! - a direction-specific label (`sa-frontend` vs `sa`),
-//! - protocol metadata,
-//! - and nonces to bind one handshake to one exact connection.
+//! Proof design note:
+//! - Web UIs cannot reliably read machine MAC addresses or hostnames.
+//! - Therefore the wire-level proofs are intentionally based only on protocol
+//!   metadata, time buckets, and connection nonces.
+//! - The backend still computes a best-effort `machine_hint` from hostname + MAC
+//!   for audit logging and debugging, but that hint is not part of the proof.
 
 use crate::ws_protocol::{ClientHello, HelloReject, ServerHello};
 use anyhow::{Context as _, bail};
@@ -40,8 +40,8 @@ pub const EXPECTED_CLIENT_NAME: &str = "sa-frontend";
 /// Expected backend name.
 pub const EXPECTED_SERVER_NAME: &str = "sa";
 
-/// Versioned label for the machine fingerprint material.
-const MACHINE_FINGERPRINT_LABEL: &str = "sa-machine-fingerprint/v1";
+/// Versioned label for the machine hint material.
+const MACHINE_HINT_LABEL: &str = "sa-machine-hint/v1";
 
 /// Versioned label for the client proof.
 const CLIENT_PROOF_LABEL: &str = "sa-frontend-proof/v1";
@@ -52,13 +52,14 @@ const SERVER_PROOF_LABEL: &str = "sa-server-proof/v1";
 /// Local identity material reused across handshakes.
 #[derive(Debug, Clone)]
 pub struct LocalIdentity {
-    /// Full machine fingerprint hash used in proof generation.
-    pub machine_fingerprint: String,
     /// Short hint exposed on the wire for easier debugging.
     pub machine_hint: String,
 }
 
-/// Build the local machine fingerprint.
+/// Build the local machine hint.
+///
+/// This is intentionally separate from the proof path so browser-based frontends
+/// do not need access to hardware identifiers.
 pub fn load_local_identity() -> anyhow::Result<LocalIdentity> {
     let hostname = hostname::get()
         .context("Failed to read local hostname for WS identity")?
@@ -77,14 +78,11 @@ pub fn load_local_identity() -> anyhow::Result<LocalIdentity> {
         })
         .unwrap_or_else(|| "no-mac".to_string());
 
-    let material = format!("{MACHINE_FINGERPRINT_LABEL}|host={hostname}|mac={mac}");
-    let machine_fingerprint = sha256_hex(&material);
-    let machine_hint = machine_fingerprint.chars().take(12).collect::<String>();
+    let material = format!("{MACHINE_HINT_LABEL}|host={hostname}|mac={mac}");
+    let full_hint_hash = sha256_hex(&material);
+    let machine_hint = full_hint_hash.chars().take(12).collect::<String>();
 
-    Ok(LocalIdentity {
-        machine_fingerprint,
-        machine_hint,
-    })
+    Ok(LocalIdentity { machine_hint })
 }
 
 /// Return the current UTC time bucket.
@@ -102,18 +100,10 @@ pub fn current_time_bucket_at(now: SystemTime) -> anyhow::Result<i64> {
 }
 
 /// Build the mandatory client-first hello packet.
-pub fn build_client_hello(
-    local: &LocalIdentity,
-    client_version: &str,
-) -> anyhow::Result<ClientHello> {
+pub fn build_client_hello(client_version: &str) -> anyhow::Result<ClientHello> {
     let time_bucket = current_time_bucket()?;
     let client_nonce = uuid::Uuid::new_v4().to_string();
-    let proof = build_client_proof(
-        &local.machine_fingerprint,
-        client_version,
-        time_bucket,
-        &client_nonce,
-    );
+    let proof = build_client_proof(client_version, time_bucket, &client_nonce);
 
     Ok(ClientHello {
         protocol: WS_PROTOCOL_ID.to_string(),
@@ -123,18 +113,13 @@ pub fn build_client_hello(
         client_name: EXPECTED_CLIENT_NAME.to_string(),
         client_version: client_version.to_string(),
         time_bucket,
-        machine_hint: local.machine_hint.clone(),
         client_nonce,
         proof,
     })
 }
 
 /// Verify the client's mandatory hello packet.
-pub fn verify_client_hello(
-    hello: &ClientHello,
-    local: &LocalIdentity,
-    now: SystemTime,
-) -> anyhow::Result<()> {
+pub fn verify_client_hello(hello: &ClientHello, now: SystemTime) -> anyhow::Result<()> {
     verify_common_fields(
         &hello.protocol,
         &hello.hash_algo,
@@ -150,14 +135,6 @@ pub fn verify_client_hello(
         );
     }
 
-    if hello.machine_hint != local.machine_hint {
-        bail!(
-            "Machine fingerprint hint mismatch: expected `{}`, got `{}`",
-            local.machine_hint,
-            hello.machine_hint
-        );
-    }
-
     let now_bucket = current_time_bucket_at(now)?;
     if !is_time_bucket_acceptable(hello.time_bucket, now_bucket) {
         bail!(
@@ -168,7 +145,6 @@ pub fn verify_client_hello(
     }
 
     let expected = build_client_proof(
-        &local.machine_fingerprint,
         &hello.client_version,
         hello.time_bucket,
         &hello.client_nonce,
@@ -188,13 +164,7 @@ pub fn build_server_hello(
 ) -> anyhow::Result<ServerHello> {
     let time_bucket = current_time_bucket()?;
     let server_nonce = uuid::Uuid::new_v4().to_string();
-    let proof = build_server_proof(
-        &local.machine_fingerprint,
-        server_version,
-        time_bucket,
-        client_nonce,
-        &server_nonce,
-    );
+    let proof = build_server_proof(server_version, time_bucket, client_nonce, &server_nonce);
 
     Ok(ServerHello {
         protocol: WS_PROTOCOL_ID.to_string(),
@@ -211,10 +181,9 @@ pub fn build_server_hello(
     })
 }
 
-/// Verify the backend proof on the client side.
+/// Verify the backend proof on the frontend side.
 pub fn verify_server_hello(
     hello: &ServerHello,
-    local: &LocalIdentity,
     expected_client_nonce: &str,
     now: SystemTime,
 ) -> anyhow::Result<()> {
@@ -230,14 +199,6 @@ pub fn verify_server_hello(
             "Unexpected server name: expected `{}`, got `{}`",
             EXPECTED_SERVER_NAME,
             hello.server_name
-        );
-    }
-
-    if hello.machine_hint != local.machine_hint {
-        bail!(
-            "Machine fingerprint hint mismatch: expected `{}`, got `{}`",
-            local.machine_hint,
-            hello.machine_hint
         );
     }
 
@@ -259,7 +220,6 @@ pub fn verify_server_hello(
     }
 
     let expected = build_server_proof(
-        &local.machine_fingerprint,
         &hello.server_version,
         hello.time_bucket,
         &hello.client_nonce,
@@ -326,27 +286,21 @@ fn verify_common_fields(
 }
 
 /// Build the client-side proof.
-fn build_client_proof(
-    machine_fingerprint: &str,
-    client_version: &str,
-    time_bucket: i64,
-    client_nonce: &str,
-) -> String {
+fn build_client_proof(client_version: &str, time_bucket: i64, client_nonce: &str) -> String {
     sha256_hex(&format!(
-        "{CLIENT_PROOF_LABEL}|{WS_PROTOCOL_ID}|{EXPECTED_CLIENT_NAME}|{client_version}|{time_bucket}|{machine_fingerprint}|{client_nonce}"
+        "{CLIENT_PROOF_LABEL}|{WS_PROTOCOL_ID}|{EXPECTED_CLIENT_NAME}|{client_version}|{time_bucket}|{client_nonce}"
     ))
 }
 
 /// Build the server-side proof.
 fn build_server_proof(
-    machine_fingerprint: &str,
     server_version: &str,
     time_bucket: i64,
     client_nonce: &str,
     server_nonce: &str,
 ) -> String {
     sha256_hex(&format!(
-        "{SERVER_PROOF_LABEL}|{WS_PROTOCOL_ID}|{EXPECTED_SERVER_NAME}|{server_version}|{time_bucket}|{machine_fingerprint}|{client_nonce}|{server_nonce}"
+        "{SERVER_PROOF_LABEL}|{WS_PROTOCOL_ID}|{EXPECTED_SERVER_NAME}|{server_version}|{time_bucket}|{client_nonce}|{server_nonce}"
     ))
 }
 
@@ -364,14 +318,12 @@ mod tests {
 
     fn fake_identity() -> LocalIdentity {
         LocalIdentity {
-            machine_fingerprint: "abc123machinefingerprint".to_string(),
             machine_hint: "abc123machin".to_string(),
         }
     }
 
     #[test]
     fn client_hello_verifies_inside_time_window() {
-        let identity = fake_identity();
         let now = UNIX_EPOCH + Duration::from_secs(50);
         let time_bucket = current_time_bucket_at(now).expect("bucket");
         let hello = ClientHello {
@@ -382,22 +334,15 @@ mod tests {
             client_name: EXPECTED_CLIENT_NAME.to_string(),
             client_version: "0.1.0".to_string(),
             time_bucket,
-            machine_hint: identity.machine_hint.clone(),
             client_nonce: "nonce-a".to_string(),
-            proof: build_client_proof(
-                &identity.machine_fingerprint,
-                "0.1.0",
-                time_bucket,
-                "nonce-a",
-            ),
+            proof: build_client_proof("0.1.0", time_bucket, "nonce-a"),
         };
 
-        verify_client_hello(&hello, &identity, now).expect("client hello should verify");
+        verify_client_hello(&hello, now).expect("client hello should verify");
     }
 
     #[test]
     fn client_hello_rejects_wrong_bucket() {
-        let identity = fake_identity();
         let now = UNIX_EPOCH + Duration::from_secs(50);
         let now_bucket = current_time_bucket_at(now).expect("bucket");
         let hello = ClientHello {
@@ -408,17 +353,11 @@ mod tests {
             client_name: EXPECTED_CLIENT_NAME.to_string(),
             client_version: "0.1.0".to_string(),
             time_bucket: now_bucket + 2,
-            machine_hint: identity.machine_hint.clone(),
             client_nonce: "nonce-a".to_string(),
-            proof: build_client_proof(
-                &identity.machine_fingerprint,
-                "0.1.0",
-                now_bucket + 2,
-                "nonce-a",
-            ),
+            proof: build_client_proof("0.1.0", now_bucket + 2, "nonce-a"),
         };
 
-        let err = verify_client_hello(&hello, &identity, now).expect_err("bucket should fail");
+        let err = verify_client_hello(&hello, now).expect_err("bucket should fail");
         assert!(err.to_string().contains("outside the accepted window"));
     }
 
@@ -438,15 +377,9 @@ mod tests {
             machine_hint: identity.machine_hint.clone(),
             client_nonce: "nonce-a".to_string(),
             server_nonce: "nonce-b".to_string(),
-            proof: build_server_proof(
-                &identity.machine_fingerprint,
-                "0.1.0",
-                time_bucket,
-                "nonce-a",
-                "nonce-b",
-            ),
+            proof: build_server_proof("0.1.0", time_bucket, "nonce-a", "nonce-b"),
         };
 
-        verify_server_hello(&hello, &identity, "nonce-a", now).expect("server hello should verify");
+        verify_server_hello(&hello, "nonce-a", now).expect("server hello should verify");
     }
 }

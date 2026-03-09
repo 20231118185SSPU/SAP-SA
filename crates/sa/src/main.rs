@@ -1,4 +1,4 @@
-//! `sa` 閳?the StudyAdministrator (SA) backend agent daemon.
+//! `sa` 闁?the StudyAdministrator (SA) backend agent daemon.
 //!
 //! Responsibilities:
 //! - Load `sa.toml` (TOML config).
@@ -936,7 +936,7 @@ impl Hub {
 /// Expand special placeholders in referenced paths.
 ///
 /// Currently supported:
-/// - `YYYY-MM-DD` 閳?replaced with today's date, and also yesterday's date
+/// - `YYYY-MM-DD` 闁?replaced with today's date, and also yesterday's date
 ///   (to match common "load today + yesterday" instructions).
 fn expand_date_placeholders(mut refs: Vec<String>) -> Vec<String> {
     let mut out = Vec::new();
@@ -1281,11 +1281,7 @@ async fn ws_session_with_timeout(
         }
     };
 
-    if let Err(err) = verify_client_hello(
-        &client_hello,
-        &hub.ws_identity,
-        std::time::SystemTime::now(),
-    ) {
+    if let Err(err) = verify_client_hello(&client_hello, std::time::SystemTime::now()) {
         reject_handshake(
             &hub,
             connection_id,
@@ -1336,7 +1332,6 @@ async fn ws_session_with_timeout(
         %connection_id,
         client_name = %client_hello.client_name,
         client_version = %client_hello.client_version,
-        machine_hint = %client_hello.machine_hint,
         time_bucket = client_hello.time_bucket,
         "Accepted WS handshake"
     );
@@ -1545,7 +1540,7 @@ async fn main() -> anyhow::Result<()> {
     // Connect external MCP servers before freezing the tool registry.
     let mcp_registry = if cfg.mcp.enabled && !cfg.mcp.servers.is_empty() {
         tracing::info!(
-            "Initializing MCP client 閳?{} server(s) configured",
+            "Initializing MCP client 闁?{} server(s) configured",
             cfg.mcp.servers.len()
         );
         match McpRegistry::connect_all(&cfg.mcp.servers).await {
@@ -1768,14 +1763,9 @@ mod tests {
     }
 
     /// Build the exact client proof used by the WS handshake.
-    fn compute_client_proof(
-        machine_fingerprint: &str,
-        client_version: &str,
-        time_bucket: i64,
-        client_nonce: &str,
-    ) -> String {
+    fn compute_client_proof(client_version: &str, time_bucket: i64, client_nonce: &str) -> String {
         let material = format!(
-            "{TEST_CLIENT_PROOF_LABEL}|{WS_PROTOCOL_ID}|{EXPECTED_CLIENT_NAME}|{client_version}|{time_bucket}|{machine_fingerprint}|{client_nonce}"
+            "{TEST_CLIENT_PROOF_LABEL}|{WS_PROTOCOL_ID}|{EXPECTED_CLIENT_NAME}|{client_version}|{time_bucket}|{client_nonce}"
         );
         let mut hasher = Sha256::new();
         hasher.update(material.as_bytes());
@@ -1784,7 +1774,6 @@ mod tests {
 
     /// Build one custom hello so tests can isolate bucket skew from proof mismatch.
     fn build_client_hello_with_bucket(
-        local_identity: &LocalIdentity,
         client_version: &str,
         time_bucket: i64,
         client_nonce: &str,
@@ -1797,14 +1786,8 @@ mod tests {
             client_name: EXPECTED_CLIENT_NAME.to_string(),
             client_version: client_version.to_string(),
             time_bucket,
-            machine_hint: local_identity.machine_hint.clone(),
             client_nonce: client_nonce.to_string(),
-            proof: compute_client_proof(
-                &local_identity.machine_fingerprint,
-                client_version,
-                time_bucket,
-                client_nonce,
-            ),
+            proof: compute_client_proof(client_version, time_bucket, client_nonce),
         }
     }
 
@@ -1869,14 +1852,9 @@ mod tests {
     async fn handshake_rejects_time_bucket_skew_and_closes() {
         let server = spawn_test_server(std::time::Duration::from_millis(250)).await;
         let mut ws = connect_test_client(&server).await;
-        let local_identity = load_local_identity().expect("local identity should load");
         let now_bucket = current_time_bucket().expect("current bucket should resolve");
-        let hello = build_client_hello_with_bucket(
-            &local_identity,
-            "test-client",
-            now_bucket + 2,
-            "bucket-skew-nonce",
-        );
+        let hello =
+            build_client_hello_with_bucket("test-client", now_bucket + 2, "bucket-skew-nonce");
 
         send_client_hello(&mut ws, hello).await;
 
@@ -1894,9 +1872,7 @@ mod tests {
     async fn handshake_rejects_proof_mismatch_and_closes() {
         let server = spawn_test_server(std::time::Duration::from_millis(250)).await;
         let mut ws = connect_test_client(&server).await;
-        let local_identity = load_local_identity().expect("local identity should load");
-        let mut hello = build_client_hello(&local_identity, "test-client")
-            .expect("valid client hello should build");
+        let mut hello = build_client_hello("test-client").expect("valid client hello should build");
         hello.proof =
             "0000000000000000000000000000000000000000000000000000000000000000".to_string();
 
@@ -1916,9 +1892,7 @@ mod tests {
     async fn handshake_accepts_valid_client_hello_before_normal_messages() {
         let server = spawn_test_server(std::time::Duration::from_millis(250)).await;
         let mut ws = connect_test_client(&server).await;
-        let local_identity = load_local_identity().expect("local identity should load");
-        let hello = build_client_hello(&local_identity, "test-client")
-            .expect("valid client hello should build");
+        let hello = build_client_hello("test-client").expect("valid client hello should build");
 
         send_client_hello(&mut ws, hello).await;
 
