@@ -395,7 +395,7 @@ agents_md = "Agents.md"
         let cfg =
             toml::from_str::<Config>(raw).expect("config without compaction section should parse");
         assert!(cfg.compaction.enabled);
-        assert_eq!(cfg.compaction.trigger_tokens, 24_000);
+        assert_eq!(cfg.compaction.trigger_tokens, 180_000);
         assert_eq!(cfg.compaction.keep_recent_tokens, 8_000);
         assert_eq!(cfg.compaction.reserve_summary_tokens, 4_096);
         assert_eq!(cfg.compaction.min_messages_to_compact, 8);

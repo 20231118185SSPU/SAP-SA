@@ -176,7 +176,7 @@ const fn default_compaction_enabled() -> bool {
 
 /// Default value for `CompactionConfig.trigger_tokens`.
 const fn default_compaction_trigger_tokens() -> usize {
-    24_000
+    180_000
 }
 
 /// Default value for `CompactionConfig.keep_recent_tokens`.
