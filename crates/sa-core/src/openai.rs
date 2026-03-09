@@ -178,6 +178,14 @@ pub struct ChatCompletionsRequest {
     /// Chat messages.
     pub messages: Vec<ChatMessage>,
 
+    /// Optional output token cap.
+    ///
+    /// We use the classic OpenAI-compatible `max_tokens` field because many
+    /// compatible gateways and self-hosted proxies still accept this shape on
+    /// `/v1/chat/completions`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
+
     /// Optional reasoning depth / effort for GPT-family reasoning models.
     ///
     /// This is forwarded as the OpenAI-compatible top-level
@@ -317,6 +325,7 @@ mod tests {
         let req = ChatCompletionsRequest {
             model: "gpt-5.2".to_string(),
             messages: vec![ChatMessage::text("user", "hello")],
+            max_tokens: None,
             reasoning_effort: Some("xhigh".to_string()),
             tools: None,
             tool_choice: None,
@@ -332,6 +341,7 @@ mod tests {
         let req = ChatCompletionsRequest {
             model: "gpt-5.2".to_string(),
             messages: vec![ChatMessage::text("user", "hello")],
+            max_tokens: None,
             reasoning_effort: None,
             tools: None,
             tool_choice: None,

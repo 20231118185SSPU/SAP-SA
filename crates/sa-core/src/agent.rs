@@ -168,9 +168,12 @@ impl AgentRunner {
             match maybe_compact_history(
                 &self.llm,
                 &self.cfg.model,
+                &system_message.role,
+                &system_message,
                 self.cfg.reasoning_effort.as_deref(),
                 &mut compaction_state,
                 &mut messages,
+                &tool_definitions,
                 &self.cfg.compaction,
                 cancel,
             )
@@ -192,11 +195,10 @@ impl AgentRunner {
                 }
                 Ok(None) => {}
                 Err(err) => {
-                    (emit)(
-                        EventKind::Error,
-                        task_id,
-                        format!("History compaction failed before step {step}: {err}"),
-                    );
+                    let msg = format!("History compaction failed before step {step}: {err}");
+                    (emit)(EventKind::Error, task_id, msg.clone());
+                    (emit)(EventKind::Final, task_id, msg.clone());
+                    return Err(anyhow::anyhow!(msg));
                 }
             }
 
@@ -210,6 +212,7 @@ impl AgentRunner {
             let req = ChatCompletionsRequest {
                 model: self.cfg.model.clone(),
                 messages: build_request_messages(&system_message, &compaction_state, &messages),
+                max_tokens: None,
                 reasoning_effort: self.cfg.reasoning_effort.clone(),
                 tools: Some(tool_definitions.clone()),
                 tool_choice: Some(serde_json::json!("auto")),

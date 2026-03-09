@@ -44,7 +44,8 @@ max_steps = 32
 # Whether SA should automatically compress long-running conversation history.
 enabled = true
 
-# Approximate total history size at which compaction is triggered.
+# Approximate total request size at which compaction is triggered.
+# This budget includes system/developer prompt, retained history, and tool schemas.
 trigger_tokens = 180000
 
 # Approximate recent-history budget kept verbatim after compaction.

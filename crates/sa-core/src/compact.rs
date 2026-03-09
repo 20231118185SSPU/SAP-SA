@@ -20,7 +20,11 @@
 //! next model call to continue work.
 
 use crate::cancel::CancelToken;
-use crate::openai::{ChatCompletionsRequest, ChatMessage, OpenAiClient, ToolCall};
+use crate::openai::{
+    ChatCompletionsError, ChatCompletionsRequest, ChatMessage, OpenAiClient, ToolCall,
+    ToolDefinition,
+};
+use crate::retry::retry_delay;
 use anyhow::Context as _;
 use serde::Deserialize;
 use std::fmt::Write as _;
@@ -131,6 +135,10 @@ pub const TURN_PREFIX_SUMMARIZATION_PROMPT: &str = r#"这是一个因过长而�
 
 保持简洁。只聚焦于理解后半段所必需的信息。"#;
 
+/// Small constant used to represent top-level JSON request wrapper overhead
+/// that is not captured by per-message or per-tool estimates.
+const REQUEST_WRAPPER_TOKENS: usize = 32;
+
 /// Default compaction settings for SA.
 ///
 /// These numbers are intentionally conservative because SA currently does not
@@ -143,7 +151,13 @@ pub struct CompactionConfig {
     /// Master kill-switch.
     #[serde(default = "default_compaction_enabled")]
     pub enabled: bool,
-    /// Approximate total history size at which compaction should trigger.
+    /// Approximate total request size at which compaction should trigger.
+    ///
+    /// This includes:
+    /// - the stable system/developer prompt
+    /// - any existing compaction summary
+    /// - the retained conversation messages
+    /// - tool definitions sent with the next main model call
     #[serde(default = "default_compaction_trigger_tokens")]
     pub trigger_tokens: usize,
     /// Approximate token budget to preserve as the recent suffix.
@@ -216,11 +230,12 @@ impl CompactionState {
 /// Human-readable report returned after one successful compaction.
 #[derive(Debug, Clone)]
 pub struct CompactionReport {
-    /// Estimated total tokens before compaction.
+    /// Estimated total request tokens before compaction.
     pub tokens_before: usize,
-    /// Estimated total tokens after compaction.
+    /// Estimated total request tokens after compaction.
     pub tokens_after: usize,
-    /// Number of real conversation messages summarized away.
+    /// Number of real conversation messages summarized away across all
+    /// compaction passes performed in one call.
     pub summarized_messages: usize,
     /// Number of real conversation messages still kept verbatim.
     pub kept_messages: usize,
@@ -239,8 +254,6 @@ struct PreparedCompaction {
     turn_prefix_messages: Vec<ChatMessage>,
     /// Previous checkpoint summary, if any.
     previous_summary: Option<String>,
-    /// Approximate total size before compaction.
-    total_tokens_before: usize,
     /// Whether we had to split one turn.
     split_turn: bool,
 }
@@ -298,68 +311,118 @@ pub fn build_compaction_summary_message(summary: &str) -> ChatMessage {
 pub async fn maybe_compact_history(
     llm: &OpenAiClient,
     model: &str,
+    system_role_name: &str,
+    system_message: &ChatMessage,
     reasoning_effort: Option<&str>,
     state: &mut CompactionState,
     conversation_messages: &mut Vec<ChatMessage>,
+    tool_definitions: &[ToolDefinition],
     cfg: &CompactionConfig,
     cancel: &CancelToken,
 ) -> anyhow::Result<Option<CompactionReport>> {
-    let Some(prepared) = prepare_compaction(conversation_messages, state, cfg) else {
+    if !cfg.enabled {
         return Ok(None);
-    };
+    }
 
-    let history_summary = if prepared.messages_to_summarize.is_empty() {
-        prepared
-            .previous_summary
-            .clone()
-            .unwrap_or_else(|| "No prior history.".to_string())
-    } else {
-        generate_summary(
-            llm,
-            model,
-            reasoning_effort,
-            &prepared.messages_to_summarize,
-            cfg.reserve_summary_tokens,
-            cancel,
-            prepared.previous_summary.as_deref(),
-            None,
-        )
-        .await?
-    };
+    let mut initial_tokens_before = estimate_request_tokens(
+        system_message,
+        state,
+        conversation_messages,
+        tool_definitions,
+    );
+    if initial_tokens_before < cfg.trigger_tokens {
+        return Ok(None);
+    }
 
-    let final_summary = if prepared.split_turn && !prepared.turn_prefix_messages.is_empty() {
-        let turn_prefix_summary = generate_turn_prefix_summary(
-            llm,
-            model,
-            reasoning_effort,
-            &prepared.turn_prefix_messages,
-            cfg.reserve_summary_tokens,
-            cancel,
-        )
-        .await?;
+    let mut total_summarized_messages = 0usize;
+    let mut split_turn = false;
 
-        format!(
-            "{history_summary}\n\n---\n\n**Turn Context (split turn):**\n\n{turn_prefix_summary}"
-        )
-    } else {
-        history_summary
-    };
+    loop {
+        let total_tokens_before = estimate_request_tokens(
+            system_message,
+            state,
+            conversation_messages,
+            tool_definitions,
+        );
+        if total_tokens_before < cfg.trigger_tokens {
+            return Ok(Some(CompactionReport {
+                tokens_before: initial_tokens_before,
+                tokens_after: total_tokens_before,
+                summarized_messages: total_summarized_messages,
+                kept_messages: conversation_messages.len(),
+                split_turn,
+            }));
+        }
 
-    let summary_tokens = estimate_tokens(&build_compaction_summary_message(&final_summary));
-    let kept_tokens = estimate_context_tokens(&prepared.kept_messages);
-    let report = CompactionReport {
-        tokens_before: prepared.total_tokens_before,
-        tokens_after: summary_tokens + kept_tokens,
-        summarized_messages: prepared.messages_to_summarize.len()
-            + prepared.turn_prefix_messages.len(),
-        kept_messages: prepared.kept_messages.len(),
-        split_turn: prepared.split_turn,
-    };
+        let prepared =
+            prepare_compaction(conversation_messages, state, cfg).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Estimated request size is {total_tokens_before} tokens, but no more compactable history remains"
+                )
+            })?;
 
-    *conversation_messages = prepared.kept_messages;
-    state.set_summary(final_summary);
+        let history_summary = if prepared.messages_to_summarize.is_empty() {
+            prepared
+                .previous_summary
+                .clone()
+                .unwrap_or_else(|| "No prior history.".to_string())
+        } else {
+            generate_summary(
+                llm,
+                model,
+                system_role_name,
+                reasoning_effort,
+                &prepared.messages_to_summarize,
+                cfg.reserve_summary_tokens,
+                cancel,
+                prepared.previous_summary.as_deref(),
+                None,
+            )
+            .await?
+        };
 
-    Ok(Some(report))
+        let final_summary = if prepared.split_turn && !prepared.turn_prefix_messages.is_empty() {
+            let turn_prefix_summary = generate_turn_prefix_summary(
+                llm,
+                model,
+                system_role_name,
+                reasoning_effort,
+                &prepared.turn_prefix_messages,
+                cfg.reserve_summary_tokens,
+                cancel,
+            )
+            .await?;
+
+            format!(
+                "{history_summary}\n\n---\n\n**Turn Context (split turn):**\n\n{turn_prefix_summary}"
+            )
+        } else {
+            history_summary
+        };
+
+        let mut next_state = state.clone();
+        next_state.set_summary(final_summary.clone());
+        let total_tokens_after = estimate_request_tokens(
+            system_message,
+            &next_state,
+            &prepared.kept_messages,
+            tool_definitions,
+        );
+        if total_tokens_after >= total_tokens_before {
+            anyhow::bail!(
+                "Compaction made no progress: estimated request size stayed at {} -> {} tokens",
+                total_tokens_before,
+                total_tokens_after
+            );
+        }
+
+        total_summarized_messages +=
+            prepared.messages_to_summarize.len() + prepared.turn_prefix_messages.len();
+        split_turn |= prepared.split_turn;
+        *conversation_messages = prepared.kept_messages;
+        state.set_summary(final_summary);
+        initial_tokens_before = initial_tokens_before.max(total_tokens_before);
+    }
 }
 
 /// Decide whether compaction is needed and, if so, which slices should be
@@ -369,18 +432,7 @@ fn prepare_compaction(
     state: &CompactionState,
     cfg: &CompactionConfig,
 ) -> Option<PreparedCompaction> {
-    if !cfg.enabled || conversation_messages.len() < cfg.min_messages_to_compact {
-        return None;
-    }
-
-    let existing_summary_tokens = state
-        .summary()
-        .map(|summary| estimate_tokens(&build_compaction_summary_message(summary)))
-        .unwrap_or(0);
-    let total_tokens_before =
-        existing_summary_tokens + estimate_context_tokens(conversation_messages);
-
-    if total_tokens_before < cfg.trigger_tokens {
+    if conversation_messages.len() < cfg.min_messages_to_compact {
         return None;
     }
 
@@ -412,7 +464,6 @@ fn prepare_compaction(
         kept_messages,
         turn_prefix_messages,
         previous_summary: state.summary().map(str::to_string),
-        total_tokens_before,
         split_turn: cut.split_turn,
     })
 }
@@ -469,6 +520,35 @@ pub fn serialize_conversation(messages: &[ChatMessage]) -> String {
 /// Estimate the approximate token size of a whole message list.
 pub fn estimate_context_tokens(messages: &[ChatMessage]) -> usize {
     messages.iter().map(estimate_tokens).sum()
+}
+
+/// Estimate the approximate token size of serialized tool definitions.
+pub fn estimate_tool_definitions_tokens(tool_definitions: &[ToolDefinition]) -> usize {
+    if tool_definitions.is_empty() {
+        return 0;
+    }
+
+    match serde_json::to_string(tool_definitions) {
+        Ok(serialized) => serialized.len().div_ceil(4),
+        Err(_) => 0,
+    }
+}
+
+/// Estimate the approximate token size of the full model request that SA would
+/// send on the next `/v1/chat/completions` call.
+pub fn estimate_request_tokens(
+    system_message: &ChatMessage,
+    state: &CompactionState,
+    conversation_messages: &[ChatMessage],
+    tool_definitions: &[ToolDefinition],
+) -> usize {
+    REQUEST_WRAPPER_TOKENS
+        + estimate_context_tokens(&build_request_messages(
+            system_message,
+            state,
+            conversation_messages,
+        ))
+        + estimate_tool_definitions_tokens(tool_definitions)
 }
 
 /// Estimate the approximate token size of one chat message.
@@ -625,6 +705,7 @@ fn build_turn_prefix_prompt(conversation_text: &str) -> String {
 async fn generate_summary(
     llm: &OpenAiClient,
     model: &str,
+    system_role_name: &str,
     reasoning_effort: Option<&str>,
     current_messages: &[ChatMessage],
     reserve_summary_tokens: usize,
@@ -635,24 +716,15 @@ async fn generate_summary(
     let conversation_text = serialize_conversation(current_messages);
     let prompt_text =
         build_summarization_prompt(&conversation_text, previous_summary, custom_focus);
-    let max_tokens = ((reserve_summary_tokens as f64) * 0.8).floor() as usize;
+    let req = build_summarization_request(
+        system_role_name,
+        model,
+        reasoning_effort,
+        prompt_text,
+        validated_completion_budget(reserve_summary_tokens, 0.8)?,
+    );
 
-    let req = ChatCompletionsRequest {
-        model: model.to_string(),
-        messages: vec![ChatMessage::text("user", prompt_text)],
-        reasoning_effort: reasoning_effort.map(str::to_string),
-        tools: None,
-        tool_choice: None,
-        stream: Some(false),
-    };
-
-    let response = tokio::select! {
-        _ = cancel.cancelled() => {
-            anyhow::bail!("Compaction cancelled before summarization finished")
-        }
-        response = llm.chat_completions(&req) => response,
-    }
-    .map_err(|err| map_summarization_error("Summarization failed", err))?;
+    let response = chat_completions_with_retry(llm, &req, cancel, "Summarization").await?;
 
     let choice = response
         .first_choice()
@@ -665,10 +737,6 @@ async fn generate_summary(
         .filter(|text| !text.is_empty())
         .ok_or_else(|| anyhow::anyhow!("Summarization response contained empty content"))?;
 
-    if max_tokens == 0 {
-        anyhow::bail!("Invalid compaction config: reserve_summary_tokens must be greater than 0");
-    }
-
     Ok(summary.to_string())
 }
 
@@ -676,6 +744,7 @@ async fn generate_summary(
 async fn generate_turn_prefix_summary(
     llm: &OpenAiClient,
     model: &str,
+    system_role_name: &str,
     reasoning_effort: Option<&str>,
     current_messages: &[ChatMessage],
     reserve_summary_tokens: usize,
@@ -683,24 +752,16 @@ async fn generate_turn_prefix_summary(
 ) -> anyhow::Result<String> {
     let conversation_text = serialize_conversation(current_messages);
     let prompt_text = build_turn_prefix_prompt(&conversation_text);
-    let max_tokens = ((reserve_summary_tokens as f64) * 0.5).floor() as usize;
+    let req = build_summarization_request(
+        system_role_name,
+        model,
+        reasoning_effort,
+        prompt_text,
+        validated_completion_budget(reserve_summary_tokens, 0.5)?,
+    );
 
-    let req = ChatCompletionsRequest {
-        model: model.to_string(),
-        messages: vec![ChatMessage::text("user", prompt_text)],
-        reasoning_effort: reasoning_effort.map(str::to_string),
-        tools: None,
-        tool_choice: None,
-        stream: Some(false),
-    };
-
-    let response = tokio::select! {
-        _ = cancel.cancelled() => {
-            anyhow::bail!("Compaction cancelled before turn-prefix summarization finished")
-        }
-        response = llm.chat_completions(&req) => response,
-    }
-    .map_err(|err| map_summarization_error("Turn-prefix summarization failed", err))?;
+    let response =
+        chat_completions_with_retry(llm, &req, cancel, "Turn-prefix summarization").await?;
 
     let choice = response
         .first_choice()
@@ -715,11 +776,74 @@ async fn generate_turn_prefix_summary(
             anyhow::anyhow!("Turn-prefix summarization response contained empty content")
         })?;
 
+    Ok(summary.to_string())
+}
+
+/// Build one summary-model request with the dedicated compaction system prompt.
+fn build_summarization_request(
+    system_role_name: &str,
+    model: &str,
+    reasoning_effort: Option<&str>,
+    prompt_text: String,
+    max_tokens: u32,
+) -> ChatCompletionsRequest {
+    ChatCompletionsRequest {
+        model: model.to_string(),
+        messages: vec![
+            ChatMessage::text(system_role_name, SUMMARIZATION_SYSTEM_PROMPT),
+            ChatMessage::text("user", prompt_text),
+        ],
+        max_tokens: Some(max_tokens),
+        reasoning_effort: reasoning_effort.map(str::to_string),
+        tools: None,
+        tool_choice: None,
+        stream: Some(false),
+    }
+}
+
+/// Convert a reserved summary budget into a provider request field.
+fn validated_completion_budget(reserve_summary_tokens: usize, ratio: f64) -> anyhow::Result<u32> {
+    let max_tokens = ((reserve_summary_tokens as f64) * ratio).floor() as usize;
     if max_tokens == 0 {
         anyhow::bail!("Invalid compaction config: reserve_summary_tokens must be greater than 0");
     }
 
-    Ok(summary.to_string())
+    u32::try_from(max_tokens)
+        .context("Invalid compaction config: reserve_summary_tokens exceeds u32 range")
+}
+
+/// Send one compaction-related chat completion request with retry handling.
+async fn chat_completions_with_retry(
+    llm: &OpenAiClient,
+    req: &ChatCompletionsRequest,
+    cancel: &CancelToken,
+    label: &str,
+) -> anyhow::Result<crate::openai::ChatCompletionsResponse> {
+    let mut error_count = 0u32;
+
+    loop {
+        let response = tokio::select! {
+            _ = cancel.cancelled() => {
+                anyhow::bail!("{label} cancelled before completion")
+            }
+            response = llm.chat_completions(req) => response,
+        };
+
+        match response {
+            Ok(resp) => return Ok(resp),
+            Err(err) if err.is_retriable() => {
+                error_count = error_count.saturating_add(1);
+                let delay = retry_delay(error_count);
+                tokio::select! {
+                    _ = cancel.cancelled() => {
+                        anyhow::bail!("{label} cancelled during retry backoff")
+                    }
+                    _ = tokio::time::sleep(delay) => {}
+                }
+            }
+            Err(err) => return Err(map_summarization_error(label, err)),
+        }
+    }
 }
 
 /// Render one assistant tool call into a compact, readable form for summary
@@ -751,17 +875,14 @@ fn non_empty_text(text: Option<&str>) -> Option<&str> {
 }
 
 /// Convert transport-layer summarization failures into stable `anyhow` errors.
-fn map_summarization_error(
-    prefix: &str,
-    err: crate::openai::ChatCompletionsError,
-) -> anyhow::Error {
+fn map_summarization_error(prefix: &str, err: ChatCompletionsError) -> anyhow::Error {
     anyhow::anyhow!("{prefix}: {err}")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::openai::{ToolCall, ToolFunctionCall};
+    use crate::openai::{ToolCall, ToolDefinition, ToolFunctionCall, ToolFunctionDefinition};
 
     /// Helper used by several tests.
     fn assistant_with_tool_call(name: &str, arguments: serde_json::Value) -> ChatMessage {
@@ -831,6 +952,59 @@ mod tests {
     }
 
     #[test]
+    fn build_summarization_request_includes_system_prompt_and_budget() {
+        let req = build_summarization_request(
+            "developer",
+            "gpt-5.2",
+            Some("high"),
+            "需要摘要的内容".to_string(),
+            1024,
+        );
+
+        assert_eq!(req.model, "gpt-5.2");
+        assert_eq!(req.max_tokens, Some(1024));
+        assert_eq!(req.messages.len(), 2);
+        assert_eq!(req.messages[0].role, "developer");
+        assert_eq!(
+            req.messages[0].content.as_deref(),
+            Some(SUMMARIZATION_SYSTEM_PROMPT)
+        );
+        assert_eq!(req.messages[1].role, "user");
+        assert_eq!(req.reasoning_effort.as_deref(), Some("high"));
+        assert!(req.tools.is_none());
+    }
+
+    #[test]
+    fn estimate_request_tokens_counts_system_summary_and_tools() {
+        let system_message = ChatMessage::text("developer", "system prompt");
+        let mut state = CompactionState::default();
+        state.set_summary("历史摘要".to_string());
+        let tool_definitions = vec![ToolDefinition {
+            kind: "function".to_string(),
+            function: ToolFunctionDefinition {
+                name: "Read".to_string(),
+                description: "读取文件".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" }
+                    }
+                }),
+            },
+        }];
+
+        let tokens = estimate_request_tokens(
+            &system_message,
+            &state,
+            &[ChatMessage::text("user", "最新消息")],
+            &tool_definitions,
+        );
+
+        assert!(tokens > estimate_context_tokens(&[ChatMessage::text("user", "最新消息")]));
+        assert!(estimate_tool_definitions_tokens(&tool_definitions) > 0);
+    }
+
+    #[test]
     fn find_cut_point_never_keeps_from_tool_result() {
         let messages = vec![
             ChatMessage::text("user", "step 1"),
@@ -877,5 +1051,15 @@ mod tests {
         );
 
         assert!(estimate_tokens(&message) > 0);
+    }
+
+    #[test]
+    fn validated_completion_budget_rejects_zero_budget() {
+        let err =
+            validated_completion_budget(0, 0.8).expect_err("zero summary budget must be rejected");
+        assert!(
+            err.to_string()
+                .contains("reserve_summary_tokens must be greater than 0")
+        );
     }
 }
