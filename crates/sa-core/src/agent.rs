@@ -13,6 +13,9 @@
 
 use crate::agents_md::{AgentsMd, format_agents_md_block};
 use crate::cancel::CancelToken;
+use crate::compact::{
+    CompactionConfig, CompactionState, build_request_messages, maybe_compact_history,
+};
 use crate::openai::{ChatCompletionsRequest, ChatMessage, OpenAiClient, ToolCall};
 use crate::retry::retry_delay;
 use crate::skills::SkillRegistry;
@@ -48,6 +51,8 @@ pub struct AgentRunnerConfig {
     pub reasoning_effort: Option<String>,
     /// Maximum tool-call steps per task.
     pub max_steps: u32,
+    /// History compaction behavior for long-running tasks.
+    pub compaction: CompactionConfig,
 }
 
 /// The runnable agent.
@@ -118,17 +123,17 @@ impl AgentRunner {
         // Build the "system prompt" (or "developer prompt") that stays constant.
         let system_prompt = self.build_system_prompt(agents_md, extra_system_prompt);
 
-        // Initialize conversation.
-        let mut messages = Vec::<ChatMessage>::new();
+        // Keep the stable system/developer instruction block separate from the
+        // mutable conversation history so compaction only touches the real
+        // dialogue and never rewrites the base instructions.
+        let system_message = ChatMessage::text(self.cfg.system_role_name.clone(), system_prompt);
 
-        // NOTE: The user requested configurability for the role name here.
-        messages.push(ChatMessage::text(
-            self.cfg.system_role_name.clone(),
-            system_prompt,
-        ));
+        // Store only the real conversation here. Synthetic compaction summaries
+        // are injected later when we build the provider request.
+        let mut messages = vec![ChatMessage::text("user", task.clone())];
 
-        // User task.
-        messages.push(ChatMessage::text("user", task.clone()));
+        // One task keeps one evolving checkpoint summary.
+        let mut compaction_state = CompactionState::default();
 
         // We pre-compute tool definitions once. This keeps requests stable.
         let tool_definitions = self.tools.tool_definitions();
@@ -160,6 +165,41 @@ impl AgentRunner {
                 &emit,
             );
 
+            match maybe_compact_history(
+                &self.llm,
+                &self.cfg.model,
+                self.cfg.reasoning_effort.as_deref(),
+                &mut compaction_state,
+                &mut messages,
+                &self.cfg.compaction,
+                cancel,
+            )
+            .await
+            {
+                Ok(Some(report)) => {
+                    (emit)(
+                        EventKind::Log,
+                        task_id,
+                        format!(
+                            "Compacted history before step {step}: tokens {} -> {}, summarized {} message(s), kept {}, split_turn={}",
+                            report.tokens_before,
+                            report.tokens_after,
+                            report.summarized_messages,
+                            report.kept_messages,
+                            report.split_turn,
+                        ),
+                    );
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    (emit)(
+                        EventKind::Error,
+                        task_id,
+                        format!("History compaction failed before step {step}: {err}"),
+                    );
+                }
+            }
+
             (emit)(
                 EventKind::Log,
                 task_id,
@@ -169,7 +209,7 @@ impl AgentRunner {
             // Build the request.
             let req = ChatCompletionsRequest {
                 model: self.cfg.model.clone(),
-                messages: messages.clone(),
+                messages: build_request_messages(&system_message, &compaction_state, &messages),
                 reasoning_effort: self.cfg.reasoning_effort.clone(),
                 tools: Some(tool_definitions.clone()),
                 tool_choice: Some(serde_json::json!("auto")),

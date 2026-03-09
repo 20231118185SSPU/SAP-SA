@@ -23,6 +23,7 @@ use futures_util::{SinkExt as _, StreamExt as _};
 use sa_core::agent::{AgentRunner, AgentRunnerConfig, DrainQueuedUserMessagesFn, EmitEventFn};
 use sa_core::agents_md::{extract_markdown_file_references, load_agents_md};
 use sa_core::cancel::{CancelHandle, cancel_pair};
+use sa_core::compact::CompactionConfig;
 use sa_core::config::load_config_from_file;
 use sa_core::mcp_client::McpRegistry;
 use sa_core::memory::{build_prompt_block as build_memory_prompt_block, is_memory_reference};
@@ -1584,6 +1585,7 @@ async fn main() -> anyhow::Result<()> {
         system_role_name,
         reasoning_effort,
         max_steps: cfg.llm.max_steps,
+        compaction: CompactionConfig::default(),
     };
     let runner = AgentRunner::new(llm, tools, Arc::clone(&skills), runner_cfg);
 
@@ -1662,6 +1664,7 @@ mod tests {
                 system_role_name: "developer".to_string(),
                 reasoning_effort: None,
                 max_steps: 1,
+                compaction: CompactionConfig::default(),
             },
         );
 
