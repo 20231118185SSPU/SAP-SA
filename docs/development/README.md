@@ -1,85 +1,82 @@
-# Development documentation (SA)
+# SA 开发文档
 
-## Project overview
+## 项目概览
 
-This folder documents the StudyAdministrator (SA) backend in `../`:
+本目录记录 StudyAdministrator（SA）后端的开发说明。
 
-- `crates/sa-core`: core logic (config, skill loading, OpenAI-compatible client, agent loop)
-- `crates/sa`: backend daemon that runs the agent loop and exposes WebSocket
+主要目录：
 
-The terminal frontend is a separate project located at:
+- `../crates/sa-core`：核心逻辑，包括配置、`Agents.md` 读取、技能扫描、内置工具、MCP、OpenAI 兼容接口调用、Agent 主循环、WS 协议结构
+- `../crates/sa`：后端守护进程，负责运行 Agent、缓存事件、处理 WebSocket 连接与重连恢复
 
-- `../sa-cli`
+说明：
 
-## Running
+- 命令行前端位于独立项目 `../../sa-cli`
+- 本轮文档重点覆盖后端与协议，不继续展开前端实现细节
 
-1. Create `sa.toml` from `sa.example.toml`.
-2. Configure `[llm]` as needed:
+## 运行
+
+1. 基于 `sa.example.toml` 创建 `sa.toml`
+2. 配置 `[llm]`
    - `base_url`
    - `api_key`
    - `model`
    - `system_role_name`
-   - `reasoning_effort` (optional; for GPT-family reasoning depth such as `low`, `high`, `xhigh`)
-3. (Optional) Configure `[mcp]` if you want external MCP tools:
+   - `reasoning_effort`（可选，例如 `low`、`high`、`xhigh`）
+3. 可选配置 `[mcp]`
    - `enabled = true`
-   - one or more `[[mcp.servers]]`
-   - supported transports: `stdio`, `http`, `sse`
-   - registered tool names are prefixed as `<server>__<tool>`
-4. `AGENTS.md` and related context files are now tracked in the repository. If `AGENTS.md`
-   references persona/context files in backticks (e.g. `SOUL.md`, `USER.md`), the daemon will
-   preload them into the prompt. Memory files are handled separately through
-   `MemorySearch` / `MemoryGet`.
-5. Start the daemon:
+   - 配置一个或多个 `[[mcp.servers]]`
+   - 当前支持 `stdio`、`http`、`sse`
+   - 动态工具注册名格式为 `<server>__<tool>`
+4. 在工作区根目录准备 `AGENTS.md` 以及它引用的上下文文件
+5. 启动后端：
 
 ```bash
 cargo run -p sa --release
 ```
 
-6. Start the interactive CLI (bottom input box) in the separate CLI project:
+## 构建策略
 
-```bash
-cd ../sa-cli
-cargo run --release
-```
+当前仓库使用一套统一的 `--release` 配置，同时兼顾体积与运行性能。
 
-## Build (size + speed)
-
-This repo tunes the standard `--release` profile in `Cargo.toml` for **both**
-size and runtime performance.
-
-Example:
+示例：
 
 ```bash
 cargo build --release
 ```
 
-Interactive commands (CLI):
+## WebSocket 握手
 
-- Type text and press Enter → sends a normal message; if a task is already running, the backend queues it as a follow-up turn instead of interrupting immediately
-- Pending `Ask` questions use a dedicated answer box; press `Tab` to switch focus between the answer box and the normal message box
-- `Esc` → interrupt current task
-- `/exit` → quit CLI
+普通 WS 消息流之前，必须先完成强制握手：
 
-One-shot mode (for scripting):
+1. 前端先发送 `client_hello`
+2. 后端校验 `client_hello`
+3. 后端返回 `server_hello`
+4. 前端校验 `server_hello`
+5. 校验通过后才进入正常协议流
 
-```bash
-cd ../sa-cli
-cargo run --release -- run "用一句话解释这个项目的结构"
-```
+如果握手失败，后端返回 `hello_reject`。
 
-## WebSocket API (v0)
+完整协议、字段解释、证明公式、JSON 示例见：
 
-All messages are JSON text frames.
+- `ws-handshake.md`
 
-Client → Server:
+## WebSocket API（正常消息流）
 
+说明：以下消息仅在握手成功后有效。
+
+客户端 -> 后端：
+
+- `{"type":"client_hello","hello":{...}}`：连接首包，必须先发送
 - `{"type":"submit","task_id":"<optional uuid>","task":"..."}`
 - `{"type":"get_history","from_event_id":123}`
 - `{"type":"interrupt","task_id":"<uuid>"}`
 - `{"type":"answer_question","answer":{...}}`
 
-Server → Client:
+后端 -> 客户端：
 
+- `{"type":"server_hello","hello":{...}}`
+- `{"type":"hello_reject","reject":{...}}`
 - `{"type":"accepted","task_id":"..."}`
 - `{"type":"history","events":[...]}`
 - `{"type":"event","event":{...}}`
@@ -88,72 +85,83 @@ Server → Client:
 - `{"type":"question_resolved","question_id":"..."}`
 - `{"type":"show","file":{...}}`
 - `{"type":"recent_shows","files":[...]}`
+- `{"type":"error","message":"..."}`
 
-Event fields:
+事件字段：
 
-- `event_id` (u64): monotonically increasing identifier
-- `ts` (RFC3339 string): server timestamp (UTC)
-- `task_id` (string): which task produced the event
-- `kind` (string): `log` | `tool` | `message` | `final` | `error`
-- `message` (string): human-readable text
+- `event_id`：单调递增事件编号
+- `ts`：UTC 时间戳（RFC3339）
+- `task_id`：所属顶层任务
+- `kind`：`log` | `tool` | `message` | `final` | `error`
+- `message`：可读文本
 
-Structured question fields:
+结构化提问字段：
 
-- `question_id` (UUID): used to correlate the answer
-- `task_id` (UUID): top-level task waiting on the answer
-- `prompt` (string): user-facing prompt
-- `mode` (string): `single_choice` | `multi_choice` | `text`
-- `options` (array): selectable options for choice-based prompts
-- `allow_free_text` (bool): whether extra text is allowed
+- `question_id`：问题 UUID
+- `task_id`：所属顶层任务 UUID
+- `prompt`：展示给同学的提问文本
+- `mode`：`single_choice` | `multi_choice` | `text`
+- `options`：选项数组
+- `allow_free_text`：是否允许额外自由输入
 
-## Built-in tools
+## 内置工具
 
-- `Read`: read a UTF-8 text file under the workspace root
-- `Write`: create a file only if it does not already exist
-- `Edit`: modify an existing file, but only after `Read` has been used on it in the same agent session
-- `Bash`: run commands through Git Bash (`bash -lc`)
-- `Fetch`: perform a direct HTTP request to a known URL
-- `Search`: perform a web search and return candidate titles/snippets/URLs
-- `MemorySearch`: search `MEMORY.md`, `memory.md`, and `memory/*.md` for relevant snippets
-- `MemoryGet`: read one allowed memory Markdown file by path and optional line range
-- `Send`: push a user-facing message into the CLI event stream
-- `Show`: read an existing workspace file and push its payload to the CLI over WebSocket
-- `Ask`: emit a structured question and block until an answer arrives
-- `Skill`: read `SKILL.md` or another skill-relative file from a named skill; host install paths stay hidden
-- `SubAgent`: run a nested child agent with parent-supplied context; child output is traced back into the parent task stream
+- `Read`：读取工作区内 UTF-8 文本文件
+- `Write`：仅在目标文件不存在时创建文件
+- `Edit`：编辑已存在文件，且要求当前 Agent 会话中已先读过该文件
+- `Bash`：通过 Git Bash 执行命令（`bash -lc`）
+- `Fetch`：向指定 URL 发起网络请求
+- `Search`：执行网络搜索并返回候选结果
+- `MemorySearch`：检索 `MEMORY.md`、`memory.md`、`memory/*.md`
+- `MemoryGet`：按路径与可选行范围读取单个 memory Markdown 文件
+- `Send`：发送简洁消息给同学
+- `Show`：读取一个已存在文件并通过 WS 发送给前端展示
+- `Ask`：发起结构化提问并等待同学回答
+- `Skill`：按技能名读取 `SKILL.md` 或技能目录下的其他允许文件，不暴露真实宿主路径
+- `SubAgent`：启动子代理，传入父代理构造的上下文；子代理完成后把结果回传上级
 
-If MCP is enabled, additional dynamic tools are appended at startup. These use
-the name format `<server>__<tool>` and are dispatched through the MCP client.
+如果 MCP 已启用，后端启动时还会追加外部动态工具，名称格式为 `<server>__<tool>`。
 
-## Known issues
+## MCP
 
-- This is intentionally minimal: no authentication on the WebSocket server.
-- `SubAgent` recursion is intentionally bounded by a hard depth limit.
-- Streaming token output is not implemented; events are per-step.
-- Memory search is currently lexical Markdown search, not embedding-based semantic search.
-- `Search` currently uses DuckDuckGo's lightweight HTML endpoint and a small internal parser; if that HTML changes, result extraction may need maintenance.
-- MCP support currently covers tools only; MCP resources and prompts are not yet wired into SA.
+当前 SA 后端已经支持 MCP 工具协议，参考实现来自 `zeroclaw` 的成熟代码路径，目标是减少协议细节错误率。
 
-## Changelog
+当前范围：
 
-- 0.1.0: initial minimal autonomous agent + WS + CLI.
-- 0.2.0: persistent long-term memory, Agents.md reload + persona preloading, interrupt, TUI CLI, infinite retry/backoff.
-- 0.2.1: CLI always requests WS history on connect (prevents missing `final` after disconnect).
-- 0.2.2: TUI ignores key release events (fixes double-typed input on some terminals).
-- 0.2.3: TUI cursor uses Unicode display width (fixes cursor drift for CJK/emoji input).
-- 0.2.4: add optimized build profiles (`--release` / `--profile release-small`).
-- 0.2.5: keep one tuned `--release` profile (size + speed).
-- 0.3.0: split the backend daemon and CLI into separate projects.
-- 0.4.0: rename the backend to StudyAdministrator (SA), rename binaries/config to `sa`.
-- 0.5.0: replace the built-in toolset with `Read` / `Write` / `Edit` / `Bash` / `Send` / `Ask` / `Skill` / `SubAgent`, add structured question WS messages, and support nested sub-agents.
-- 0.6.0: switch the built-in prompt to a Chinese ZeroClaw-style framework prompt, add `Fetch` / `Search` / `Show`, and add WS file-display messages for reconnecting CLI clients.
-- 0.7.0: switch memory to OpenClaw-style Markdown files (`MEMORY.md`, `memory/*.md`), add `MemorySearch` / `MemoryGet`, and harden `Skill` into a path-isolated skill file reader.
+- 支持连接 MCP server
+- 支持列出并注册 MCP tools
+- 支持在 Agent 执行中调用 MCP tools
 
-## Traceability (extracted from `../zeroclaw`)
+当前不包含：
 
-This minimal implementation is intentionally small, but it is conceptually extracted
-from these ZeroClaw modules:
+- MCP resources 的完整接入
+- MCP prompts 的完整接入
 
-- OpenAI-compatible HTTP calling: `../zeroclaw/src/providers/compatible.rs`
-- Agent tool-calling loop patterns: `../zeroclaw/src/agent/loop_.rs`
-- Skills config / skill concepts: `../zeroclaw/src/config/schema.rs` (skills section)
+## 已知限制
+
+- 当前 WebSocket 已增加本机指纹双向握手，但它仍不是面对恶意本地进程的强认证
+- `SubAgent` 深度受硬限制保护，避免无限递归
+- 目前没有 token 级流式输出，事件粒度仍然是步骤级
+- Memory 检索仍是 Markdown 词法搜索，不是 embedding 语义检索
+- `Search` 依赖轻量网页搜索解析，若上游页面结构变化，解析逻辑可能需要维护
+- MCP 目前主要覆盖 tools，尚未扩展到更完整的协议面
+
+## 更新日志
+
+- `0.1.0`：初始最小可运行后端 Agent + WS
+- `0.2.0`：补齐长期记忆、`Agents.md` 重载与上下文预加载、无限重试/退避
+- `0.3.0`：将后端与 CLI 拆分为独立项目
+- `0.4.0`：统一更名为 StudyAdministrator（SA），后端二进制改为 `sa`
+- `0.5.0`：重构内置工具为 `Read` / `Write` / `Edit` / `Bash` / `Send` / `Ask` / `Skill` / `SubAgent`
+- `0.6.0`：加入 `Fetch` / `Search` / `Show`，并增强用户可见文件展示协议
+- `0.7.0`：记忆加载改为 OpenClaw 风格 Markdown 记忆文件，`Skill` 改为路径隔离读取
+- `0.7.1`：加入前端先发起的 WS 双向身份握手，新增 `client_hello` / `server_hello` / `hello_reject`
+
+## 可追溯性
+
+这套最小后端实现虽然做了大量裁剪，但设计来源仍可追溯到已有实现：
+
+- OpenAI 兼容接口调用：`../zeroclaw/src/providers/compatible.rs`
+- Agent 工具循环：`../zeroclaw/src/agent/loop_.rs`
+- MCP 参考实现：`../zeroclaw` 中 MCP 相关模块
+- 记忆装载方式：参考 `../openclaw` 的注入策略并做适配

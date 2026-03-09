@@ -21,4 +21,5 @@ pub mod openai;
 pub mod retry;
 pub mod skills;
 pub mod tools;
+pub mod ws_identity;
 pub mod ws_protocol;

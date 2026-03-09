@@ -1,4 +1,4 @@
-//! `sa` — the StudyAdministrator (SA) backend agent daemon.
+//! `sa` 鈥?the StudyAdministrator (SA) backend agent daemon.
 //!
 //! Responsibilities:
 //! - Load `sa.toml` (TOML config).
@@ -31,6 +31,10 @@ use sa_core::skills::SkillRegistry;
 use sa_core::tools::{
     AskQuestionFn, AskRequest, MAX_SUBAGENT_DEPTH, RunSubAgentFn, SendMessageFn, ShowFileFn,
     SubAgentRequest, ToolContext, ToolExecutor, ToolRuntime,
+};
+use sa_core::ws_identity::{
+    LocalIdentity, WS_HANDSHAKE_TIMEOUT_SECS, build_hello_reject, build_server_hello,
+    load_local_identity, verify_client_hello,
 };
 use sa_core::ws_protocol::{
     ClientMessage, Event, EventKind, QuestionMode, ServerMessage, UserQuestion, UserQuestionAnswer,
@@ -143,11 +147,19 @@ struct Hub {
     /// - Users may create `Agents.md` after the daemon starts.
     /// Reloading makes this behavior verifiable and fixes "Agents.md not loaded" confusion.
     agents_md_path: PathBuf,
+
+    /// Stable machine identity reused by every WS handshake.
+    ws_identity: LocalIdentity,
 }
 
 impl Hub {
     /// Create a new hub and spawn the background worker.
-    fn new(runner: AgentRunner, agents_md_path: PathBuf, preload_ctx: ToolContext) -> Arc<Self> {
+    fn new(
+        runner: AgentRunner,
+        agents_md_path: PathBuf,
+        preload_ctx: ToolContext,
+        ws_identity: LocalIdentity,
+    ) -> Arc<Self> {
         // Task queue capacity (small but adequate for minimal agent).
         let (task_tx, task_rx) = mpsc::channel::<TaskRequest>(128);
 
@@ -168,6 +180,7 @@ impl Hub {
             preload_ctx,
             runner,
             agents_md_path,
+            ws_identity,
         });
 
         // Spawn worker loop.
@@ -232,6 +245,22 @@ impl Hub {
     /// not render the whole stream.
     fn mirror_server_message(&self, msg: &ServerMessage) {
         match msg {
+            ServerMessage::ServerHello { hello } => {
+                eprintln!(
+                    "[frontend][server_hello][protocol={}][server={}][version={}][bucket={}][machine_hint={}]",
+                    hello.protocol,
+                    hello.server_name,
+                    hello.server_version,
+                    hello.time_bucket,
+                    hello.machine_hint
+                );
+            }
+            ServerMessage::HelloReject { reject } => {
+                eprintln!(
+                    "[frontend][hello_reject][protocol={}][server={}][version={}] {}",
+                    reject.protocol, reject.server_name, reject.server_version, reject.reason
+                );
+            }
             ServerMessage::Accepted { task_id } => {
                 eprintln!("[frontend][accepted][task={task_id}]");
             }
@@ -904,7 +933,7 @@ impl Hub {
 /// Expand special placeholders in referenced paths.
 ///
 /// Currently supported:
-/// - `YYYY-MM-DD` → replaced with today's date, and also yesterday's date
+/// - `YYYY-MM-DD` 鈫?replaced with today's date, and also yesterday's date
 ///   (to match common "load today + yesterday" instructions).
 fn expand_date_placeholders(mut refs: Vec<String>) -> Vec<String> {
     let mut out = Vec::new();
@@ -1042,6 +1071,23 @@ fn send_direct_server_message(
     let _ = out_tx.send(msg);
 }
 
+/// Send one handshake message before the per-connection writer task exists.
+async fn send_handshake_server_message(
+    hub: &Arc<Hub>,
+    ws_tx: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    msg: ServerMessage,
+) -> anyhow::Result<()> {
+    hub.mirror_server_message(&msg);
+
+    let text = serde_json::to_string(&msg).context("Failed to serialize WS handshake message")?;
+    ws_tx
+        .send(Message::Text(text.into()))
+        .await
+        .context("Failed to send WS handshake message")?;
+
+    Ok(())
+}
+
 /// WS upgrade handler.
 async fn ws_route(ws: WebSocketUpgrade, State(hub): State<Arc<Hub>>) -> impl IntoResponse {
     ws.on_upgrade(move |socket| ws_session(socket, hub))
@@ -1049,8 +1095,157 @@ async fn ws_route(ws: WebSocketUpgrade, State(hub): State<Arc<Hub>>) -> impl Int
 
 /// Handle a single WS connection.
 async fn ws_session(socket: WebSocket, hub: Arc<Hub>) {
+    let server_version = env!("CARGO_PKG_VERSION");
+
     // We split the socket so we can read and write concurrently.
     let (mut ws_tx, mut ws_rx) = socket.split();
+
+    // Mandatory client-first handshake.
+    let first_frame = match tokio::time::timeout(
+        std::time::Duration::from_secs(WS_HANDSHAKE_TIMEOUT_SECS),
+        ws_rx.next(),
+    )
+    .await
+    {
+        Ok(Some(Ok(frame))) => frame,
+        Ok(Some(Err(err))) => {
+            let _ = send_handshake_server_message(
+                &hub,
+                &mut ws_tx,
+                ServerMessage::HelloReject {
+                    reject: build_hello_reject(
+                        format!("Failed to read initial handshake frame: {err}"),
+                        server_version,
+                    ),
+                },
+            )
+            .await;
+            return;
+        }
+        Ok(None) => return,
+        Err(_) => {
+            let _ = send_handshake_server_message(
+                &hub,
+                &mut ws_tx,
+                ServerMessage::HelloReject {
+                    reject: build_hello_reject(
+                        format!(
+                            "Handshake timed out after {} seconds",
+                            WS_HANDSHAKE_TIMEOUT_SECS
+                        ),
+                        server_version,
+                    ),
+                },
+            )
+            .await;
+            return;
+        }
+    };
+
+    let Message::Text(first_text) = first_frame else {
+        let _ = send_handshake_server_message(
+            &hub,
+            &mut ws_tx,
+            ServerMessage::HelloReject {
+                reject: build_hello_reject(
+                    "The first client frame must be a UTF-8 JSON text frame",
+                    server_version,
+                ),
+            },
+        )
+        .await;
+        return;
+    };
+
+    let first_msg = match serde_json::from_str::<ClientMessage>(&first_text) {
+        Ok(msg) => msg,
+        Err(err) => {
+            let _ = send_handshake_server_message(
+                &hub,
+                &mut ws_tx,
+                ServerMessage::HelloReject {
+                    reject: build_hello_reject(
+                        format!("Invalid handshake JSON: {err}"),
+                        server_version,
+                    ),
+                },
+            )
+            .await;
+            return;
+        }
+    };
+
+    let client_hello = match first_msg {
+        ClientMessage::ClientHello { hello } => hello,
+        other => {
+            let _ = send_handshake_server_message(
+                &hub,
+                &mut ws_tx,
+                ServerMessage::HelloReject {
+                    reject: build_hello_reject(
+                        format!(
+                            "The first client message must be `client_hello`, got `{:?}`",
+                            other
+                        ),
+                        server_version,
+                    ),
+                },
+            )
+            .await;
+            return;
+        }
+    };
+
+    if let Err(err) = verify_client_hello(
+        &client_hello,
+        &hub.ws_identity,
+        std::time::SystemTime::now(),
+    ) {
+        let _ = send_handshake_server_message(
+            &hub,
+            &mut ws_tx,
+            ServerMessage::HelloReject {
+                reject: build_hello_reject(
+                    format!("Client hello verification failed: {err}"),
+                    server_version,
+                ),
+            },
+        )
+        .await;
+        return;
+    }
+
+    let server_hello =
+        match build_server_hello(&hub.ws_identity, server_version, &client_hello.client_nonce) {
+            Ok(hello) => hello,
+            Err(err) => {
+                let _ = send_handshake_server_message(
+                    &hub,
+                    &mut ws_tx,
+                    ServerMessage::HelloReject {
+                        reject: build_hello_reject(
+                            format!("Failed to build server hello: {err}"),
+                            server_version,
+                        ),
+                    },
+                )
+                .await;
+                return;
+            }
+        };
+
+    if send_handshake_server_message(
+        &hub,
+        &mut ws_tx,
+        ServerMessage::ServerHello {
+            hello: server_hello,
+        },
+    )
+    .await
+    .is_err()
+    {
+        return;
+    }
 
     // Outbound message channel (single writer task owns `ws_tx`).
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<ServerMessage>();
@@ -1129,6 +1324,15 @@ async fn ws_session(socket: WebSocket, hub: Arc<Hub>) {
                 };
 
                 match msg {
+                    ClientMessage::ClientHello { .. } => {
+                        send_direct_server_message(
+                            &hub,
+                            &out_tx,
+                            ServerMessage::Error {
+                                message: "`client_hello` is only allowed as the first message on a connection".to_string(),
+                            },
+                        );
+                    }
                     ClientMessage::Submit { task_id, task } => {
                         // If the client didn't provide an id, we generate one.
                         let task_id = task_id.unwrap_or_else(Uuid::new_v4);
@@ -1160,10 +1364,6 @@ async fn ws_session(socket: WebSocket, hub: Arc<Hub>) {
                         );
                     }
                     ClientMessage::Interrupt { task_id } => {
-                        // Cancellation is implemented in the worker loop. Here we only
-                        // forward the request into the hub.
-                        //
-                        // NOTE: If the task is not currently running, the hub will ignore it.
                         hub.request_interrupt(task_id);
                     }
                     ClientMessage::AnswerQuestion { answer } => {
@@ -1251,7 +1451,7 @@ async fn main() -> anyhow::Result<()> {
     // Connect external MCP servers before freezing the tool registry.
     let mcp_registry = if cfg.mcp.enabled && !cfg.mcp.servers.is_empty() {
         tracing::info!(
-            "Initializing MCP client — {} server(s) configured",
+            "Initializing MCP client 鈥?{} server(s) configured",
             cfg.mcp.servers.len()
         );
         match McpRegistry::connect_all(&cfg.mcp.servers).await {
@@ -1299,7 +1499,9 @@ async fn main() -> anyhow::Result<()> {
     let runner = AgentRunner::new(llm, tools, Arc::clone(&skills), runner_cfg);
 
     // Hub (spawns worker loop).
-    let hub = Hub::new(runner, agents_md_path, preload_ctx);
+    let ws_identity = load_local_identity()?;
+    tracing::info!("WS identity machine hint: {}", ws_identity.machine_hint);
+    let hub = Hub::new(runner, agents_md_path, preload_ctx, ws_identity);
 
     // Build HTTP router (WS only).
     let app = Router::new()
