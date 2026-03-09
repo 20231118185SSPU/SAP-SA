@@ -4,6 +4,8 @@
 
 SA 的 WebSocket 连接在进入正常消息流之前，必须先完成一次“前端先证明、后端再证明”的双向握手。
 
+这里的“前端”是逻辑身份，不绑定某个具体实现，因此协议中不再使用 `cli` 作为对端名称，而统一使用 `sa-frontend` 表示“任意符合 SA 协议的前端实现”。
+
 这个握手的目标不是做互联网级别的强认证，而是回答一个更实际的问题：
 
 - 当前连接到的端口，是否大概率就是本机上预期的 SA 后端。
@@ -16,9 +18,9 @@ SA 的 WebSocket 连接在进入正常消息流之前，必须先完成一次“
 
 原因：
 
-- 机器指纹来自本机可获得的信息（主机名、MAC 地址）。
+- 机器指纹来自本机可获得的信息，例如主机名和 MAC 地址。
 - 协议材料和算法都在本地程序中。
-- 因此前提是“用于探测是不是正确的 SA 端口/进程”，不是“抵抗拥有本机权限的攻击者”。
+- 因此前提是“用于探测是不是正确的 SA 端口或进程”，不是“抵抗拥有本机权限的攻击者”。
 
 ## 握手顺序
 
@@ -41,7 +43,7 @@ SA 的 WebSocket 连接在进入正常消息流之前，必须先完成一次“
 - `hash_algo`: `sha256`
 - `time_step_secs`: `5`
 - `allowed_skew_buckets`: `1`
-- `client_name`: `sa-cli`
+- `client_name`: `sa-frontend`
 - `server_name`: `sa`
 - 握手超时: `5` 秒
 
@@ -68,7 +70,7 @@ time_bucket = floor(unix_utc_seconds / 5)
 
 原始材料：
 
-- 主机名（转小写）
+- 主机名，转小写
 - 一个 MAC 地址；若读取不到则使用 `no-mac`
 
 拼接格式：
@@ -94,7 +96,7 @@ sa-machine-fingerprint/v1|host=<hostname>|mac=<mac>
     "hash_algo": "sha256",
     "time_step_secs": 5,
     "allowed_skew_buckets": 1,
-    "client_name": "sa-cli",
+    "client_name": "sa-frontend",
     "client_version": "0.1.0",
     "time_bucket": 352000000,
     "machine_hint": "0123abcd4567",
@@ -106,16 +108,17 @@ sa-machine-fingerprint/v1|host=<hostname>|mac=<mac>
 
 字段说明：
 
-- `client_nonce` 由前端为本次连接随机生成
-- `proof` 是前端证明，绑定了时间桶、程序版本、机器指纹和本次 nonce
+- `client_name` 是逻辑前端身份名，不代表某个具体前端项目名称。
+- `client_nonce` 由前端为本次连接随机生成。
+- `proof` 是前端证明，绑定了时间桶、程序版本、机器指纹和本次 nonce。
 
 前端证明公式：
 
 ```text
 client_proof = sha256_hex(
-  "sa-cli-proof/v1"
+  "sa-frontend-proof/v1"
   + "|sa-ws/v1"
-  + "|sa-cli"
+  + "|sa-frontend"
   + "|<client_version>"
   + "|<time_bucket>"
   + "|<machine_fingerprint>"
@@ -125,11 +128,11 @@ client_proof = sha256_hex(
 
 后端会校验：
 
-- 协议号、哈希算法、时间桶步长、允许偏差是否全部匹配
-- `client_name` 是否为 `sa-cli`
-- `machine_hint` 是否与本机一致
-- `time_bucket` 是否落在允许窗口内
-- `proof` 是否能由本机指纹和消息内容重算得到
+- 协议号、哈希算法、时间桶步长、允许偏差是否全部匹配。
+- `client_name` 是否为 `sa-frontend`。
+- `machine_hint` 是否与本机一致。
+- `time_bucket` 是否落在允许窗口内。
+- `proof` 是否能由本机指纹和消息内容重算得到。
 
 ## server_hello
 
@@ -228,6 +231,7 @@ server_proof = sha256_hex(
 - 使用可调试的 `machine_hint`，方便排查连接到了哪一台机器、哪一套环境。
 - 使用 5 秒时间桶和前后 1 桶容错，降低轻微时钟偏差带来的误判。
 - 使用方向不同的 proof label，避免前后端证明被直接互相复用。
+- 将前端身份名抽象为 `sa-frontend`，避免把协议错误绑定到某个具体 UI 实现。
 
 ## 实现位置
 

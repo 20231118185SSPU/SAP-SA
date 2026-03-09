@@ -104,7 +104,7 @@ pub struct ClientHello {
     pub time_step_secs: u64,
     /// Allowed clock skew in time buckets.
     pub allowed_skew_buckets: u64,
-    /// Expected frontend name (currently `sa-cli`).
+    /// Expected logical frontend identity name (currently `sa-frontend`).
     pub client_name: String,
     /// Frontend binary version.
     pub client_version: String,

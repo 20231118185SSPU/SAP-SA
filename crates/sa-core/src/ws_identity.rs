@@ -10,7 +10,7 @@
 //! The proof material combines:
 //! - a 5-second UTC time bucket,
 //! - a local machine fingerprint derived from hostname + MAC,
-//! - a direction-specific label (`sa-cli` vs `sa`),
+//! - a direction-specific label (`sa-frontend` vs `sa`),
 //! - protocol metadata,
 //! - and nonces to bind one handshake to one exact connection.
 
@@ -34,8 +34,8 @@ pub const WS_ALLOWED_SKEW_BUCKETS: u64 = 1;
 /// Mandatory handshake timeout in seconds.
 pub const WS_HANDSHAKE_TIMEOUT_SECS: u64 = 5;
 
-/// Expected frontend name.
-pub const EXPECTED_CLIENT_NAME: &str = "sa-cli";
+/// Expected logical frontend identity name used by any SA frontend implementation.
+pub const EXPECTED_CLIENT_NAME: &str = "sa-frontend";
 
 /// Expected backend name.
 pub const EXPECTED_SERVER_NAME: &str = "sa";
@@ -44,7 +44,7 @@ pub const EXPECTED_SERVER_NAME: &str = "sa";
 const MACHINE_FINGERPRINT_LABEL: &str = "sa-machine-fingerprint/v1";
 
 /// Versioned label for the client proof.
-const CLIENT_PROOF_LABEL: &str = "sa-cli-proof/v1";
+const CLIENT_PROOF_LABEL: &str = "sa-frontend-proof/v1";
 
 /// Versioned label for the server proof.
 const SERVER_PROOF_LABEL: &str = "sa-server-proof/v1";
