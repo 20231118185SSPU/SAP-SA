@@ -277,10 +277,12 @@ impl AgentRunner {
                     }
                 }
             };
+            let response_usage = resp.usage.clone();
             let choice = resp.first_choice()?;
 
             // Copy assistant message for our history.
-            let assistant = choice.message.clone();
+            let mut assistant = choice.message.clone();
+            assistant.usage = response_usage;
 
             // Emit assistant content (if present).
             if let Some(content) = assistant.content.as_deref() {

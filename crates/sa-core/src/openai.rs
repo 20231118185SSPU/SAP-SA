@@ -225,6 +225,15 @@ pub struct ChatMessage {
     /// For tool result messages: which tool-call this result corresponds to.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+
+    /// Internal usage snapshot copied from the top-level response that produced
+    /// this assistant turn.
+    ///
+    /// This field is intentionally not sent back to the provider. SA only keeps
+    /// it locally so compaction can reuse the latest authoritative usage as a
+    /// token-estimation anchor.
+    #[serde(skip_serializing, default)]
+    pub usage: Option<ChatUsage>,
 }
 
 impl ChatMessage {
@@ -235,6 +244,7 @@ impl ChatMessage {
             content: Some(content.into()),
             tool_calls: None,
             tool_call_id: None,
+            usage: None,
         }
     }
 
@@ -245,8 +255,64 @@ impl ChatMessage {
             content: Some(content.into()),
             tool_calls: None,
             tool_call_id: Some(tool_call_id.into()),
+            usage: None,
         }
     }
+}
+
+/// Provider-reported usage for one chat completion response.
+///
+/// The field aliases keep SA compatible with a wider range of
+/// OpenAI-compatible gateways.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct ChatUsage {
+    /// Prompt-side tokens.
+    #[serde(default, alias = "prompt_tokens")]
+    pub input_tokens: Option<u64>,
+
+    /// Completion-side tokens.
+    #[serde(default, alias = "completion_tokens")]
+    pub output_tokens: Option<u64>,
+
+    /// Provider-reported total tokens, if available.
+    #[serde(default, alias = "total")]
+    pub total_tokens: Option<u64>,
+
+    /// Nested prompt token detail payload.
+    #[serde(default)]
+    pub prompt_tokens_details: Option<PromptTokenDetails>,
+
+    /// Cache-read tokens exposed by some OpenAI-compatible bridges.
+    #[serde(default, alias = "cache_read_tokens")]
+    pub cache_read_input_tokens: Option<u64>,
+
+    /// Cache-write tokens exposed by some OpenAI-compatible bridges.
+    #[serde(default, alias = "cache_write_tokens")]
+    pub cache_creation_input_tokens: Option<u64>,
+}
+
+impl ChatUsage {
+    /// Return cache-read tokens, if the gateway reports them.
+    pub fn cache_read_tokens(&self) -> u64 {
+        self.prompt_tokens_details
+            .as_ref()
+            .and_then(|details| details.cached_tokens)
+            .or(self.cache_read_input_tokens)
+            .unwrap_or(0)
+    }
+
+    /// Return cache-write tokens, if the gateway reports them.
+    pub fn cache_write_tokens(&self) -> u64 {
+        self.cache_creation_input_tokens.unwrap_or(0)
+    }
+}
+
+/// Nested prompt token detail payload used by some OpenAI-compatible APIs.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct PromptTokenDetails {
+    /// Cached prompt tokens, if present.
+    #[serde(default)]
+    pub cached_tokens: Option<u64>,
 }
 
 /// Tool definition used in `tools`.
@@ -296,6 +362,9 @@ pub struct ToolFunctionCall {
 pub struct ChatCompletionsResponse {
     /// Model outputs.
     pub choices: Vec<ChatChoice>,
+    /// Provider-reported usage for the whole request, if available.
+    #[serde(default)]
+    pub usage: Option<ChatUsage>,
 }
 
 /// A single model output choice.
@@ -318,7 +387,7 @@ impl ChatCompletionsResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::{ChatCompletionsRequest, ChatMessage};
+    use super::{ChatCompletionsRequest, ChatCompletionsResponse, ChatMessage, ChatUsage};
 
     #[test]
     fn request_serializes_reasoning_effort_when_present() {
@@ -350,5 +419,53 @@ mod tests {
 
         let value = serde_json::to_value(req).expect("serialize request");
         assert!(value.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn chat_message_serialization_omits_internal_usage_snapshot() {
+        let mut message = ChatMessage::text("assistant", "done");
+        message.usage = Some(ChatUsage {
+            input_tokens: Some(100),
+            output_tokens: Some(20),
+            total_tokens: Some(120),
+            prompt_tokens_details: None,
+            cache_read_input_tokens: None,
+            cache_creation_input_tokens: None,
+        });
+
+        let value = serde_json::to_value(message).expect("serialize message");
+        assert!(value.get("usage").is_none());
+    }
+
+    #[test]
+    fn response_deserializes_usage_with_openai_aliases() {
+        let raw = serde_json::json!({
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "ok"
+                    },
+                    "finish_reason": "stop"
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 1200,
+                "completion_tokens": 34,
+                "total_tokens": 1234,
+                "prompt_tokens_details": {
+                    "cached_tokens": 1000
+                }
+            }
+        });
+
+        let response =
+            serde_json::from_value::<ChatCompletionsResponse>(raw).expect("deserialize response");
+        let usage = response.usage.expect("usage should be present");
+        assert_eq!(usage.input_tokens, Some(1200));
+        assert_eq!(usage.output_tokens, Some(34));
+        assert_eq!(usage.total_tokens, Some(1234));
+        assert_eq!(usage.cache_read_tokens(), 1000);
+        assert_eq!(usage.cache_write_tokens(), 0);
     }
 }

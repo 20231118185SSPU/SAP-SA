@@ -8,7 +8,8 @@
 //! That means we cannot copy OpenClaw's session-file compaction implementation
 //! verbatim. Instead, this module adapts the same core ideas to SA's simpler
 //! in-memory conversation state:
-//! - estimate history size conservatively with a chars/4 token heuristic
+//! - reuse the latest assistant usage snapshot when available
+//! - estimate only the trailing suffix heuristically with a chars/4 rule
 //! - keep the newest suffix intact
 //! - summarize the older prefix with the translated prompts from `./compact.md`
 //! - re-inject the generated checkpoint summary as a synthetic user message
@@ -21,7 +22,7 @@
 
 use crate::cancel::CancelToken;
 use crate::openai::{
-    ChatCompletionsError, ChatCompletionsRequest, ChatMessage, OpenAiClient, ToolCall,
+    ChatCompletionsError, ChatCompletionsRequest, ChatMessage, ChatUsage, OpenAiClient, ToolCall,
     ToolDefinition,
 };
 use crate::retry::retry_delay;
@@ -141,10 +142,9 @@ const REQUEST_WRAPPER_TOKENS: usize = 32;
 
 /// Default compaction settings for SA.
 ///
-/// These numbers are intentionally conservative because SA currently does not
-/// receive authoritative token usage metadata from the provider for every
-/// message. We therefore rely on a heuristic and compact before the history is
-/// likely to become problematic.
+/// These numbers are intentionally conservative because SA only receives
+/// authoritative usage snapshots on successful assistant turns. Everything
+/// after the latest assistant usage still relies on heuristics.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct CompactionConfig {
@@ -400,12 +400,15 @@ pub async fn maybe_compact_history(
             history_summary
         };
 
+        let mut kept_messages = prepared.kept_messages;
+        clear_stale_usage_snapshots(&mut kept_messages);
+
         let mut next_state = state.clone();
         next_state.set_summary(final_summary.clone());
         let total_tokens_after = estimate_request_tokens(
             system_message,
             &next_state,
-            &prepared.kept_messages,
+            &kept_messages,
             tool_definitions,
         );
         if total_tokens_after >= total_tokens_before {
@@ -419,7 +422,7 @@ pub async fn maybe_compact_history(
         total_summarized_messages +=
             prepared.messages_to_summarize.len() + prepared.turn_prefix_messages.len();
         split_turn |= prepared.split_turn;
-        *conversation_messages = prepared.kept_messages;
+        *conversation_messages = kept_messages;
         state.set_summary(final_summary);
         initial_tokens_before = initial_tokens_before.max(total_tokens_before);
     }
@@ -536,19 +539,99 @@ pub fn estimate_tool_definitions_tokens(tool_definitions: &[ToolDefinition]) -> 
 
 /// Estimate the approximate token size of the full model request that SA would
 /// send on the next `/v1/chat/completions` call.
+///
+/// This mirrors OpenClaw's high-level hybrid strategy:
+/// - if we have a recent assistant usage snapshot, treat it as the best
+///   estimate for the request up to that assistant turn
+/// - estimate only the messages after that turn
+/// - if there is no usage snapshot, fall back to a full heuristic estimate
+///
+/// Tool definitions and wrapper overhead are only added in the full-heuristic
+/// branch. When a usage snapshot exists, it already came from a real provider
+/// request that included those fields.
 pub fn estimate_request_tokens(
     system_message: &ChatMessage,
     state: &CompactionState,
     conversation_messages: &[ChatMessage],
     tool_definitions: &[ToolDefinition],
 ) -> usize {
+    let request_messages = build_request_messages(system_message, state, conversation_messages);
+
+    if let Some(estimate) = estimate_request_tokens_from_last_usage(&request_messages) {
+        return estimate;
+    }
+
     REQUEST_WRAPPER_TOKENS
-        + estimate_context_tokens(&build_request_messages(
-            system_message,
-            state,
-            conversation_messages,
-        ))
+        + estimate_context_tokens(&request_messages)
         + estimate_tool_definitions_tokens(tool_definitions)
+}
+
+/// Usage snapshot metadata for the newest assistant turn that has one.
+#[derive(Debug, Clone, Copy)]
+struct AssistantUsageInfo<'a> {
+    /// Usage payload attached to the assistant turn.
+    usage: &'a ChatUsage,
+    /// Message index of the assistant turn.
+    index: usize,
+}
+
+/// Estimate request size using the last assistant usage snapshot plus trailing
+/// heuristic tokens.
+fn estimate_request_tokens_from_last_usage(messages: &[ChatMessage]) -> Option<usize> {
+    let usage_info = get_last_assistant_usage_info(messages)?;
+    let usage_tokens = calculate_request_tokens_from_usage(usage_info.usage)?;
+    let trailing_tokens = estimate_context_tokens(&messages[usage_info.index + 1..]);
+    Some(usage_tokens.saturating_add(trailing_tokens))
+}
+
+/// Walk the message list backwards and find the newest assistant turn with
+/// provider-reported usage.
+fn get_last_assistant_usage_info(messages: &[ChatMessage]) -> Option<AssistantUsageInfo<'_>> {
+    for (index, message) in messages.iter().enumerate().rev() {
+        if message.role != "assistant" {
+            continue;
+        }
+
+        let usage = message.usage.as_ref()?;
+        return Some(AssistantUsageInfo { usage, index });
+    }
+
+    None
+}
+
+/// Convert provider-reported usage into the conservative "whole request"
+/// estimate style used by OpenClaw.
+///
+/// Adaptation note:
+/// - OpenAI-style `prompt_tokens_details.cached_tokens` is usually a subset of
+///   `prompt_tokens`, so we must not blindly add it again when prompt/input
+///   tokens are already present.
+fn calculate_request_tokens_from_usage(usage: &ChatUsage) -> Option<usize> {
+    if let Some(total) = usage.total_tokens {
+        return Some(saturating_u64_to_usize(total));
+    }
+
+    let input = usage.input_tokens.unwrap_or(0);
+    let output = usage.output_tokens.unwrap_or(0);
+    if input > 0 || output > 0 {
+        return Some(saturating_u64_to_usize(input.saturating_add(output)));
+    }
+
+    let sum = usage
+        .cache_read_tokens()
+        .saturating_add(usage.cache_write_tokens());
+
+    if sum == 0 {
+        return None;
+    }
+
+    Some(saturating_u64_to_usize(sum))
+}
+
+/// Convert a possibly large `u64` token counter to `usize` without panicking on
+/// narrower targets.
+fn saturating_u64_to_usize(value: u64) -> usize {
+    usize::try_from(value).unwrap_or(usize::MAX)
 }
 
 /// Estimate the approximate token size of one chat message.
@@ -575,6 +658,19 @@ pub fn estimate_tokens(message: &ChatMessage) -> usize {
     }
 
     chars.div_ceil(4)
+}
+
+/// Drop assistant usage snapshots after compaction rewrites the earlier
+/// conversation prefix.
+///
+/// Reusing those old snapshots after history has been summarized would cause
+/// stale context sizes to leak into future estimates.
+fn clear_stale_usage_snapshots(messages: &mut [ChatMessage]) {
+    for message in messages {
+        if message.role == "assistant" {
+            message.usage = None;
+        }
+    }
 }
 
 /// Find all indices where a cut is legal.
@@ -882,7 +978,10 @@ fn map_summarization_error(prefix: &str, err: ChatCompletionsError) -> anyhow::E
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::openai::{ToolCall, ToolDefinition, ToolFunctionCall, ToolFunctionDefinition};
+    use crate::openai::{
+        ChatUsage, PromptTokenDetails, ToolCall, ToolDefinition, ToolFunctionCall,
+        ToolFunctionDefinition,
+    };
 
     /// Helper used by several tests.
     fn assistant_with_tool_call(name: &str, arguments: serde_json::Value) -> ChatMessage {
@@ -898,6 +997,7 @@ mod tests {
                 },
             }]),
             tool_call_id: None,
+            usage: None,
         }
     }
 
@@ -1005,6 +1105,49 @@ mod tests {
     }
 
     #[test]
+    fn estimate_request_tokens_prefers_last_assistant_usage_snapshot() {
+        let system_message = ChatMessage::text("developer", "system prompt");
+        let tool_definitions = vec![ToolDefinition {
+            kind: "function".to_string(),
+            function: ToolFunctionDefinition {
+                name: "VeryLargeTool".to_string(),
+                description: "x".repeat(2_000),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "content": { "type": "string" }
+                    }
+                }),
+            },
+        }];
+
+        let mut assistant = ChatMessage::text("assistant", "前一轮回答");
+        assistant.usage = Some(ChatUsage {
+            input_tokens: Some(900),
+            output_tokens: Some(100),
+            total_tokens: Some(1_000),
+            prompt_tokens_details: None,
+            cache_read_input_tokens: None,
+            cache_creation_input_tokens: None,
+        });
+        let trailing_user = ChatMessage::text("user", "新的追问");
+
+        let tokens = estimate_request_tokens(
+            &system_message,
+            &CompactionState::default(),
+            &[
+                ChatMessage::text("user", "初始请求"),
+                assistant,
+                trailing_user.clone(),
+            ],
+            &tool_definitions,
+        );
+
+        assert_eq!(tokens, 1_000 + estimate_tokens(&trailing_user));
+    }
+
+    #[test]
     fn find_cut_point_never_keeps_from_tool_result() {
         let messages = vec![
             ChatMessage::text("user", "step 1"),
@@ -1061,5 +1204,43 @@ mod tests {
             err.to_string()
                 .contains("reserve_summary_tokens must be greater than 0")
         );
+    }
+
+    #[test]
+    fn calculate_request_tokens_from_usage_prefers_input_and_output_without_double_counting_cache_details()
+     {
+        let usage = ChatUsage {
+            input_tokens: Some(1_200),
+            output_tokens: Some(80),
+            total_tokens: None,
+            prompt_tokens_details: Some(PromptTokenDetails {
+                cached_tokens: Some(500),
+            }),
+            cache_read_input_tokens: None,
+            cache_creation_input_tokens: Some(40),
+        };
+
+        assert_eq!(calculate_request_tokens_from_usage(&usage), Some(1_280));
+    }
+
+    #[test]
+    fn clear_stale_usage_snapshots_removes_assistant_usage_only() {
+        let mut assistant = ChatMessage::text("assistant", "历史回答");
+        assistant.usage = Some(ChatUsage {
+            input_tokens: Some(10),
+            output_tokens: Some(5),
+            total_tokens: Some(15),
+            prompt_tokens_details: None,
+            cache_read_input_tokens: None,
+            cache_creation_input_tokens: None,
+        });
+        let user = ChatMessage::text("user", "后续问题");
+        let mut messages = vec![assistant, user.clone()];
+
+        clear_stale_usage_snapshots(&mut messages);
+
+        assert!(messages[0].usage.is_none());
+        assert_eq!(messages[1].content, user.content);
+        assert!(messages[1].usage.is_none());
     }
 }
