@@ -9,6 +9,11 @@
 - `../crates/sa-core`：核心逻辑，包括配置、`Agents.md` 读取、技能扫描、内置工具、MCP、OpenAI 兼容接口调用、Agent 主循环、WS 协议结构
 - `../crates/sa`：后端守护进程，负责运行 Agent、缓存事件、处理 WebSocket 连接与重连恢复
 
+专题文档：
+
+- `token-accounting.md`：SA 当前的 token 统计、usage 回填与 compact 估算策略
+- `ws-handshake.md`：前后端双向握手与协议身份校验
+
 说明：
 
 - 命令行前端位于独立项目 `../../sa-cli`
