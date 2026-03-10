@@ -226,14 +226,18 @@ pub struct ChatMessage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
 
-    /// Internal usage snapshot copied from the top-level response that produced
-    /// this assistant turn.
+    /// Internal request-usage snapshot copied from the top-level response that
+    /// produced this assistant turn.
     ///
     /// This field is intentionally not sent back to the provider. SA only keeps
     /// it locally so compaction can reuse the latest authoritative usage as a
     /// token-estimation anchor.
+    ///
+    /// Important:
+    /// - this is **request-scoped** usage anchored to the assistant turn
+    /// - it is not a claim about the cost of this one message in isolation
     #[serde(skip_serializing, default)]
-    pub usage: Option<ChatUsage>,
+    pub request_usage: Option<ChatUsage>,
 }
 
 impl ChatMessage {
@@ -244,7 +248,7 @@ impl ChatMessage {
             content: Some(content.into()),
             tool_calls: None,
             tool_call_id: None,
-            usage: None,
+            request_usage: None,
         }
     }
 
@@ -255,7 +259,7 @@ impl ChatMessage {
             content: Some(content.into()),
             tool_calls: None,
             tool_call_id: Some(tool_call_id.into()),
-            usage: None,
+            request_usage: None,
         }
     }
 }
@@ -282,6 +286,10 @@ pub struct ChatUsage {
     #[serde(default)]
     pub prompt_tokens_details: Option<PromptTokenDetails>,
 
+    /// Responses-style input token detail payload.
+    #[serde(default)]
+    pub input_tokens_details: Option<InputTokenDetails>,
+
     /// Cache-read tokens exposed by some OpenAI-compatible bridges.
     #[serde(default, alias = "cache_read_tokens")]
     pub cache_read_input_tokens: Option<u64>,
@@ -289,21 +297,69 @@ pub struct ChatUsage {
     /// Cache-write tokens exposed by some OpenAI-compatible bridges.
     #[serde(default, alias = "cache_write_tokens")]
     pub cache_creation_input_tokens: Option<u64>,
+
+    /// Chat Completions-style completion token detail payload.
+    #[serde(default)]
+    pub completion_tokens_details: Option<OutputTokenDetails>,
+
+    /// Responses-style output token detail payload.
+    #[serde(default)]
+    pub output_tokens_details: Option<OutputTokenDetails>,
 }
 
 impl ChatUsage {
-    /// Return cache-read tokens, if the gateway reports them.
-    pub fn cache_read_tokens(&self) -> u64 {
+    /// Return cache-read tokens explicitly reported as an additional usage
+    /// component, as seen on Anthropic/Bedrock-style payloads.
+    pub fn explicit_cache_read_tokens(&self) -> u64 {
+        self.cache_read_input_tokens.unwrap_or(0)
+    }
+
+    /// Return cache-read tokens reported inside OpenAI-style nested detail
+    /// objects.
+    ///
+    /// These nested values are usually informational details about prompt/input
+    /// tokens, not always standalone totals. Callers that compute a total usage
+    /// estimate must decide whether adding them would double-count.
+    pub fn cached_input_tokens_detail(&self) -> u64 {
         self.prompt_tokens_details
             .as_ref()
             .and_then(|details| details.cached_tokens)
-            .or(self.cache_read_input_tokens)
+            .or(self
+                .input_tokens_details
+                .as_ref()
+                .and_then(|details| details.cached_tokens))
+            .unwrap_or(0)
+    }
+
+    /// Return the best available cache-read token count for display/debug use.
+    pub fn cache_read_tokens(&self) -> u64 {
+        self.cache_read_input_tokens
+            .or(self
+                .prompt_tokens_details
+                .as_ref()
+                .and_then(|details| details.cached_tokens))
+            .or(self
+                .input_tokens_details
+                .as_ref()
+                .and_then(|details| details.cached_tokens))
             .unwrap_or(0)
     }
 
     /// Return cache-write tokens, if the gateway reports them.
     pub fn cache_write_tokens(&self) -> u64 {
         self.cache_creation_input_tokens.unwrap_or(0)
+    }
+
+    /// Return reasoning tokens reported by OpenAI-style detailed output usage.
+    pub fn reasoning_tokens(&self) -> u64 {
+        self.completion_tokens_details
+            .as_ref()
+            .and_then(|details| details.reasoning_tokens)
+            .or(self
+                .output_tokens_details
+                .as_ref()
+                .and_then(|details| details.reasoning_tokens))
+            .unwrap_or(0)
     }
 }
 
@@ -313,6 +369,22 @@ pub struct PromptTokenDetails {
     /// Cached prompt tokens, if present.
     #[serde(default)]
     pub cached_tokens: Option<u64>,
+}
+
+/// Responses-style input token detail payload.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct InputTokenDetails {
+    /// Cached input tokens, if present.
+    #[serde(default)]
+    pub cached_tokens: Option<u64>,
+}
+
+/// Output token detail payload used by newer OpenAI-compatible responses.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct OutputTokenDetails {
+    /// Reasoning tokens, if present.
+    #[serde(default)]
+    pub reasoning_tokens: Option<u64>,
 }
 
 /// Tool definition used in `tools`.
@@ -387,7 +459,10 @@ impl ChatCompletionsResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::{ChatCompletionsRequest, ChatCompletionsResponse, ChatMessage, ChatUsage};
+    use super::{
+        ChatCompletionsRequest, ChatCompletionsResponse, ChatMessage, ChatUsage, InputTokenDetails,
+        OutputTokenDetails,
+    };
 
     #[test]
     fn request_serializes_reasoning_effort_when_present() {
@@ -424,17 +499,20 @@ mod tests {
     #[test]
     fn chat_message_serialization_omits_internal_usage_snapshot() {
         let mut message = ChatMessage::text("assistant", "done");
-        message.usage = Some(ChatUsage {
+        message.request_usage = Some(ChatUsage {
             input_tokens: Some(100),
             output_tokens: Some(20),
             total_tokens: Some(120),
             prompt_tokens_details: None,
+            input_tokens_details: None,
             cache_read_input_tokens: None,
             cache_creation_input_tokens: None,
+            completion_tokens_details: None,
+            output_tokens_details: None,
         });
 
         let value = serde_json::to_value(message).expect("serialize message");
-        assert!(value.get("usage").is_none());
+        assert!(value.get("request_usage").is_none());
     }
 
     #[test]
@@ -467,5 +545,66 @@ mod tests {
         assert_eq!(usage.total_tokens, Some(1234));
         assert_eq!(usage.cache_read_tokens(), 1000);
         assert_eq!(usage.cache_write_tokens(), 0);
+    }
+
+    #[test]
+    fn response_deserializes_usage_with_responses_detail_aliases() {
+        let raw = serde_json::json!({
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "ok"
+                    },
+                    "finish_reason": "stop"
+                }
+            ],
+            "usage": {
+                "input_tokens": 800,
+                "output_tokens": 120,
+                "input_tokens_details": {
+                    "cached_tokens": 300
+                },
+                "output_tokens_details": {
+                    "reasoning_tokens": 40
+                },
+                "cache_read_input_tokens": 50,
+                "cache_creation_input_tokens": 25
+            }
+        });
+
+        let response =
+            serde_json::from_value::<ChatCompletionsResponse>(raw).expect("deserialize response");
+        let usage = response.usage.expect("usage should be present");
+        assert_eq!(usage.input_tokens, Some(800));
+        assert_eq!(usage.output_tokens, Some(120));
+        assert_eq!(usage.cached_input_tokens_detail(), 300);
+        assert_eq!(usage.explicit_cache_read_tokens(), 50);
+        assert_eq!(usage.cache_read_tokens(), 50);
+        assert_eq!(usage.cache_write_tokens(), 25);
+        assert_eq!(usage.reasoning_tokens(), 40);
+    }
+
+    #[test]
+    fn chat_usage_display_helpers_fall_back_to_nested_detail_fields() {
+        let usage = ChatUsage {
+            input_tokens: None,
+            output_tokens: None,
+            total_tokens: None,
+            prompt_tokens_details: None,
+            input_tokens_details: Some(InputTokenDetails {
+                cached_tokens: Some(222),
+            }),
+            cache_read_input_tokens: None,
+            cache_creation_input_tokens: None,
+            completion_tokens_details: Some(OutputTokenDetails {
+                reasoning_tokens: Some(17),
+            }),
+            output_tokens_details: None,
+        };
+
+        assert_eq!(usage.cached_input_tokens_detail(), 222);
+        assert_eq!(usage.cache_read_tokens(), 222);
+        assert_eq!(usage.reasoning_tokens(), 17);
     }
 }

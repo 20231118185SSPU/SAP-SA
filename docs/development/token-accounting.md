@@ -18,6 +18,7 @@
 2. 只对该 assistant 之后新增的尾部消息做启发式估算
 3. 如果完全没有可用 `usage`，再退回到整包请求的启发式估算
 4. compact 改写历史后，会主动清理保留下来的旧 `usage` 快照，避免复用过期窗口大小
+5. 所有启发式估算都会附加安全余量，避免 `chars / 4` 低估
 
 这意味着 SA 不再是“全程纯 `chars / 4`”，而是：
 
@@ -44,9 +45,10 @@ SA 调用的是 OpenAI 兼容的 `POST /v1/chat/completions`。
 - `usage.completion_tokens`
 - `usage.total_tokens`
 
-这些字段会先反序列化到 `ChatCompletionsResponse.usage`，随后在 Agent 主循环里回填到本轮 assistant 消息上。
+这些字段会先反序列化到 `ChatCompletionsResponse.usage`，随后在 Agent 主循环里回填到本轮 assistant 消息上的内部 `request_usage` 锚点上。
 
 这样做的目的不是把 `usage` 再发回给模型，而是为了给下一轮 compact 估算提供一个“真实锚点”。
+这里记录的是**整次请求级别的 usage 快照**，不是单条 assistant 文本本身的独立成本。
 
 ### 2. compact 估算时怎么用 usage
 
@@ -55,10 +57,13 @@ SA 调用的是 OpenAI 兼容的 `POST /v1/chat/completions`。
 如果找到：
 
 - 优先使用 `usage.total_tokens`
-- 如果没有 `total_tokens`，则优先回退到：
-  - `input_tokens/prompt_tokens + output_tokens/completion_tokens`
-- 只有在这些主字段也缺失时，才退到 cache 细项
+- 如果没有 `total_tokens`，则按 Anthropic/Bedrock 风格优先回退到：
+  - `input_tokens/prompt_tokens + output_tokens/completion_tokens + cache_read_input_tokens + cache_creation_input_tokens`
+- 对 OpenAI 风格的 `prompt_tokens_details.cached_tokens` / `input_tokens_details.cached_tokens`：
+  - 如果主字段已存在，不额外叠加，避免双算
+  - 如果主字段缺失，则作为回退值使用
 - 然后只对这条 assistant 之后新增的消息做 `chars / 4` 估算
+- 尾部启发式估算会附加 safety margin
 
 最终得到：
 
@@ -74,7 +79,7 @@ SA 调用的是 OpenAI 兼容的 `POST /v1/chat/completions`。
 - tool definitions
 - 少量请求 wrapper 开销
 
-统一按近似字符量估算。
+统一按近似字符量估算，并附加 safety margin。
 
 ### 4. 为什么 compact 后要清理 usage
 
@@ -93,7 +98,7 @@ assistant 上的 `usage` 描述的是“旧历史结构下的整包请求大小�
 - 下一轮估算仍然以旧大窗口为准
 - 结果立刻再次触发 compact
 
-因此 SA 在 compact 完成后，会对保留下来的 assistant 消息清空 `usage`，等下一次真实模型调用成功后，再重新建立新锚点。
+因此 SA 在 compact 完成后，会对保留下来的 assistant 消息清空 `request_usage`，等下一次真实模型调用成功后，再重新建立新锚点。
 
 ## 与 OpenClaw 的关系
 
@@ -115,9 +120,10 @@ SA 当前做法直接参考了 `OpenClaw` / 上游 `pi-coding-agent` 的核心�
 - 仅对 trailing messages 调用 `estimateTokens()`
 
 SA 不是逐字复制，而是在更小的 Rust 数据模型里做了等价适配。
-其中有一个刻意差异：
+其中有两个刻意差异：
 
 - 对 OpenAI 风格的 `prompt_tokens_details.cached_tokens`，SA 不会在已有 `prompt_tokens` 时再次叠加，避免双算
+- SA 在比较 compact 前后是否“有进展”时，会使用同一套“不看 request_usage、只看 heuristic”的可比估算，避免把 usage 模式和 heuristic 模式直接硬比
 
 ## 与 ZeroClaw 的关系
 
@@ -139,6 +145,9 @@ SA 这次调整后，位置更接近 `OpenClaw`，不再是简单的 `ZeroClaw c
 - `output_tokens`
 - `total`
 - `prompt_tokens_details.cached_tokens`
+- `input_tokens_details.cached_tokens`
+- `completion_tokens_details.reasoning_tokens`
+- `output_tokens_details.reasoning_tokens`
 - `cache_read_input_tokens`
 - `cache_creation_input_tokens`
 
@@ -152,7 +161,8 @@ SA 这次调整后，位置更接近 `OpenClaw`，不再是简单的 `ZeroClaw c
 - 如果上游服务端不返回 `usage`，SA 只能退回启发式估算
 - `usage.total_tokens` 在不同兼容网关上语义可能不完全一致，SA 当前采用的是与 OpenClaw 同方向的保守用法
 - tool definitions 仅在“没有 usage 锚点”时才额外按启发式计入；有锚点时默认认为旧 usage 已覆盖当时的工具 schema
-- cache 细项不会在已有 `prompt_tokens/input_tokens` 的情况下再次叠加，避免对 OpenAI 风格响应双算
+- OpenAI 风格的 nested cache detail 不会在已有 `prompt_tokens/input_tokens` 的情况下再次叠加，避免双算
+- compact 前后“是否有进展”的判断使用统一 heuristic 口径，而不是拿 usage 口径和 heuristic 口径直接比较
 
 ## 验证方式
 
@@ -166,8 +176,10 @@ SA 这次调整后，位置更接近 `OpenClaw`，不再是简单的 `ZeroClaw c
 重点测试点：
 
 - 有 usage 时不再重复把 tool definitions 额外算一遍
-- compact 后保留消息的 usage 已被清空
+- compact 后保留消息的 `request_usage` 已被清空
 - 没有 usage 时仍能安全退回 heuristic
+- 最新 assistant 没有 `request_usage` 时，仍能继续向前找到更早的有效 usage 锚点
+- `keep_recent_tokens` 在 split-turn / tool-result 邻接场景下不会低于目标预算
 
 ## 后续可继续优化的方向
 

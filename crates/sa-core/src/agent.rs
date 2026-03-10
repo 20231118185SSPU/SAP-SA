@@ -281,8 +281,12 @@ impl AgentRunner {
             let choice = resp.first_choice()?;
 
             // Copy assistant message for our history.
+            //
+            // Important: the top-level response `usage` is request-scoped, not
+            // message-scoped. We anchor that snapshot to this assistant turn so
+            // the next compaction pass can reuse it as "last known real usage".
             let mut assistant = choice.message.clone();
-            assistant.usage = response_usage;
+            assistant.request_usage = response_usage;
 
             // Emit assistant content (if present).
             if let Some(content) = assistant.content.as_deref() {

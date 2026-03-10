@@ -140,6 +140,15 @@ pub const TURN_PREFIX_SUMMARIZATION_PROMPT: &str = r#"这是一个因过长而�
 /// that is not captured by per-message or per-tool estimates.
 const REQUEST_WRAPPER_TOKENS: usize = 32;
 
+/// Conservative safety margin applied to heuristic-only token estimates.
+///
+/// OpenClaw uses a similar safety factor because plain `chars / 4` tends to
+/// underestimate code, JSON, and tool-heavy messages.
+const TOKEN_ESTIMATE_SAFETY_MARGIN_NUMERATOR: usize = 6;
+
+/// Denominator paired with [`TOKEN_ESTIMATE_SAFETY_MARGIN_NUMERATOR`].
+const TOKEN_ESTIMATE_SAFETY_MARGIN_DENOMINATOR: usize = 5;
+
 /// Default compaction settings for SA.
 ///
 /// These numbers are intentionally conservative because SA only receives
@@ -400,22 +409,35 @@ pub async fn maybe_compact_history(
             history_summary
         };
 
+        let comparable_tokens_before = estimate_request_tokens_without_request_usage(
+            system_message,
+            state,
+            conversation_messages,
+            tool_definitions,
+        );
+
         let mut kept_messages = prepared.kept_messages;
-        clear_stale_usage_snapshots(&mut kept_messages);
+        clear_request_usage_snapshots(&mut kept_messages);
 
         let mut next_state = state.clone();
         next_state.set_summary(final_summary.clone());
-        let total_tokens_after = estimate_request_tokens(
+        let _total_tokens_after = estimate_request_tokens(
             system_message,
             &next_state,
             &kept_messages,
             tool_definitions,
         );
-        if total_tokens_after >= total_tokens_before {
+        let comparable_tokens_after = estimate_request_tokens_without_request_usage(
+            system_message,
+            &next_state,
+            &kept_messages,
+            tool_definitions,
+        );
+        if comparable_tokens_after >= comparable_tokens_before {
             anyhow::bail!(
-                "Compaction made no progress: estimated request size stayed at {} -> {} tokens",
-                total_tokens_before,
-                total_tokens_after
+                "Compaction made no heuristic progress: comparable estimate stayed at {} -> {} tokens",
+                comparable_tokens_before,
+                comparable_tokens_after
             );
         }
 
@@ -561,9 +583,31 @@ pub fn estimate_request_tokens(
         return estimate;
     }
 
-    REQUEST_WRAPPER_TOKENS
-        + estimate_context_tokens(&request_messages)
-        + estimate_tool_definitions_tokens(tool_definitions)
+    apply_token_estimate_safety_margin(
+        REQUEST_WRAPPER_TOKENS
+            + estimate_context_tokens(&request_messages)
+            + estimate_tool_definitions_tokens(tool_definitions),
+    )
+}
+
+/// Estimate request size while deliberately ignoring any anchored request-usage
+/// snapshots on assistant messages.
+///
+/// This helper is used for like-for-like before/after comparisons inside the
+/// compaction loop.
+fn estimate_request_tokens_without_request_usage(
+    system_message: &ChatMessage,
+    state: &CompactionState,
+    conversation_messages: &[ChatMessage],
+    tool_definitions: &[ToolDefinition],
+) -> usize {
+    let mut request_messages = build_request_messages(system_message, state, conversation_messages);
+    clear_request_usage_snapshots(&mut request_messages);
+    apply_token_estimate_safety_margin(
+        REQUEST_WRAPPER_TOKENS
+            + estimate_context_tokens(&request_messages)
+            + estimate_tool_definitions_tokens(tool_definitions),
+    )
 }
 
 /// Usage snapshot metadata for the newest assistant turn that has one.
@@ -580,7 +624,9 @@ struct AssistantUsageInfo<'a> {
 fn estimate_request_tokens_from_last_usage(messages: &[ChatMessage]) -> Option<usize> {
     let usage_info = get_last_assistant_usage_info(messages)?;
     let usage_tokens = calculate_request_tokens_from_usage(usage_info.usage)?;
-    let trailing_tokens = estimate_context_tokens(&messages[usage_info.index + 1..]);
+    let trailing_tokens = apply_token_estimate_safety_margin(estimate_context_tokens(
+        &messages[usage_info.index + 1..],
+    ));
     Some(usage_tokens.saturating_add(trailing_tokens))
 }
 
@@ -592,7 +638,9 @@ fn get_last_assistant_usage_info(messages: &[ChatMessage]) -> Option<AssistantUs
             continue;
         }
 
-        let usage = message.usage.as_ref()?;
+        let Some(usage) = message.request_usage.as_ref() else {
+            continue;
+        };
         return Some(AssistantUsageInfo { usage, index });
     }
 
@@ -613,12 +661,15 @@ fn calculate_request_tokens_from_usage(usage: &ChatUsage) -> Option<usize> {
 
     let input = usage.input_tokens.unwrap_or(0);
     let output = usage.output_tokens.unwrap_or(0);
-    if input > 0 || output > 0 {
-        return Some(saturating_u64_to_usize(input.saturating_add(output)));
-    }
-
-    let sum = usage
-        .cache_read_tokens()
+    let explicit_cache_read = usage.explicit_cache_read_tokens();
+    let fallback_cache_read = if explicit_cache_read > 0 || input > 0 || output > 0 {
+        explicit_cache_read
+    } else {
+        usage.cached_input_tokens_detail()
+    };
+    let sum = input
+        .saturating_add(output)
+        .saturating_add(fallback_cache_read)
         .saturating_add(usage.cache_write_tokens());
 
     if sum == 0 {
@@ -632,6 +683,13 @@ fn calculate_request_tokens_from_usage(usage: &ChatUsage) -> Option<usize> {
 /// narrower targets.
 fn saturating_u64_to_usize(value: u64) -> usize {
     usize::try_from(value).unwrap_or(usize::MAX)
+}
+
+/// Apply the shared safety margin used by heuristic token estimation.
+fn apply_token_estimate_safety_margin(tokens: usize) -> usize {
+    tokens
+        .saturating_mul(TOKEN_ESTIMATE_SAFETY_MARGIN_NUMERATOR)
+        .div_ceil(TOKEN_ESTIMATE_SAFETY_MARGIN_DENOMINATOR)
 }
 
 /// Estimate the approximate token size of one chat message.
@@ -660,15 +718,15 @@ pub fn estimate_tokens(message: &ChatMessage) -> usize {
     chars.div_ceil(4)
 }
 
-/// Drop assistant usage snapshots after compaction rewrites the earlier
+/// Drop assistant request-usage snapshots after compaction rewrites the earlier
 /// conversation prefix.
 ///
 /// Reusing those old snapshots after history has been summarized would cause
 /// stale context sizes to leak into future estimates.
-fn clear_stale_usage_snapshots(messages: &mut [ChatMessage]) {
+fn clear_request_usage_snapshots(messages: &mut [ChatMessage]) {
     for message in messages {
         if message.role == "assistant" {
-            message.usage = None;
+            message.request_usage = None;
         }
     }
 }
@@ -718,12 +776,12 @@ fn find_cut_point(messages: &[ChatMessage], keep_recent_tokens: usize) -> CutPoi
     let mut hit_budget = false;
 
     for index in (0..messages.len()).rev() {
-        accumulated_tokens += estimate_tokens(&messages[index]);
+        accumulated_tokens += apply_token_estimate_safety_margin(estimate_tokens(&messages[index]));
         if accumulated_tokens >= keep_recent_tokens {
             cut_index = cut_points
                 .iter()
                 .copied()
-                .find(|candidate| *candidate >= index)
+                .rfind(|candidate| *candidate <= index)
                 .unwrap_or(0);
             hit_budget = true;
             break;
@@ -979,7 +1037,7 @@ fn map_summarization_error(prefix: &str, err: ChatCompletionsError) -> anyhow::E
 mod tests {
     use super::*;
     use crate::openai::{
-        ChatUsage, PromptTokenDetails, ToolCall, ToolDefinition, ToolFunctionCall,
+        ChatUsage, InputTokenDetails, ToolCall, ToolDefinition, ToolFunctionCall,
         ToolFunctionDefinition,
     };
 
@@ -997,7 +1055,7 @@ mod tests {
                 },
             }]),
             tool_call_id: None,
-            usage: None,
+            request_usage: None,
         }
     }
 
@@ -1123,13 +1181,16 @@ mod tests {
         }];
 
         let mut assistant = ChatMessage::text("assistant", "前一轮回答");
-        assistant.usage = Some(ChatUsage {
+        assistant.request_usage = Some(ChatUsage {
             input_tokens: Some(900),
             output_tokens: Some(100),
             total_tokens: Some(1_000),
             prompt_tokens_details: None,
+            input_tokens_details: None,
             cache_read_input_tokens: None,
             cache_creation_input_tokens: None,
+            completion_tokens_details: None,
+            output_tokens_details: None,
         });
         let trailing_user = ChatMessage::text("user", "新的追问");
 
@@ -1144,7 +1205,10 @@ mod tests {
             &tool_definitions,
         );
 
-        assert_eq!(tokens, 1_000 + estimate_tokens(&trailing_user));
+        assert_eq!(
+            tokens,
+            1_000 + apply_token_estimate_safety_margin(estimate_tokens(&trailing_user))
+        );
     }
 
     #[test]
@@ -1207,40 +1271,107 @@ mod tests {
     }
 
     #[test]
-    fn calculate_request_tokens_from_usage_prefers_input_and_output_without_double_counting_cache_details()
-     {
+    fn calculate_request_tokens_from_usage_adds_anthropic_style_cache_fields() {
         let usage = ChatUsage {
             input_tokens: Some(1_200),
             output_tokens: Some(80),
             total_tokens: None,
-            prompt_tokens_details: Some(PromptTokenDetails {
+            prompt_tokens_details: None,
+            input_tokens_details: None,
+            cache_read_input_tokens: Some(500),
+            cache_creation_input_tokens: Some(40),
+            completion_tokens_details: None,
+            output_tokens_details: None,
+        };
+
+        assert_eq!(calculate_request_tokens_from_usage(&usage), Some(1_820));
+    }
+
+    #[test]
+    fn calculate_request_tokens_from_usage_uses_detail_cache_only_as_fallback() {
+        let usage = ChatUsage {
+            input_tokens: None,
+            output_tokens: None,
+            total_tokens: None,
+            prompt_tokens_details: None,
+            input_tokens_details: Some(InputTokenDetails {
                 cached_tokens: Some(500),
             }),
             cache_read_input_tokens: None,
             cache_creation_input_tokens: Some(40),
+            completion_tokens_details: None,
+            output_tokens_details: None,
         };
 
-        assert_eq!(calculate_request_tokens_from_usage(&usage), Some(1_280));
+        assert_eq!(calculate_request_tokens_from_usage(&usage), Some(540));
     }
 
     #[test]
-    fn clear_stale_usage_snapshots_removes_assistant_usage_only() {
+    fn get_last_assistant_usage_info_skips_newer_assistant_without_usage() {
+        let mut older = ChatMessage::text("assistant", "older");
+        older.request_usage = Some(ChatUsage {
+            input_tokens: Some(100),
+            output_tokens: Some(10),
+            total_tokens: Some(110),
+            prompt_tokens_details: None,
+            input_tokens_details: None,
+            cache_read_input_tokens: None,
+            cache_creation_input_tokens: None,
+            completion_tokens_details: None,
+            output_tokens_details: None,
+        });
+        let newer = ChatMessage::text("assistant", "newer");
+        let messages = vec![older, newer];
+
+        let usage = get_last_assistant_usage_info(&messages).expect("should find older usage");
+        assert_eq!(usage.index, 0);
+        assert_eq!(usage.usage.total_tokens, Some(110));
+    }
+
+    #[test]
+    fn find_cut_point_keeps_at_least_requested_recent_budget() {
+        let messages = vec![
+            ChatMessage::text("user", "u1"),
+            ChatMessage::text("assistant", "a1"),
+            ChatMessage::tool_result("call_1", "tool result that should stay attached"),
+            ChatMessage::text("user", "u2 long enough"),
+            ChatMessage::text("assistant", "a2 long enough"),
+        ];
+
+        let keep_recent_tokens = apply_token_estimate_safety_margin(
+            estimate_tokens(&messages[3]) + estimate_tokens(&messages[4]),
+        );
+        let cut = find_cut_point(&messages, keep_recent_tokens);
+        let kept_tokens = messages[cut.first_kept_index..]
+            .iter()
+            .map(estimate_tokens)
+            .sum::<usize>();
+
+        assert!(apply_token_estimate_safety_margin(kept_tokens) >= keep_recent_tokens);
+        assert!(cut.first_kept_index <= 3);
+    }
+
+    #[test]
+    fn clear_request_usage_snapshots_removes_assistant_usage_only() {
         let mut assistant = ChatMessage::text("assistant", "历史回答");
-        assistant.usage = Some(ChatUsage {
+        assistant.request_usage = Some(ChatUsage {
             input_tokens: Some(10),
             output_tokens: Some(5),
             total_tokens: Some(15),
             prompt_tokens_details: None,
+            input_tokens_details: None,
             cache_read_input_tokens: None,
             cache_creation_input_tokens: None,
+            completion_tokens_details: None,
+            output_tokens_details: None,
         });
         let user = ChatMessage::text("user", "后续问题");
         let mut messages = vec![assistant, user.clone()];
 
-        clear_stale_usage_snapshots(&mut messages);
+        clear_request_usage_snapshots(&mut messages);
 
-        assert!(messages[0].usage.is_none());
+        assert!(messages[0].request_usage.is_none());
         assert_eq!(messages[1].content, user.content);
-        assert!(messages[1].usage.is_none());
+        assert!(messages[1].request_usage.is_none());
     }
 }
