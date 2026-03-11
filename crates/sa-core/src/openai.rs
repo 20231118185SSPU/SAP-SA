@@ -10,8 +10,9 @@
 
 use anyhow::Context as _;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::fmt;
 use tokio_stream::StreamExt;
 use uuid::Uuid;
@@ -1110,8 +1111,11 @@ struct ResponsesRequest {
     /// Conversation items.
     input: Vec<ResponsesInputItem>,
     /// Flattened system/developer instructions.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    instructions: Option<String>,
+    ///
+    /// `codex` always sends a concrete string here, even when it is empty. We
+    /// follow the same shape so providers that validate strictly against the
+    /// canonical Responses schema see the expected field type.
+    instructions: String,
     /// Output cap.
     #[serde(skip_serializing_if = "Option::is_none")]
     max_output_tokens: Option<u32>,
@@ -1119,14 +1123,31 @@ struct ResponsesRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning: Option<ResponsesReasoning>,
     /// Tool definitions.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tools: Option<Vec<ToolDefinition>>,
+    ///
+    /// The official Responses request accepts arbitrary JSON tool
+    /// specifications, not just function tools, so we serialize into raw JSON
+    /// values here.
+    tools: Vec<Value>,
     /// Tool choice policy.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tool_choice: Option<Value>,
+    tool_choice: String,
+    /// Whether the model may emit more than one tool call in one turn.
+    parallel_tool_calls: bool,
+    /// Whether the provider should persist the response server-side.
+    ///
+    /// SA does not currently rely on provider-side storage, so we keep this
+    /// disabled by default while still emitting the canonical field.
+    store: bool,
     /// Streaming toggle.
+    stream: bool,
+    /// Extra response fields requested from the provider.
+    include: Vec<String>,
+    /// Optional text controls.
+    ///
+    /// We keep the field available for official-shape compatibility even
+    /// though SA does not yet expose verbosity/schema controls in its own
+    /// configuration surface.
     #[serde(skip_serializing_if = "Option::is_none")]
-    stream: Option<bool>,
+    text: Option<ResponsesTextControls>,
 }
 
 impl ResponsesRequest {
@@ -1166,21 +1187,43 @@ impl ResponsesRequest {
             }
         }
 
+        let reasoning = req
+            .reasoning_effort
+            .as_deref()
+            .and_then(|effort| non_empty_text(Some(effort)))
+            .map(|effort| ResponsesReasoning {
+                effort: effort.to_string(),
+            });
+        let include = if reasoning.is_some() {
+            vec!["reasoning.encrypted_content".to_string()]
+        } else {
+            Vec::new()
+        };
+        let tools = req
+            .tools
+            .as_ref()
+            .map(|definitions| {
+                definitions
+                    .iter()
+                    .map(tool_definition_to_responses_value)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let has_tools = !tools.is_empty();
+
         Self {
             model: req.model.clone(),
             input,
-            instructions: (!instructions.is_empty()).then(|| instructions.join("\n\n")),
+            instructions: instructions.join("\n\n"),
             max_output_tokens: req.max_tokens,
-            reasoning: req
-                .reasoning_effort
-                .as_deref()
-                .and_then(|effort| non_empty_text(Some(effort)))
-                .map(|effort| ResponsesReasoning {
-                    effort: effort.to_string(),
-                }),
-            tools: req.tools.clone(),
-            tool_choice: req.tool_choice.clone(),
-            stream: req.stream,
+            reasoning,
+            tools,
+            tool_choice: normalize_responses_tool_choice(req.tool_choice.as_ref(), has_tools),
+            parallel_tool_calls: has_tools,
+            store: false,
+            stream: req.stream.unwrap_or(false),
+            include,
+            text: None,
         }
     }
 }
@@ -1194,7 +1237,7 @@ pub enum ResponsesInputItem {
         /// Sender role.
         role: String,
         /// Message content parts.
-        content: Vec<ResponsesContentPart>,
+        content: Vec<ResponsesContentItem>,
     },
 
     /// Assistant function-call item.
@@ -1203,8 +1246,7 @@ pub enum ResponsesInputItem {
         #[serde(skip_serializing_if = "Option::is_none")]
         id: Option<String>,
         /// Tool-call correlation id used by later `function_call_output`.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        call_id: Option<String>,
+        call_id: String,
         /// Tool name.
         name: String,
         /// JSON-encoded arguments string.
@@ -1215,36 +1257,48 @@ pub enum ResponsesInputItem {
     FunctionCallOutput {
         /// The prior function-call correlation id.
         call_id: String,
-        /// Tool output text.
-        output: String,
+        /// Tool output payload encoded exactly like the official Responses API:
+        /// either a plain string or an array of structured content items.
+        output: ResponsesFunctionCallOutputPayload,
     },
 
     /// Reasoning breadcrumb item preserved across turns.
     Reasoning {
-        /// Optional plaintext reasoning fragment.
+        /// Optional provider-side item id.
         #[serde(skip_serializing_if = "Option::is_none")]
-        content: Option<String>,
+        id: Option<String>,
+        /// Optional reasoning summary items.
+        #[serde(default)]
+        summary: Vec<ResponsesReasoningSummaryItem>,
+        /// Optional plaintext reasoning fragment.
+        #[serde(default, skip_serializing_if = "responses_reasoning_content_is_empty")]
+        content: Option<Vec<ResponsesReasoningContentItem>>,
         /// Optional encrypted reasoning blob.
         #[serde(skip_serializing_if = "Option::is_none")]
         encrypted_content: Option<String>,
-        /// Optional reasoning summary.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        summary: Option<String>,
     },
 }
 
 impl ResponsesInputItem {
-    /// Build one text message item.
-    fn message_text(role: impl Into<String>, kind: impl Into<String>, text: String) -> Self {
+    /// Build one user/developer/system text message item.
+    fn message_input_text(role: impl Into<String>, text: String) -> Self {
         Self::Message {
             role: role.into(),
-            content: vec![ResponsesContentPart::text(kind, text)],
+            content: vec![ResponsesContentItem::InputText { text }],
+        }
+    }
+
+    /// Build one assistant text message item.
+    fn message_output_text(role: impl Into<String>, text: String) -> Self {
+        Self::Message {
+            role: role.into(),
+            content: vec![ResponsesContentItem::OutputText { text }],
         }
     }
 
     /// Build one user text item.
     fn user_text(text: String) -> Self {
-        Self::message_text("user", "input_text", text)
+        Self::message_input_text("user", text)
     }
 
     /// Return the first textual payload carried by this item, if any.
@@ -1253,7 +1307,8 @@ impl ResponsesInputItem {
             ResponsesInputItem::Message { content, .. } => {
                 let parts = content
                     .iter()
-                    .filter_map(|part| non_empty_text(part.text.as_deref()).map(str::to_string))
+                    .filter_map(ResponsesContentItem::text)
+                    .map(str::to_string)
                     .collect::<Vec<_>>();
                 (!parts.is_empty()).then(|| parts.join("\n"))
             }
@@ -1264,24 +1319,125 @@ impl ResponsesInputItem {
     }
 }
 
-/// Text content part inside one Responses message item.
+/// Content part inside one Responses message item.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ResponsesContentPart {
-    /// Part discriminator such as `input_text` or `output_text`.
-    #[serde(rename = "type")]
-    pub kind: String,
-    /// Text payload.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub text: Option<String>,
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ResponsesContentItem {
+    /// User/developer/system text.
+    InputText {
+        /// Plain text payload.
+        text: String,
+    },
+    /// Assistant text.
+    OutputText {
+        /// Plain text payload.
+        text: String,
+    },
+    /// User image reference.
+    InputImage {
+        /// Image URL or data URL.
+        image_url: String,
+    },
 }
 
-impl ResponsesContentPart {
-    /// Build one text content part.
-    fn text(kind: impl Into<String>, text: String) -> Self {
-        Self {
-            kind: kind.into(),
-            text: Some(text),
+impl ResponsesContentItem {
+    /// Return the visible text carried by this content item, if any.
+    fn text(&self) -> Option<&str> {
+        match self {
+            ResponsesContentItem::InputText { text }
+            | ResponsesContentItem::OutputText { text } => non_empty_text(Some(text)),
+            ResponsesContentItem::InputImage { .. } => None,
         }
+    }
+}
+
+/// One reasoning-summary part preserved across Responses turns.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ResponsesReasoningSummaryItem {
+    /// Human-readable summary text.
+    SummaryText {
+        /// Summary payload.
+        text: String,
+    },
+}
+
+/// One reasoning-content part preserved across Responses turns.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ResponsesReasoningContentItem {
+    /// Explicit reasoning-text payload.
+    ReasoningText {
+        /// Reasoning payload.
+        text: String,
+    },
+    /// Plain text payload seen on some providers.
+    Text {
+        /// Text payload.
+        text: String,
+    },
+}
+
+/// Tool-call output content items compatible with the official Responses API.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ResponsesFunctionCallOutputContentItem {
+    /// Text output returned by the tool.
+    InputText {
+        /// Text payload.
+        text: String,
+    },
+    /// Image output returned by the tool.
+    InputImage {
+        /// Image URL or data URL.
+        image_url: String,
+    },
+}
+
+/// Wire body for `function_call_output.output`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum ResponsesFunctionCallOutputBody {
+    /// Plain-text tool output.
+    Text(String),
+    /// Structured multimodal tool output.
+    ContentItems(Vec<ResponsesFunctionCallOutputContentItem>),
+}
+
+/// Wrapper that keeps SA's internal type explicit while serializing exactly as
+/// the official Responses API expects for `function_call_output.output`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResponsesFunctionCallOutputPayload {
+    /// Actual wire body.
+    body: ResponsesFunctionCallOutputBody,
+}
+
+impl ResponsesFunctionCallOutputPayload {
+    /// Build a plain-text tool output payload.
+    fn from_text(text: String) -> Self {
+        Self {
+            body: ResponsesFunctionCallOutputBody::Text(text),
+        }
+    }
+}
+
+impl Serialize for ResponsesFunctionCallOutputPayload {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.body.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ResponsesFunctionCallOutputPayload {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(Self {
+            body: ResponsesFunctionCallOutputBody::deserialize(deserializer)?,
+        })
     }
 }
 
@@ -1290,6 +1446,27 @@ impl ResponsesContentPart {
 struct ResponsesReasoning {
     /// Requested reasoning effort.
     effort: String,
+}
+
+/// Minimal text controls for the Responses request.
+#[derive(Debug, Clone, Serialize)]
+struct ResponsesTextControls {
+    /// Optional verbosity control.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verbosity: Option<ResponsesVerbosity>,
+}
+
+/// Verbosity variants accepted by the Responses API text controls.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "lowercase")]
+#[allow(dead_code)]
+enum ResponsesVerbosity {
+    /// Minimal output verbosity.
+    Low,
+    /// Balanced output verbosity.
+    Medium,
+    /// High output verbosity.
+    High,
 }
 
 /// Responses wire response.
@@ -1315,6 +1492,10 @@ struct ResponsesStreamAccumulator {
     saw_output_text_delta: bool,
     /// Completed output items, when emitted individually.
     output_items: Vec<ResponsesOutputItem>,
+    /// Incremental reasoning content deltas keyed by `content_index`.
+    reasoning_content_deltas: BTreeMap<i64, String>,
+    /// Incremental reasoning-summary deltas keyed by `summary_index`.
+    reasoning_summary_deltas: BTreeMap<i64, String>,
     /// Terminal full response object, if the provider emitted one.
     completed_response: Option<ResponsesResponse>,
 }
@@ -1364,12 +1545,48 @@ impl ResponsesStreamAccumulator {
                 }
                 Ok(None)
             }
-            Some("response.output_item.done") => {
+            Some("response.output_item.added") | Some("response.output_item.done") => {
                 if let Some(item) = event.get("item").cloned() {
                     if let Ok(parsed) = serde_json::from_value::<ResponsesOutputItem>(item) {
-                        self.output_items.push(parsed);
+                        upsert_responses_output_item(&mut self.output_items, parsed);
                     }
                 }
+                Ok(None)
+            }
+            Some("response.reasoning_text.delta") => {
+                let Some(delta) = event.get("delta").and_then(Value::as_str) else {
+                    return Ok(None);
+                };
+                let index = event
+                    .get("content_index")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
+                self.reasoning_content_deltas
+                    .entry(index)
+                    .or_default()
+                    .push_str(delta);
+                Ok(None)
+            }
+            Some("response.reasoning_summary_part.added") => {
+                let index = event
+                    .get("summary_index")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
+                self.reasoning_summary_deltas.entry(index).or_default();
+                Ok(None)
+            }
+            Some("response.reasoning_summary_text.delta") => {
+                let Some(delta) = event.get("delta").and_then(Value::as_str) else {
+                    return Ok(None);
+                };
+                let index = event
+                    .get("summary_index")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
+                self.reasoning_summary_deltas
+                    .entry(index)
+                    .or_default()
+                    .push_str(delta);
                 Ok(None)
             }
             Some("response.completed") | Some("response.done") => {
@@ -1388,9 +1605,7 @@ impl ResponsesStreamAccumulator {
                 if parsed.output_text.is_none() && !self.output_text.is_empty() {
                     parsed.output_text = Some(self.output_text.clone());
                 }
-                if parsed.output.is_empty() && !self.output_items.is_empty() {
-                    parsed.output = self.output_items.clone();
-                }
+                merge_responses_output_items(&mut parsed.output, &self.synthetic_output_items());
 
                 self.completed_response = Some(parsed);
                 Ok(Some(()))
@@ -1403,10 +1618,70 @@ impl ResponsesStreamAccumulator {
     /// explicit `response.completed` object.
     fn synthetic_response(&self) -> ResponsesResponse {
         ResponsesResponse {
-            output: self.output_items.clone(),
+            output: self.synthetic_output_items(),
             output_text: (!self.output_text.is_empty()).then(|| self.output_text.clone()),
             usage: None,
         }
+    }
+
+    /// Build the best-effort output item list we can reconstruct from stream
+    /// fragments alone.
+    fn synthetic_output_items(&self) -> Vec<ResponsesOutputItem> {
+        let mut items = self.output_items.clone();
+        if !items.iter().any(ResponsesOutputItem::is_reasoning_item) {
+            let synthesized_reasoning = self.synthesized_reasoning_item();
+            if let Some(item) = synthesized_reasoning {
+                items.push(item);
+            }
+        }
+        items
+    }
+
+    /// Reconstruct one reasoning output item from the accumulated delta-only
+    /// stream events.
+    fn synthesized_reasoning_item(&self) -> Option<ResponsesOutputItem> {
+        let content_items = self
+            .reasoning_content_deltas
+            .values()
+            .filter_map(|text| {
+                non_empty_text(Some(text)).map(|trimmed| {
+                    serde_json::json!({
+                        "type": "reasoning_text",
+                        "text": trimmed,
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        let summary_items = self
+            .reasoning_summary_deltas
+            .values()
+            .filter_map(|text| {
+                non_empty_text(Some(text)).map(|trimmed| {
+                    serde_json::json!({
+                        "type": "summary_text",
+                        "text": trimmed,
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+
+        if content_items.is_empty() && summary_items.is_empty() {
+            return None;
+        }
+
+        Some(ResponsesOutputItem {
+            kind: Some("reasoning".to_string()),
+            id: None,
+            call_id: None,
+            status: None,
+            name: None,
+            arguments: None,
+            role: None,
+            content: (!content_items.is_empty()).then(|| Value::Array(content_items)),
+            text: None,
+            encrypted_content: None,
+            summary: (!summary_items.is_empty()).then(|| Value::Array(summary_items)),
+        })
     }
 }
 
@@ -1422,6 +1697,10 @@ struct ResponsesOutputItem {
     /// Optional tool call id.
     #[serde(default)]
     call_id: Option<String>,
+    /// Optional item status.
+    #[serde(default)]
+    #[allow(dead_code)]
+    status: Option<String>,
     /// Function name for `function_call`.
     #[serde(default)]
     name: Option<String>,
@@ -1446,7 +1725,32 @@ struct ResponsesOutputItem {
     encrypted_content: Option<String>,
     /// Optional reasoning summary.
     #[serde(default)]
-    summary: Option<String>,
+    summary: Option<Value>,
+}
+
+impl ResponsesOutputItem {
+    /// Return `true` if this output item is a reasoning item.
+    fn is_reasoning_item(&self) -> bool {
+        self.kind.as_deref() == Some("reasoning")
+    }
+
+    /// Determine whether two output items refer to the same logical provider
+    /// item.
+    ///
+    /// We prefer stable provider IDs. If they do not exist, `call_id` still
+    /// lets us coalesce `function_call` items emitted via both
+    /// `response.output_item.added` and `response.output_item.done`.
+    fn matches_identity(&self, other: &Self) -> bool {
+        if let (Some(left), Some(right)) = (self.id.as_deref(), other.id.as_deref()) {
+            return left == right;
+        }
+
+        if let (Some(left), Some(right)) = (self.call_id.as_deref(), other.call_id.as_deref()) {
+            return left == right;
+        }
+
+        false
+    }
 }
 
 /// Normalize a Responses reply back into SA's canonical chat-style response.
@@ -1534,31 +1838,33 @@ fn normalize_responses_output_items(
 
                 history_items.push(ResponsesInputItem::FunctionCall {
                     id: item_id,
-                    call_id: Some(normalized_call_id),
+                    call_id: normalized_call_id,
                     name: name.to_string(),
                     arguments,
                 });
             }
             Some("reasoning") => {
-                let content = non_empty_text(
-                    extract_responses_reasoning_text(item.content.as_ref())
-                        .as_deref()
-                        .or(item.text.as_deref())
-                        .or(item.summary.as_deref()),
-                )
-                .map(str::to_string);
+                let content =
+                    normalize_responses_reasoning_content(item.content.as_ref()).or_else(|| {
+                        non_empty_text(item.text.as_deref()).map(|text| {
+                            vec![ResponsesReasoningContentItem::ReasoningText {
+                                text: text.to_string(),
+                            }]
+                        })
+                    });
                 let encrypted_content =
                     non_empty_text(item.encrypted_content.as_deref()).map(str::to_string);
-                let summary = non_empty_text(item.summary.as_deref()).map(str::to_string);
+                let summary = normalize_responses_reasoning_summary(item.summary.as_ref());
 
-                if content.is_none() && encrypted_content.is_none() && summary.is_none() {
+                if content.is_none() && encrypted_content.is_none() && summary.is_empty() {
                     continue;
                 }
 
                 history_items.push(ResponsesInputItem::Reasoning {
+                    id: sanitize_id(item.id.as_deref()),
+                    summary,
                     content,
                     encrypted_content,
-                    summary,
                 });
             }
             Some("output_text") => {
@@ -1570,11 +1876,7 @@ fn normalize_responses_output_items(
                     assistant_text = Some(text.clone());
                 }
 
-                history_items.push(ResponsesInputItem::message_text(
-                    "assistant",
-                    "output_text",
-                    text,
-                ));
+                history_items.push(ResponsesInputItem::message_output_text("assistant", text));
             }
             _ => {}
         }
@@ -1584,11 +1886,7 @@ fn normalize_responses_output_items(
         if let Some(text) = non_empty_text(top_level_output_text) {
             let text = text.to_string();
             assistant_text = Some(text.clone());
-            history_items.push(ResponsesInputItem::message_text(
-                "assistant",
-                "output_text",
-                text,
-            ));
+            history_items.push(ResponsesInputItem::message_output_text("assistant", text));
         }
     }
 
@@ -1600,11 +1898,22 @@ fn normalize_responses_output_items(
 fn normalize_responses_message_parts(
     role: &str,
     raw_content: Option<&Value>,
-) -> Vec<ResponsesContentPart> {
-    let default_kind = match role {
-        "assistant" => "output_text",
-        _ => "input_text",
-    };
+) -> Vec<ResponsesContentItem> {
+    let default_is_output = matches!(role, "assistant");
+
+    if let Some(Value::String(text)) = raw_content
+        && let Some(text) = non_empty_text(Some(text))
+    {
+        return vec![if default_is_output {
+            ResponsesContentItem::OutputText {
+                text: text.to_string(),
+            }
+        } else {
+            ResponsesContentItem::InputText {
+                text: text.to_string(),
+            }
+        }];
+    }
 
     let Some(parts) = raw_content.and_then(Value::as_array) else {
         return Vec::new();
@@ -1612,24 +1921,110 @@ fn normalize_responses_message_parts(
 
     parts
         .iter()
-        .filter_map(|part| {
-            let text = non_empty_text(part.get("text").and_then(Value::as_str))?.to_string();
-            let kind = part
-                .get("type")
-                .and_then(Value::as_str)
-                .filter(|kind| matches!(*kind, "input_text" | "output_text"))
-                .unwrap_or(default_kind);
-            Some(ResponsesContentPart::text(kind, text))
+        .filter_map(|part| match part.get("type").and_then(Value::as_str) {
+            Some("input_image") => {
+                let image_url = non_empty_text(part.get("image_url").and_then(Value::as_str))?;
+                Some(ResponsesContentItem::InputImage {
+                    image_url: image_url.to_string(),
+                })
+            }
+            Some("output_text") => {
+                let text = non_empty_text(part.get("text").and_then(Value::as_str))?;
+                Some(ResponsesContentItem::OutputText {
+                    text: text.to_string(),
+                })
+            }
+            Some("input_text") => {
+                let text = non_empty_text(part.get("text").and_then(Value::as_str))?;
+                Some(ResponsesContentItem::InputText {
+                    text: text.to_string(),
+                })
+            }
+            _ => {
+                let text = non_empty_text(part.get("text").and_then(Value::as_str))?;
+                Some(if default_is_output {
+                    ResponsesContentItem::OutputText {
+                        text: text.to_string(),
+                    }
+                } else {
+                    ResponsesContentItem::InputText {
+                        text: text.to_string(),
+                    }
+                })
+            }
         })
         .collect()
 }
 
-/// Extract plaintext reasoning content from a polymorphic `content` field.
-fn extract_responses_reasoning_text(raw_content: Option<&Value>) -> Option<String> {
-    match raw_content {
-        Some(Value::String(text)) => non_empty_text(Some(text)).map(str::to_string),
-        _ => None,
+/// Normalize a raw reasoning-summary payload into official Responses summary
+/// items.
+fn normalize_responses_reasoning_summary(
+    raw_summary: Option<&Value>,
+) -> Vec<ResponsesReasoningSummaryItem> {
+    match raw_summary {
+        Some(Value::String(text)) => non_empty_text(Some(text))
+            .map(|text| {
+                vec![ResponsesReasoningSummaryItem::SummaryText {
+                    text: text.to_string(),
+                }]
+            })
+            .unwrap_or_default(),
+        Some(Value::Object(_)) => normalize_responses_reasoning_summary(Some(&Value::Array(vec![
+            raw_summary.cloned().unwrap_or(Value::Null),
+        ]))),
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(|item| {
+                let text = non_empty_text(item.get("text").and_then(Value::as_str))?;
+                Some(ResponsesReasoningSummaryItem::SummaryText {
+                    text: text.to_string(),
+                })
+            })
+            .collect(),
+        _ => Vec::new(),
     }
+}
+
+/// Normalize a raw reasoning-content payload into official Responses content
+/// items.
+fn normalize_responses_reasoning_content(
+    raw_content: Option<&Value>,
+) -> Option<Vec<ResponsesReasoningContentItem>> {
+    let normalized = match raw_content {
+        Some(Value::String(text)) => non_empty_text(Some(text))
+            .map(|text| {
+                vec![ResponsesReasoningContentItem::ReasoningText {
+                    text: text.to_string(),
+                }]
+            })
+            .unwrap_or_default(),
+        Some(Value::Object(_)) => {
+            let raw_item = raw_content.cloned().unwrap_or(Value::Null);
+            normalize_responses_reasoning_content(Some(&Value::Array(vec![raw_item])))
+                .unwrap_or_default()
+        }
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(|item| {
+                let text = non_empty_text(item.get("text").and_then(Value::as_str))?;
+                let kind = item
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("reasoning_text");
+                Some(match kind {
+                    "text" => ResponsesReasoningContentItem::Text {
+                        text: text.to_string(),
+                    },
+                    _ => ResponsesReasoningContentItem::ReasoningText {
+                        text: text.to_string(),
+                    },
+                })
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+
+    (!normalized.is_empty()).then_some(normalized)
 }
 
 /// Build assistant-side Responses items from SA's canonical assistant message.
@@ -1637,9 +2032,8 @@ fn build_assistant_responses_items(message: &ChatMessage) -> Vec<ResponsesInputI
     let mut items = Vec::<ResponsesInputItem>::new();
 
     if let Some(text) = message.content.as_deref() {
-        items.push(ResponsesInputItem::message_text(
+        items.push(ResponsesInputItem::message_output_text(
             "assistant",
-            "output_text",
             text.to_string(),
         ));
     }
@@ -1650,7 +2044,7 @@ fn build_assistant_responses_items(message: &ChatMessage) -> Vec<ResponsesInputI
                 sanitize_id(Some(&tool_call.id)).unwrap_or_else(|| Uuid::new_v4().to_string());
             items.push(ResponsesInputItem::FunctionCall {
                 id: None,
-                call_id: Some(call_id),
+                call_id,
                 name: tool_call.function.name.clone(),
                 arguments: tool_call.function.arguments.clone(),
             });
@@ -1664,7 +2058,10 @@ fn build_assistant_responses_items(message: &ChatMessage) -> Vec<ResponsesInputI
 fn build_tool_output_item(message: &ChatMessage) -> Option<ResponsesInputItem> {
     let call_id = sanitize_id(message.tool_call_id.as_deref())?;
     let output = message.content.clone().unwrap_or_default();
-    Some(ResponsesInputItem::FunctionCallOutput { call_id, output })
+    Some(ResponsesInputItem::FunctionCallOutput {
+        call_id,
+        output: ResponsesFunctionCallOutputPayload::from_text(output),
+    })
 }
 
 /// Map arbitrary chat-style roles into the roles accepted by the OpenResponses schema.
@@ -1691,14 +2088,72 @@ fn sanitize_id(value: Option<&str>) -> Option<String> {
     non_empty_text(value).map(str::to_string)
 }
 
+/// `Reasoning.content` is optional; when present but empty it should still be
+/// omitted so the replayed item stays compact.
+fn responses_reasoning_content_is_empty(
+    content: &Option<Vec<ResponsesReasoningContentItem>>,
+) -> bool {
+    match content {
+        Some(items) => items.is_empty(),
+        None => true,
+    }
+}
+
+/// Convert one tool definition into the raw JSON shape used by the official
+/// Responses request.
+fn tool_definition_to_responses_value(definition: &ToolDefinition) -> Value {
+    serde_json::to_value(definition)
+        .expect("ToolDefinition contains only serializable JSON-compatible fields")
+}
+
+/// Normalize SA's internal `tool_choice` into the canonical Responses string
+/// form used by `codex`.
+fn normalize_responses_tool_choice(tool_choice: Option<&Value>, has_tools: bool) -> String {
+    if let Some(Value::String(choice)) = tool_choice
+        && let Some(choice) = non_empty_text(Some(choice))
+    {
+        return choice.to_string();
+    }
+
+    if has_tools {
+        "auto".to_string()
+    } else {
+        "none".to_string()
+    }
+}
+
+/// Insert or replace one Responses output item in-place.
+fn upsert_responses_output_item(items: &mut Vec<ResponsesOutputItem>, item: ResponsesOutputItem) {
+    if let Some(index) = items
+        .iter()
+        .position(|existing| existing.matches_identity(&item))
+    {
+        items[index] = item;
+    } else {
+        items.push(item);
+    }
+}
+
+/// Merge one list of output items into another while coalescing identical
+/// provider items.
+fn merge_responses_output_items(
+    target: &mut Vec<ResponsesOutputItem>,
+    incoming: &[ResponsesOutputItem],
+) {
+    for item in incoming {
+        upsert_responses_output_item(target, item.clone());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         ChatCompletionsRequest, ChatCompletionsResponse, ChatCompletionsStreamAccumulator,
         ChatCompletionsStreamChunk, ChatMessage, ChatUsage, InputTokenDetails, OutputTokenDetails,
-        ResponsesInputItem, ResponsesRequest, ResponsesStreamAccumulator, ToolCall, ToolDefinition,
-        ToolFunctionCall, ToolFunctionDefinition, WireApi, normalize_responses_response,
-        process_sse_line,
+        ResponsesFunctionCallOutputContentItem, ResponsesInputItem, ResponsesReasoningContentItem,
+        ResponsesReasoningSummaryItem, ResponsesRequest, ResponsesStreamAccumulator, ToolCall,
+        ToolDefinition, ToolFunctionCall, ToolFunctionDefinition, WireApi,
+        normalize_responses_response, process_sse_line,
     };
 
     #[test]
@@ -1870,6 +2325,51 @@ mod tests {
     }
 
     #[test]
+    fn responses_stream_accumulator_reconstructs_reasoning_from_deltas() {
+        let mut acc = ResponsesStreamAccumulator::default();
+
+        acc.apply_event(&serde_json::json!({
+            "type": "response.reasoning_summary_part.added",
+            "summary_index": 0
+        }))
+        .expect("summary part should parse");
+        acc.apply_event(&serde_json::json!({
+            "type": "response.reasoning_summary_text.delta",
+            "summary_index": 0,
+            "delta": "先读配置"
+        }))
+        .expect("summary delta should parse");
+        acc.apply_event(&serde_json::json!({
+            "type": "response.reasoning_text.delta",
+            "content_index": 0,
+            "delta": "我需要先确认字段。"
+        }))
+        .expect("reasoning delta should parse");
+
+        let response = acc.synthetic_response();
+        let normalized = normalize_responses_response(response);
+        let choice = normalized.first_choice().expect("choice should exist");
+        let history = choice
+            .message
+            .responses_input_items
+            .as_ref()
+            .expect("responses history should exist");
+
+        assert!(history.iter().any(|item| matches!(
+            item,
+            ResponsesInputItem::Reasoning {
+                summary,
+                content: Some(content),
+                ..
+            } if summary == &vec![ResponsesReasoningSummaryItem::SummaryText {
+                text: "先读配置".to_string(),
+            }] && content == &vec![ResponsesReasoningContentItem::ReasoningText {
+                text: "我需要先确认字段。".to_string(),
+            }]
+        )));
+    }
+
+    #[test]
     fn request_serializes_reasoning_effort_when_present() {
         let req = ChatCompletionsRequest {
             model: "gpt-5.2".to_string(),
@@ -1968,6 +2468,14 @@ mod tests {
         assert_eq!(value["instructions"], "policy");
         assert_eq!(value["max_output_tokens"], 512);
         assert_eq!(value["reasoning"]["effort"], "high");
+        assert_eq!(value["tool_choice"], "auto");
+        assert_eq!(value["parallel_tool_calls"], true);
+        assert_eq!(value["store"], false);
+        assert_eq!(value["stream"], false);
+        assert_eq!(
+            value["include"],
+            serde_json::json!(["reasoning.encrypted_content"])
+        );
         assert_eq!(value["input"][0]["type"], "message");
         assert_eq!(value["input"][0]["role"], "user");
         assert_eq!(value["input"][0]["content"][0]["type"], "input_text");
@@ -1975,6 +2483,8 @@ mod tests {
         assert_eq!(value["input"][1]["call_id"], "call_123");
         assert_eq!(value["input"][2]["type"], "function_call_output");
         assert_eq!(value["input"][2]["call_id"], "call_123");
+        assert_eq!(value["input"][2]["output"], "文件内容");
+        assert_eq!(value["tools"].as_array().map(Vec::len), Some(1));
     }
 
     #[test]
@@ -1983,6 +2493,18 @@ mod tests {
             "output": [
                 {
                     "type": "reasoning",
+                    "summary": [
+                        {
+                            "type": "summary_text",
+                            "text": "先看文件"
+                        }
+                    ],
+                    "content": [
+                        {
+                            "type": "reasoning_text",
+                            "text": "先确认工具输出。"
+                        }
+                    ],
                     "encrypted_content": "ciphertext"
                 },
                 {
@@ -2018,10 +2540,50 @@ mod tests {
             .as_ref()
             .expect("responses history items should exist");
         assert_eq!(history.len(), 2);
+        assert!(matches!(
+            &history[0],
+            ResponsesInputItem::Reasoning {
+                summary,
+                content: Some(content),
+                encrypted_content: Some(encrypted_content),
+                ..
+            } if summary == &vec![ResponsesReasoningSummaryItem::SummaryText {
+                text: "先看文件".to_string(),
+            }] && content == &vec![ResponsesReasoningContentItem::ReasoningText {
+                text: "先确认工具输出。".to_string(),
+            }] && encrypted_content == "ciphertext"
+        ));
         assert_eq!(
             normalized.usage.expect("usage should exist").input_tokens,
             Some(800)
         );
+    }
+
+    #[test]
+    fn responses_function_call_output_payload_serializes_like_codex_wire_format() {
+        let item = ResponsesInputItem::FunctionCallOutput {
+            call_id: "call_1".to_string(),
+            output: super::ResponsesFunctionCallOutputPayload {
+                body: super::ResponsesFunctionCallOutputBody::ContentItems(vec![
+                    ResponsesFunctionCallOutputContentItem::InputText {
+                        text: "line 1".to_string(),
+                    },
+                    ResponsesFunctionCallOutputContentItem::InputImage {
+                        image_url: "data:image/png;base64,AAA".to_string(),
+                    },
+                ]),
+            },
+        };
+
+        let value = serde_json::to_value(&item).expect("serialize tool output");
+        assert_eq!(value["type"], "function_call_output");
+        assert_eq!(value["call_id"], "call_1");
+        assert_eq!(value["output"][0]["type"], "input_text");
+        assert_eq!(value["output"][1]["type"], "input_image");
+
+        let parsed =
+            serde_json::from_value::<ResponsesInputItem>(value).expect("deserialize tool output");
+        assert_eq!(parsed, item);
     }
 
     #[test]

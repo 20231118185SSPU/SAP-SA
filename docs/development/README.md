@@ -12,6 +12,7 @@
 专题文档：
 
 - `token-accounting.md`：SA 当前的 token 统计、usage 回填与 compact 估算策略
+- `responses-wire-api.md`：`/v1/responses` 兼容层如何对齐 `codex` 官方实现
 - `ws-handshake.md`：前后端双向握手与协议身份校验
 
 说明：
