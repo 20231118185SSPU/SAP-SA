@@ -39,6 +39,12 @@
 
 SA 内部维护的是 chat-style 统一消息模型；实际发往供应商时可根据 `llm.wire_api` 走 `POST /v1/chat/completions` 或 `POST /v1/responses`。
 
+补充：
+
+- 主 Agent 循环默认优先走流式请求，以降低部分供应商/网关上的长请求 503 概率。
+- `responses` 流式在 `response.completed` 中通常仍可拿到 `usage`。
+- `chat_completions` 流式在很多 OpenAI-compatible 实现里不会稳定返回最终 `usage`；这时 SA 不会伪造 usage，而是退回到现有的混合启发式估算，直到后续再次拿到真实 usage 锚点。
+
 如果服务端返回：
 
 - `usage.prompt_tokens`

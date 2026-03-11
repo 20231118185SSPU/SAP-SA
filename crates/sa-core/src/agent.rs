@@ -216,7 +216,17 @@ impl AgentRunner {
                 reasoning_effort: self.cfg.reasoning_effort.clone(),
                 tools: Some(tool_definitions.clone()),
                 tool_choice: Some(serde_json::json!("auto")),
-                stream: Some(false),
+                // Stream provider output by default for the main agent loop.
+                //
+                // Rationale:
+                // - Some gateways time out long non-streaming requests and return
+                //   503 even though streaming succeeds.
+                // - `OpenAiClient` still aggregates the final response back into
+                //   the canonical SA shape, so the rest of the loop stays
+                //   unchanged.
+                // - If a provider rejects streaming outright, the client
+                //   transparently falls back to one non-streaming retry.
+                stream: Some(true),
             };
 
             // Call provider with **infinite retry** + backoff.

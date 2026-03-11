@@ -13,6 +13,7 @@ use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt;
+use tokio_stream::StreamExt;
 use uuid::Uuid;
 
 /// Wire protocol used for one OpenAI-compatible endpoint.
@@ -48,6 +49,9 @@ pub enum ChatCompletionsError {
         /// Raw response body (best-effort, may be truncated by the server).
         body: String,
     },
+    /// The provider returned a payload that SA could not parse as the selected
+    /// wire protocol.
+    InvalidResponse(String),
 }
 
 impl ChatCompletionsError {
@@ -65,6 +69,7 @@ impl ChatCompletionsError {
                     || *status == reqwest::StatusCode::TOO_MANY_REQUESTS
                     || status.is_server_error()
             }
+            ChatCompletionsError::InvalidResponse(_) => false,
         }
     }
 
@@ -73,6 +78,7 @@ impl ChatCompletionsError {
         match self {
             ChatCompletionsError::Transport(_) => None,
             ChatCompletionsError::Http { status, .. } => Some(*status),
+            ChatCompletionsError::InvalidResponse(_) => None,
         }
     }
 }
@@ -83,6 +89,9 @@ impl fmt::Display for ChatCompletionsError {
             ChatCompletionsError::Transport(err) => write!(f, "transport error: {err}"),
             ChatCompletionsError::Http { status, body } => {
                 write!(f, "http error ({status}): {body}")
+            }
+            ChatCompletionsError::InvalidResponse(message) => {
+                write!(f, "invalid response: {message}")
             }
         }
     }
@@ -209,6 +218,28 @@ impl OpenAiClient {
         &self,
         req: &ChatCompletionsRequest,
     ) -> Result<ChatCompletionsResponse, ChatCompletionsError> {
+        if req.stream.unwrap_or(false) {
+            match self.send_chat_completions_streaming_request(req).await {
+                Ok(response) => return Ok(response),
+                Err(error) if should_fallback_from_streaming(&error) => {
+                    let mut fallback_req = req.clone();
+                    fallback_req.stream = Some(false);
+                    return self
+                        .send_chat_completions_request_non_streaming(&fallback_req)
+                        .await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        self.send_chat_completions_request_non_streaming(req).await
+    }
+
+    /// Send a classic non-streaming `POST /chat/completions` request.
+    async fn send_chat_completions_request_non_streaming(
+        &self,
+        req: &ChatCompletionsRequest,
+    ) -> Result<ChatCompletionsResponse, ChatCompletionsError> {
         let url = self.chat_completions_url();
 
         // Send request.
@@ -241,9 +272,82 @@ impl OpenAiClient {
             .map_err(ChatCompletionsError::Transport)
     }
 
+    /// Send a streaming `POST /chat/completions` request and aggregate it back
+    /// into the canonical non-streaming SA response shape.
+    async fn send_chat_completions_streaming_request(
+        &self,
+        req: &ChatCompletionsRequest,
+    ) -> Result<ChatCompletionsResponse, ChatCompletionsError> {
+        let url = self.chat_completions_url();
+        let resp = self
+            .http
+            .post(url)
+            .header("Accept", "text/event-stream")
+            .json(req)
+            .send()
+            .await
+            .map_err(ChatCompletionsError::Transport)?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp
+                .text()
+                .await
+                .unwrap_or_else(|_| "<failed to read body>".to_string());
+            let body = truncate_error_body(body);
+            return Err(ChatCompletionsError::Http { status, body });
+        }
+
+        let mut accumulator = ChatCompletionsStreamAccumulator::default();
+        self.read_sse_response(resp, |event_name, data| {
+            if data == "[DONE]" {
+                return Ok(Some(()));
+            }
+            if event_name.is_some_and(|event| !event.eq_ignore_ascii_case("message")) {
+                return Ok(None);
+            }
+
+            let chunk =
+                serde_json::from_str::<ChatCompletionsStreamChunk>(data).map_err(|err| {
+                    invalid_response(format!(
+                        "chat-completions stream chunk is not valid JSON: {err}; body={}",
+                        summarize_stream_payload(data)
+                    ))
+                })?;
+            accumulator.apply_chunk(chunk);
+            Ok(None)
+        })
+        .await?;
+
+        accumulator.into_response()
+    }
+
     /// Send one `POST /responses` request and normalize it back into SA's
     /// canonical chat-style response model.
     async fn send_responses_request(
+        &self,
+        req: &ChatCompletionsRequest,
+    ) -> Result<ChatCompletionsResponse, ChatCompletionsError> {
+        if req.stream.unwrap_or(false) {
+            match self.send_responses_streaming_request(req).await {
+                Ok(response) => return Ok(response),
+                Err(error) if should_fallback_from_streaming(&error) => {
+                    let mut fallback_req = req.clone();
+                    fallback_req.stream = Some(false);
+                    return self
+                        .send_responses_request_non_streaming(&fallback_req)
+                        .await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        self.send_responses_request_non_streaming(req).await
+    }
+
+    /// Send one non-streaming `POST /responses` request and normalize it back into SA's
+    /// canonical chat-style response model.
+    async fn send_responses_request_non_streaming(
         &self,
         req: &ChatCompletionsRequest,
     ) -> Result<ChatCompletionsResponse, ChatCompletionsError> {
@@ -275,6 +379,109 @@ impl OpenAiClient {
 
         Ok(normalize_responses_response(wire_response))
     }
+
+    /// Send one streaming `POST /responses` request and aggregate the SSE event
+    /// stream into SA's canonical response model.
+    async fn send_responses_streaming_request(
+        &self,
+        req: &ChatCompletionsRequest,
+    ) -> Result<ChatCompletionsResponse, ChatCompletionsError> {
+        let url = self.responses_url();
+        let wire_request = ResponsesRequest::from_chat_request(req);
+
+        let resp = self
+            .http
+            .post(url)
+            .header("Accept", "text/event-stream")
+            .json(&wire_request)
+            .send()
+            .await
+            .map_err(ChatCompletionsError::Transport)?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp
+                .text()
+                .await
+                .unwrap_or_else(|_| "<failed to read body>".to_string());
+            let body = truncate_error_body(body);
+            return Err(ChatCompletionsError::Http { status, body });
+        }
+
+        let mut accumulator = ResponsesStreamAccumulator::default();
+        self.read_sse_response(resp, |_, data| {
+            let event = serde_json::from_str::<Value>(data).map_err(|err| {
+                invalid_response(format!(
+                    "responses stream event is not valid JSON: {err}; body={}",
+                    summarize_stream_payload(data)
+                ))
+            })?;
+            accumulator.apply_event(&event)
+        })
+        .await?;
+
+        let response = accumulator
+            .completed_response
+            .clone()
+            .unwrap_or_else(|| accumulator.synthetic_response());
+        Ok(normalize_responses_response(response))
+    }
+
+    /// Read one SSE response until the supplied handler returns a value.
+    async fn read_sse_response<T, F>(
+        &self,
+        response: reqwest::Response,
+        mut on_event: F,
+    ) -> Result<T, ChatCompletionsError>
+    where
+        F: FnMut(Option<&str>, &str) -> Result<Option<T>, ChatCompletionsError>,
+    {
+        let mut buffer = String::new();
+        let mut current_event: Option<String> = None;
+        let mut current_data: Vec<String> = Vec::new();
+        let mut stream = response.bytes_stream();
+
+        while let Some(item) = stream.next().await {
+            let bytes = item.map_err(ChatCompletionsError::Transport)?;
+            let text = std::str::from_utf8(&bytes)
+                .map_err(|err| invalid_response(format!("stream payload is not UTF-8: {err}")))?;
+            buffer.push_str(text);
+
+            while let Some(pos) = buffer.find('\n') {
+                let mut line = buffer.drain(..=pos).collect::<String>();
+                if line.ends_with('\n') {
+                    line.pop();
+                }
+                if line.ends_with('\r') {
+                    line.pop();
+                }
+
+                if let Some(result) =
+                    process_sse_line(&line, &mut current_event, &mut current_data, &mut on_event)?
+                {
+                    return Ok(result);
+                }
+            }
+        }
+
+        if !buffer.is_empty() {
+            let line = std::mem::take(&mut buffer);
+            if let Some(result) =
+                process_sse_line(&line, &mut current_event, &mut current_data, &mut on_event)?
+            {
+                return Ok(result);
+            }
+        }
+
+        if let Some(result) = flush_sse_event(&mut current_event, &mut current_data, &mut on_event)?
+        {
+            return Ok(result);
+        }
+
+        Err(invalid_response(
+            "stream ended before a terminal completion event arrived".to_string(),
+        ))
+    }
 }
 
 /// Truncate a response body that is going to be included in an error.
@@ -294,6 +501,99 @@ fn truncate_error_body(body: String) -> String {
     // Truncate by *characters* so we do not split UTF-8 sequences.
     let truncated: String = body.chars().take(MAX_CHARS).collect();
     format!("{truncated}…(truncated)")
+}
+
+/// Return whether streaming should fall back to a non-streaming retry.
+///
+/// We only fall back on errors that strongly suggest "streaming is unsupported
+/// or malformed here", not on ordinary transient provider failures like 503.
+fn should_fallback_from_streaming(error: &ChatCompletionsError) -> bool {
+    match error {
+        ChatCompletionsError::Http { status, .. } => matches!(
+            *status,
+            reqwest::StatusCode::BAD_REQUEST
+                | reqwest::StatusCode::NOT_FOUND
+                | reqwest::StatusCode::METHOD_NOT_ALLOWED
+                | reqwest::StatusCode::NOT_ACCEPTABLE
+                | reqwest::StatusCode::UNPROCESSABLE_ENTITY
+                | reqwest::StatusCode::NOT_IMPLEMENTED
+        ),
+        ChatCompletionsError::InvalidResponse(_) => true,
+        ChatCompletionsError::Transport(_) => false,
+    }
+}
+
+/// Build one protocol/shape error for provider payloads that are syntactically
+/// reachable but semantically unusable.
+fn invalid_response(message: String) -> ChatCompletionsError {
+    ChatCompletionsError::InvalidResponse(message)
+}
+
+/// Summarize one raw stream payload so parser errors stay readable.
+fn summarize_stream_payload(payload: &str) -> String {
+    const MAX_CHARS: usize = 500;
+    let compact = payload.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() <= MAX_CHARS {
+        return compact;
+    }
+    let truncated: String = compact.chars().take(MAX_CHARS).collect();
+    format!("{truncated}…(truncated)")
+}
+
+/// Process one SSE line and flush completed events when a blank separator is seen.
+fn process_sse_line<T, F>(
+    line: &str,
+    current_event: &mut Option<String>,
+    current_data: &mut Vec<String>,
+    on_event: &mut F,
+) -> Result<Option<T>, ChatCompletionsError>
+where
+    F: FnMut(Option<&str>, &str) -> Result<Option<T>, ChatCompletionsError>,
+{
+    if line.is_empty() {
+        return flush_sse_event(current_event, current_data, on_event);
+    }
+
+    if line.starts_with(':') {
+        return Ok(None);
+    }
+
+    if let Some(rest) = line.strip_prefix("event:") {
+        *current_event = Some(rest.trim().to_string());
+        return Ok(None);
+    }
+
+    if let Some(rest) = line.strip_prefix("data:") {
+        let rest = rest.strip_prefix(' ').unwrap_or(rest);
+        current_data.push(rest.to_string());
+    }
+
+    Ok(None)
+}
+
+/// Flush one accumulated SSE event frame into the supplied event handler.
+fn flush_sse_event<T, F>(
+    current_event: &mut Option<String>,
+    current_data: &mut Vec<String>,
+    on_event: &mut F,
+) -> Result<Option<T>, ChatCompletionsError>
+where
+    F: FnMut(Option<&str>, &str) -> Result<Option<T>, ChatCompletionsError>,
+{
+    if current_event.is_none() && current_data.is_empty() {
+        return Ok(None);
+    }
+
+    let event = current_event.take();
+    let data = current_data.join("\n");
+    current_data.clear();
+    let data = data.trim();
+
+    if data.is_empty() {
+        return Ok(None);
+    }
+
+    on_event(event.as_deref(), data)
 }
 
 /// Canonical SA request body.
@@ -605,6 +905,203 @@ impl ChatCompletionsResponse {
     }
 }
 
+/// One streamed chat-completions chunk.
+#[derive(Debug, Clone, Deserialize)]
+struct ChatCompletionsStreamChunk {
+    /// Stream choices.
+    #[serde(default)]
+    choices: Vec<ChatCompletionsStreamChoice>,
+    /// Optional streamed usage object.
+    #[serde(default)]
+    usage: Option<ChatUsage>,
+}
+
+/// One streamed choice delta.
+#[derive(Debug, Clone, Deserialize)]
+struct ChatCompletionsStreamChoice {
+    /// Delta payload.
+    #[serde(default)]
+    delta: ChatCompletionsStreamDelta,
+    /// Finish reason, if this chunk closes the turn.
+    #[serde(default)]
+    finish_reason: Option<String>,
+}
+
+/// Streamed assistant delta payload.
+#[derive(Debug, Clone, Deserialize, Default)]
+struct ChatCompletionsStreamDelta {
+    /// Optional role.
+    #[serde(default)]
+    role: Option<String>,
+    /// Streamed text content delta.
+    #[serde(default)]
+    content: Option<String>,
+    /// Streamed tool-call fragments.
+    #[serde(default)]
+    tool_calls: Option<Vec<ChatCompletionsStreamToolCallDelta>>,
+}
+
+/// Streamed tool-call fragment.
+#[derive(Debug, Clone, Deserialize, Default)]
+struct ChatCompletionsStreamToolCallDelta {
+    /// Stable tool-call slot index.
+    #[serde(default)]
+    index: usize,
+    /// Optional tool-call id fragment.
+    #[serde(default)]
+    id: Option<String>,
+    /// Optional type discriminator.
+    #[serde(rename = "type", default)]
+    kind: Option<String>,
+    /// Function payload delta.
+    #[serde(default)]
+    function: Option<ChatCompletionsStreamFunctionDelta>,
+}
+
+/// Streamed function-call fragment.
+#[derive(Debug, Clone, Deserialize, Default)]
+struct ChatCompletionsStreamFunctionDelta {
+    /// Optional function name fragment.
+    #[serde(default)]
+    name: Option<String>,
+    /// Optional function arguments fragment.
+    #[serde(default)]
+    arguments: Option<String>,
+}
+
+/// Mutable accumulator for one streamed chat-completions response.
+#[derive(Debug, Clone, Default)]
+struct ChatCompletionsStreamAccumulator {
+    /// Assistant role if streamed explicitly.
+    role: Option<String>,
+    /// Accumulated assistant text.
+    content: String,
+    /// Incrementally reconstructed tool calls.
+    tool_calls: Vec<ChatCompletionsStreamToolCallAccumulator>,
+    /// Final finish reason, if received.
+    finish_reason: Option<String>,
+    /// Optional provider usage.
+    usage: Option<ChatUsage>,
+}
+
+impl ChatCompletionsStreamAccumulator {
+    /// Merge one streamed chunk.
+    fn apply_chunk(&mut self, chunk: ChatCompletionsStreamChunk) {
+        if chunk.usage.is_some() {
+            self.usage = chunk.usage;
+        }
+
+        for choice in chunk.choices {
+            if let Some(role) = choice.delta.role {
+                self.role = Some(role);
+            }
+
+            if let Some(text) = choice.delta.content {
+                self.content.push_str(&text);
+            }
+
+            if let Some(tool_calls) = choice.delta.tool_calls {
+                for tool_call in tool_calls {
+                    self.apply_tool_call_delta(tool_call);
+                }
+            }
+
+            if choice.finish_reason.is_some() {
+                self.finish_reason = choice.finish_reason;
+            }
+        }
+    }
+
+    /// Merge one streamed tool-call delta by index.
+    fn apply_tool_call_delta(&mut self, delta: ChatCompletionsStreamToolCallDelta) {
+        while self.tool_calls.len() <= delta.index {
+            self.tool_calls
+                .push(ChatCompletionsStreamToolCallAccumulator::default());
+        }
+
+        let slot = &mut self.tool_calls[delta.index];
+        if let Some(id) = delta.id {
+            slot.id.get_or_insert(id);
+        }
+        if let Some(kind) = delta.kind {
+            slot.kind.get_or_insert(kind);
+        }
+        if let Some(function) = delta.function {
+            if let Some(name) = function.name {
+                slot.name.get_or_insert(name);
+            }
+            if let Some(arguments) = function.arguments {
+                slot.arguments.push_str(&arguments);
+            }
+        }
+    }
+
+    /// Convert the accumulated stream state into SA's canonical response.
+    fn into_response(self) -> Result<ChatCompletionsResponse, ChatCompletionsError> {
+        let content = (!self.content.trim().is_empty()).then_some(self.content);
+        let tool_calls = self
+            .tool_calls
+            .into_iter()
+            .filter_map(ChatCompletionsStreamToolCallAccumulator::into_tool_call)
+            .collect::<Vec<_>>();
+
+        let finish_reason = self.finish_reason.or_else(|| {
+            if tool_calls.is_empty() {
+                Some("stop".to_string())
+            } else {
+                Some("tool_calls".to_string())
+            }
+        });
+
+        Ok(ChatCompletionsResponse {
+            choices: vec![ChatChoice {
+                message: ChatMessage {
+                    role: self.role.unwrap_or_else(|| "assistant".to_string()),
+                    content,
+                    tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
+                    tool_call_id: None,
+                    request_usage: None,
+                    responses_input_items: None,
+                },
+                finish_reason,
+            }],
+            usage: self.usage,
+        })
+    }
+}
+
+/// One incrementally reconstructed streamed tool call.
+#[derive(Debug, Clone, Default)]
+struct ChatCompletionsStreamToolCallAccumulator {
+    /// Tool-call id.
+    id: Option<String>,
+    /// Type discriminator.
+    kind: Option<String>,
+    /// Function name.
+    name: Option<String>,
+    /// Concatenated JSON argument string.
+    arguments: String,
+}
+
+impl ChatCompletionsStreamToolCallAccumulator {
+    /// Convert a reconstructed tool call into the canonical SA form.
+    fn into_tool_call(self) -> Option<ToolCall> {
+        let name = sanitize_id(self.name.as_deref())?;
+        Some(ToolCall {
+            id: self.id.unwrap_or_else(|| Uuid::new_v4().to_string()),
+            kind: self.kind.unwrap_or_else(|| "function".to_string()),
+            function: ToolFunctionCall {
+                name,
+                arguments: if self.arguments.is_empty() {
+                    "{}".to_string()
+                } else {
+                    self.arguments
+                },
+            },
+        })
+    }
+}
+
 /// OpenAI Responses wire request.
 #[derive(Debug, Clone, Serialize)]
 struct ResponsesRequest {
@@ -807,6 +1304,110 @@ struct ResponsesResponse {
     /// Provider-reported usage.
     #[serde(default)]
     usage: Option<ChatUsage>,
+}
+
+/// Mutable accumulator for one streamed `/responses` SSE session.
+#[derive(Debug, Clone, Default)]
+struct ResponsesStreamAccumulator {
+    /// Incremental text deltas, if the provider emits them.
+    output_text: String,
+    /// Whether at least one delta chunk has been observed.
+    saw_output_text_delta: bool,
+    /// Completed output items, when emitted individually.
+    output_items: Vec<ResponsesOutputItem>,
+    /// Terminal full response object, if the provider emitted one.
+    completed_response: Option<ResponsesResponse>,
+}
+
+impl ResponsesStreamAccumulator {
+    /// Apply one streamed event. Returning `Some` means the response is
+    /// complete and can be converted immediately.
+    fn apply_event(&mut self, event: &Value) -> Result<Option<()>, ChatCompletionsError> {
+        let event_type = event.get("type").and_then(Value::as_str);
+
+        if event_type == Some("error") {
+            let message = event
+                .get("message")
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    event
+                        .get("error")
+                        .and_then(|error| error.get("message"))
+                        .and_then(Value::as_str)
+                })
+                .or_else(|| event.get("code").and_then(Value::as_str))
+                .unwrap_or("responses stream returned an error event");
+            return Err(invalid_response(message.to_string()));
+        }
+
+        if event_type == Some("response.failed") {
+            let message = event
+                .get("response")
+                .and_then(|response| response.get("error"))
+                .and_then(|error| error.get("message"))
+                .and_then(Value::as_str)
+                .unwrap_or("responses stream reported failure");
+            return Err(invalid_response(message.to_string()));
+        }
+
+        match event_type {
+            Some("response.output_text.delta") => {
+                if let Some(delta) = event.get("delta").and_then(Value::as_str) {
+                    self.saw_output_text_delta = true;
+                    self.output_text.push_str(delta);
+                }
+                Ok(None)
+            }
+            Some("response.output_text.done") if !self.saw_output_text_delta => {
+                if let Some(text) = event.get("text").and_then(Value::as_str) {
+                    self.output_text = text.to_string();
+                }
+                Ok(None)
+            }
+            Some("response.output_item.done") => {
+                if let Some(item) = event.get("item").cloned() {
+                    if let Ok(parsed) = serde_json::from_value::<ResponsesOutputItem>(item) {
+                        self.output_items.push(parsed);
+                    }
+                }
+                Ok(None)
+            }
+            Some("response.completed") | Some("response.done") => {
+                let Some(response) = event.get("response").cloned() else {
+                    self.completed_response = Some(self.synthetic_response());
+                    return Ok(Some(()));
+                };
+
+                let mut parsed =
+                    serde_json::from_value::<ResponsesResponse>(response).map_err(|err| {
+                        invalid_response(format!(
+                            "responses completion event carried an invalid response object: {err}"
+                        ))
+                    })?;
+
+                if parsed.output_text.is_none() && !self.output_text.is_empty() {
+                    parsed.output_text = Some(self.output_text.clone());
+                }
+                if parsed.output.is_empty() && !self.output_items.is_empty() {
+                    parsed.output = self.output_items.clone();
+                }
+
+                self.completed_response = Some(parsed);
+                Ok(Some(()))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Build a best-effort synthetic response when the provider never sent an
+    /// explicit `response.completed` object.
+    fn synthetic_response(&self) -> ResponsesResponse {
+        ResponsesResponse {
+            output: self.output_items.clone(),
+            output_text: (!self.output_text.is_empty()).then(|| self.output_text.clone()),
+            usage: None,
+        }
+    }
 }
 
 /// One raw output item from the Responses API.
@@ -1093,9 +1694,11 @@ fn sanitize_id(value: Option<&str>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ChatCompletionsRequest, ChatCompletionsResponse, ChatMessage, ChatUsage, InputTokenDetails,
-        OutputTokenDetails, ResponsesInputItem, ResponsesRequest, ToolCall, ToolDefinition,
+        ChatCompletionsRequest, ChatCompletionsResponse, ChatCompletionsStreamAccumulator,
+        ChatCompletionsStreamChunk, ChatMessage, ChatUsage, InputTokenDetails, OutputTokenDetails,
+        ResponsesInputItem, ResponsesRequest, ResponsesStreamAccumulator, ToolCall, ToolDefinition,
         ToolFunctionCall, ToolFunctionDefinition, WireApi, normalize_responses_response,
+        process_sse_line,
     };
 
     #[test]
@@ -1106,6 +1709,164 @@ mod tests {
         let parsed =
             serde_json::from_str::<WireApi>(r#""responses""#).expect("responses should parse");
         assert_eq!(parsed, WireApi::Responses);
+    }
+
+    #[test]
+    fn process_sse_line_reassembles_multiline_event_data() {
+        let mut current_event = None;
+        let mut current_data = Vec::new();
+        let mut events = Vec::<(Option<String>, String)>::new();
+
+        for line in [
+            "event: message",
+            "data: {\"hello\":",
+            "data: \"world\"}",
+            "",
+        ] {
+            let maybe = process_sse_line(
+                line,
+                &mut current_event,
+                &mut current_data,
+                &mut |event, data| {
+                    events.push((event.map(str::to_string), data.to_string()));
+                    Ok(None::<()>)
+                },
+            )
+            .expect("SSE line should parse");
+            assert!(maybe.is_none());
+        }
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0.as_deref(), Some("message"));
+        assert_eq!(events[0].1, "{\"hello\":\n\"world\"}");
+    }
+
+    #[test]
+    fn chat_completions_stream_accumulator_reconstructs_tool_call_arguments() {
+        let mut acc = ChatCompletionsStreamAccumulator::default();
+
+        let first = serde_json::json!({
+            "choices": [{
+                "delta": {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "Read",
+                            "arguments": "{\"path\":"
+                        }
+                    }]
+                }
+            }]
+        });
+        let second = serde_json::json!({
+            "choices": [{
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "function": {
+                            "arguments": "\"a.txt\"}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+
+        acc.apply_chunk(
+            serde_json::from_value::<ChatCompletionsStreamChunk>(first)
+                .expect("first stream chunk should deserialize"),
+        );
+        acc.apply_chunk(
+            serde_json::from_value::<ChatCompletionsStreamChunk>(second)
+                .expect("second stream chunk should deserialize"),
+        );
+
+        let response = acc.into_response().expect("stream should normalize");
+        let choice = response.first_choice().expect("choice should exist");
+        let tool_calls = choice
+            .message
+            .tool_calls
+            .as_ref()
+            .expect("tool calls should exist");
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].function.name, "Read");
+        assert_eq!(tool_calls[0].function.arguments, "{\"path\":\"a.txt\"}");
+        assert_eq!(choice.finish_reason.as_deref(), Some("tool_calls"));
+    }
+
+    #[test]
+    fn responses_stream_accumulator_prefers_completed_response_object() {
+        let mut acc = ResponsesStreamAccumulator::default();
+        let event = serde_json::json!({
+            "type": "response.completed",
+            "response": {
+                "output": [{
+                    "type": "function_call",
+                    "call_id": "call_abc",
+                    "name": "Read",
+                    "arguments": "{\"path\":\"a.txt\"}"
+                }],
+                "usage": {
+                    "input_tokens": 12,
+                    "output_tokens": 3
+                }
+            }
+        });
+
+        acc.apply_event(&event)
+            .expect("stream event should parse")
+            .expect("completed response should terminate");
+        let normalized = normalize_responses_response(
+            acc.completed_response
+                .clone()
+                .expect("completed response should be stored"),
+        );
+        let choice = normalized.first_choice().expect("choice should exist");
+        let tool_calls = choice
+            .message
+            .tool_calls
+            .as_ref()
+            .expect("tool calls should exist");
+        assert_eq!(tool_calls[0].id, "call_abc");
+        assert_eq!(
+            normalized.usage.expect("usage should exist").input_tokens,
+            Some(12)
+        );
+    }
+
+    #[test]
+    fn responses_stream_accumulator_builds_synthetic_response_from_deltas() {
+        let mut acc = ResponsesStreamAccumulator::default();
+
+        acc.apply_event(&serde_json::json!({
+            "type": "response.output_text.delta",
+            "delta": "hello "
+        }))
+        .expect("delta should parse");
+        acc.apply_event(&serde_json::json!({
+            "type": "response.output_text.delta",
+            "delta": "world"
+        }))
+        .expect("delta should parse");
+        acc.apply_event(&serde_json::json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    { "type": "output_text", "text": "hello world" }
+                ]
+            }
+        }))
+        .expect("output item should parse");
+
+        let response = acc.synthetic_response();
+        let normalized = normalize_responses_response(response);
+        let choice = normalized.first_choice().expect("choice should exist");
+        assert_eq!(choice.message.content.as_deref(), Some("hello world"));
     }
 
     #[test]
