@@ -37,7 +37,7 @@
 
 ### 1. 真实 usage 从哪里来
 
-SA 调用的是 OpenAI 兼容的 `POST /v1/chat/completions`。
+SA 内部维护的是 chat-style 统一消息模型；实际发往供应商时可根据 `llm.wire_api` 走 `POST /v1/chat/completions` 或 `POST /v1/responses`。
 
 如果服务端返回：
 

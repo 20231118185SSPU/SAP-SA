@@ -10,6 +10,7 @@
 //!     `role: "developer"`; the config makes this adjustable.
 
 use crate::compact::CompactionConfig;
+use crate::openai::WireApi;
 use anyhow::Context as _;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -50,6 +51,19 @@ pub struct LlmConfig {
 
     /// Model name (example: `gpt-5.2`).
     pub model: String,
+
+    /// Wire protocol used when talking to the OpenAI-compatible provider.
+    ///
+    /// Supported values:
+    /// - `chat_completions`
+    /// - `responses`
+    ///
+    /// Alias spellings such as `chat-completions` and `chat` are also accepted.
+    ///
+    /// If this field is absent, SA keeps the historical default:
+    /// `chat_completions`.
+    #[serde(default)]
+    pub wire_api: Option<WireApi>,
 
     /// Role name used for the "system instructions" message.
     ///
@@ -115,6 +129,11 @@ impl LlmConfig {
             return None;
         }
         Some(trimmed)
+    }
+
+    /// Return the effective OpenAI-compatible wire protocol.
+    pub fn effective_wire_api(&self) -> WireApi {
+        self.wire_api.unwrap_or_default()
     }
 }
 
@@ -345,6 +364,7 @@ fn validate_mcp_config(config: &McpConfig) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{Config, LlmConfig, McpConfig, McpServerConfig, McpTransport, validate_mcp_config};
+    use crate::openai::WireApi;
     use std::collections::HashMap;
 
     fn sample_llm() -> LlmConfig {
@@ -352,10 +372,43 @@ mod tests {
             base_url: "https://example.com/v1".to_string(),
             api_key: "sk-test".to_string(),
             model: "gpt-5.2".to_string(),
+            wire_api: None,
             system_role_name: None,
             reasoning_effort: None,
             max_steps: 32,
         }
+    }
+
+    #[test]
+    fn effective_wire_api_defaults_to_chat_completions() {
+        let cfg = sample_llm();
+        assert_eq!(cfg.effective_wire_api(), WireApi::ChatCompletions);
+    }
+
+    #[test]
+    fn llm_wire_api_aliases_deserialize() {
+        let raw = r#"
+[llm]
+base_url = "https://example.com/v1"
+api_key = "sk-test"
+model = "gpt-5.2"
+wire_api = "chat"
+
+[server]
+bind = "127.0.0.1:8765"
+ws_path = "/ws"
+
+[workspace]
+root_dir = "."
+agents_md = "Agents.md"
+"#;
+
+        let cfg = toml::from_str::<Config>(raw).expect("wire_api alias should parse");
+        assert_eq!(cfg.llm.effective_wire_api(), WireApi::ChatCompletions);
+
+        let raw = raw.replace("wire_api = \"chat\"", "wire_api = \"responses\"");
+        let cfg = toml::from_str::<Config>(&raw).expect("responses wire_api should parse");
+        assert_eq!(cfg.llm.effective_wire_api(), WireApi::Responses);
     }
 
     #[test]

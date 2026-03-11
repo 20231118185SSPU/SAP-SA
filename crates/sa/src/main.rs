@@ -1577,7 +1577,8 @@ async fn main() -> anyhow::Result<()> {
     // IMPORTANT: compute derived string options before we move strings out of `cfg.llm`.
     let system_role_name = cfg.llm.effective_system_role_name().to_string();
     let reasoning_effort = cfg.llm.effective_reasoning_effort().map(str::to_string);
-    let llm = OpenAiClient::new(cfg.llm.base_url, cfg.llm.api_key)?;
+    let wire_api = cfg.llm.effective_wire_api();
+    let llm = OpenAiClient::with_wire_api(cfg.llm.base_url, cfg.llm.api_key, wire_api)?;
 
     // Build agent runner.
     let runner_cfg = AgentRunnerConfig {

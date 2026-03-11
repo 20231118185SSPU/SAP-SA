@@ -4,7 +4,7 @@
 
 它从 `zeroclaw` / `openclaw` / `openai-compatible tool calling` 这类思路中抽取出最核心的部分，只保留最小但可运行的一套能力：
 
-- 调用 OpenAI 兼容的 `POST /v1/chat/completions`
+- 调用 OpenAI 兼容的 `POST /v1/chat/completions` 或 `POST /v1/responses`
 - 使用内置中文框架提示词
 - 注入工作区上下文文件（如 `AGENTS.md`、`SOUL.md`、`USER.md`）
 - 加载 `SKILL.md` 形式的技能
@@ -39,6 +39,7 @@
 - `base_url`
 - `api_key`
 - `model`
+- `wire_api`
 - `system_role_name`
 - `reasoning_effort`
 - `max_steps`
@@ -54,6 +55,15 @@
 - `xhigh`
 
 如果不填写，就不会向兼容接口发送这个字段。
+
+`wire_api` 用于切换底层协议：
+
+- `chat_completions`
+  - 使用 `/v1/chat/completions`
+- `responses`
+  - 使用 `/v1/responses`
+
+如果不填写，默认使用 `chat_completions`。
 
 ### 2. 工作区上下文注入
 
@@ -209,6 +219,13 @@ copy sa.example.toml sa.toml
 - `llm.base_url`
 - `llm.api_key`
 - `llm.model`
+
+如果你的供应商只支持新版 Responses 协议，则继续配置：
+
+```toml
+[llm]
+wire_api = "responses"
+```
 
 如果你的渠道不接受 `system` 角色，只接受 `developer`，则设置：
 

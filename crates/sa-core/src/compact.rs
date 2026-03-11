@@ -1056,6 +1056,7 @@ mod tests {
             }]),
             tool_call_id: None,
             request_usage: None,
+            responses_input_items: None,
         }
     }
 

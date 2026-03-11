@@ -15,6 +15,17 @@ api_key = "sk-REPLACE_ME"
 # Example from the request: "gpt-5.2"
 model = "gpt-5.2"
 
+# Wire protocol used for the OpenAI-compatible endpoint.
+#
+# Supported values:
+# - "chat_completions"  => POST /v1/chat/completions
+# - "responses"         => POST /v1/responses
+#
+# Alias spellings like "chat-completions" and "chat" are also accepted.
+#
+# Leave it unset to keep the historical default: "chat_completions".
+# wire_api = "chat_completions"
+
 # Some providers accept `role: system`, others only accept `role: developer`.
 # This option controls the role-name we use for the "system" instructions.
 # - Empty / missing => defaults to "system"
