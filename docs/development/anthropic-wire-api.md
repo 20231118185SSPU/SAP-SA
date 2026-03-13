@@ -100,50 +100,12 @@ Anthropic `/v1/messages` 返回后，SA 会重新归一成自己的统一响应�
 
 这样主 Agent 循环、工具执行、compact 逻辑都不需要区分上游到底是 OpenAI 还是 Claude。
 
-## 流式 SSE
-
-SA 现在已经支持 Anthropic `/v1/messages` 的 SSE 流式聚合。
-
-处理策略：
-
-- 请求侧：当内部 canonical request 的 `stream = true` 时，请求体会带上 `stream = true`
-- 传输侧：使用 `Accept: text/event-stream`
-- 聚合侧：把 Anthropic SSE 事件重新组装成与非流式一致的统一响应
-- 回退侧：如果流式被网关显式拒绝，自动回退一次非流式请求
-
-当前重点覆盖的事件：
-
-- `message_start`
-- `content_block_start`
-- `content_block_delta`
-- `content_block_stop`
-- `message_delta`
-- `message_stop`
-- `ping`
-- `error`
-
-当前已经支持的 delta 类型：
-
-- `text_delta`
-- `input_json_delta`
-
-这意味着：
-
-- 普通 assistant 文本可以在流中逐步拼接
-- `tool_use` 的 JSON 参数可以从分片 `partial_json` 中重建
-- `message_delta.usage` 会并入最终 usage
-- `message_delta.stop_reason` 会映射成 SA 统一 `finish_reason`
-
-当前仍然刻意忽略：
-
-- `thinking_delta`
-- `signature_delta`
-- 其他非 SA 当前主路径所需的 block 类型
-
 ## 当前刻意保留的限制
 
 当前实现刻意保持最小可用，不一次性把 Anthropic 全协议搬进来：
 
+- 先走非流式 `/v1/messages`
+- 暂未实现 Anthropic SSE streaming 聚合
 - 暂未暴露 Anthropic thinking/budget 参数
 - 暂未实现图片 block 的正式映射
 
@@ -168,8 +130,6 @@ SA 当前实现位于：
 - `anthropic_auto_auth_uses_bearer_for_setup_tokens`
 - `anthropic_request_extracts_system_tools_and_tool_results`
 - `normalize_anthropic_response_extracts_text_and_tool_calls`
-- `anthropic_stream_accumulator_reconstructs_text_and_tool_use`
-- `anthropic_stream_accumulator_ignores_thinking_and_surfaces_errors`
 
 并且最终需要通过：
 
