@@ -517,14 +517,30 @@ impl OpenAiClient {
 
     /// Send one Anthropic-style `POST /messages` request and normalize it back
     /// into SA's canonical chat-style response model.
-    ///
-    /// Current design choice:
-    /// - SA always uses the unary `/messages` response here, even when the
-    ///   canonical request asked for streaming.
-    /// - This keeps Claude-compatible support small and robust first.
-    /// - If later needed, Anthropic SSE can be added without changing the
-    ///   higher-level agent loop because the normalization boundary stays here.
     async fn send_anthropic_messages_request(
+        &self,
+        req: &ChatCompletionsRequest,
+    ) -> Result<ChatCompletionsResponse, ChatCompletionsError> {
+        if req.stream.unwrap_or(false) {
+            match self.send_anthropic_messages_streaming_request(req).await {
+                Ok(response) => return Ok(response),
+                Err(error) if should_fallback_from_streaming(&error) => {
+                    let mut fallback_req = req.clone();
+                    fallback_req.stream = Some(false);
+                    return self
+                        .send_anthropic_messages_non_streaming_request(&fallback_req)
+                        .await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        self.send_anthropic_messages_non_streaming_request(req)
+            .await
+    }
+
+    /// Send one non-streaming Anthropic `POST /messages` request.
+    async fn send_anthropic_messages_non_streaming_request(
         &self,
         req: &ChatCompletionsRequest,
     ) -> Result<ChatCompletionsResponse, ChatCompletionsError> {
@@ -555,6 +571,49 @@ impl OpenAiClient {
             .map_err(ChatCompletionsError::Transport)?;
 
         Ok(normalize_anthropic_messages_response(wire_response))
+    }
+
+    /// Send one streaming Anthropic `POST /messages` request and aggregate the
+    /// SSE event stream into SA's canonical response model.
+    async fn send_anthropic_messages_streaming_request(
+        &self,
+        req: &ChatCompletionsRequest,
+    ) -> Result<ChatCompletionsResponse, ChatCompletionsError> {
+        let url = self.anthropic_messages_url();
+        let wire_request = AnthropicMessagesRequest::from_chat_request(req).with_stream(true);
+
+        let resp = self
+            .apply_auth_headers(self.http.post(url))
+            .header("anthropic-version", "2023-06-01")
+            .header("Accept", "text/event-stream")
+            .json(&wire_request)
+            .send()
+            .await
+            .map_err(ChatCompletionsError::Transport)?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp
+                .text()
+                .await
+                .unwrap_or_else(|_| "<failed to read body>".to_string());
+            let body = truncate_error_body(body);
+            return Err(ChatCompletionsError::Http { status, body });
+        }
+
+        let mut accumulator = AnthropicStreamAccumulator::default();
+        self.read_sse_response(resp, |_, data| {
+            let event = serde_json::from_str::<AnthropicStreamEvent>(data).map_err(|err| {
+                invalid_response(format!(
+                    "anthropic stream event is not valid JSON: {err}; body={}",
+                    summarize_stream_payload(data)
+                ))
+            })?;
+            accumulator.apply_event(event)
+        })
+        .await?;
+
+        accumulator.into_response()
     }
 
     /// Read one SSE response until the supplied handler returns a value.
@@ -1324,6 +1383,9 @@ struct AnthropicMessagesRequest {
     /// Optional native tool definitions.
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<AnthropicToolDefinition>>,
+    /// Anthropic SSE toggle.
+    #[serde(skip_serializing_if = "is_false")]
+    stream: bool,
 }
 
 impl AnthropicMessagesRequest {
@@ -1344,7 +1406,14 @@ impl AnthropicMessagesRequest {
             system,
             messages,
             tools,
+            stream: req.stream.unwrap_or(false),
         }
+    }
+
+    /// Return a copy with an explicit streaming flag.
+    fn with_stream(mut self, stream: bool) -> Self {
+        self.stream = stream;
+        self
     }
 }
 
@@ -1428,6 +1497,295 @@ struct AnthropicMessagesResponse {
     /// Provider-reported usage.
     #[serde(default)]
     usage: Option<ChatUsage>,
+}
+
+/// Anthropic SSE event.
+#[derive(Debug, Clone, Deserialize)]
+struct AnthropicStreamEvent {
+    /// Event discriminator embedded in the JSON payload.
+    #[serde(rename = "type")]
+    kind: String,
+    /// Optional error payload.
+    #[serde(default)]
+    error: Option<AnthropicStreamError>,
+    /// Message payload for `message_start`.
+    #[serde(default)]
+    message: Option<AnthropicStreamMessage>,
+    /// Content block payload for `content_block_start`.
+    #[serde(default)]
+    content_block: Option<AnthropicContentIn>,
+    /// Delta payload for `content_block_delta`.
+    #[serde(default)]
+    delta: Option<AnthropicStreamDelta>,
+    /// Content block index for block-scoped events.
+    #[serde(default)]
+    index: Option<usize>,
+    /// Incremental usage payload, usually from `message_delta`.
+    #[serde(default)]
+    usage: Option<ChatUsage>,
+}
+
+/// Anthropic SSE error payload.
+#[derive(Debug, Clone, Deserialize)]
+struct AnthropicStreamError {
+    /// Human-readable error message.
+    #[serde(default)]
+    message: Option<String>,
+}
+
+/// Anthropic SSE `message_start.message` payload.
+#[derive(Debug, Clone, Deserialize)]
+struct AnthropicStreamMessage {
+    /// Optional initial message usage.
+    #[serde(default)]
+    usage: Option<ChatUsage>,
+}
+
+/// Anthropic SSE delta payload.
+#[derive(Debug, Clone, Deserialize)]
+struct AnthropicStreamDelta {
+    /// Delta discriminator.
+    #[serde(rename = "type", default)]
+    kind: Option<String>,
+    /// Text fragment for `text_delta`.
+    #[serde(default)]
+    text: Option<String>,
+    /// Partial JSON fragment for `input_json_delta`.
+    #[serde(default)]
+    partial_json: Option<String>,
+    /// Stop reason carried by `message_delta`.
+    #[serde(default)]
+    stop_reason: Option<String>,
+}
+
+/// Mutable accumulator for one streamed Anthropic `/messages` session.
+#[derive(Debug, Clone, Default)]
+struct AnthropicStreamAccumulator {
+    /// In-progress content blocks keyed by Anthropic block index.
+    blocks: Vec<AnthropicStreamContentBlock>,
+    /// Latest provider usage snapshot.
+    usage: Option<ChatUsage>,
+    /// Latest provider-native stop reason.
+    stop_reason: Option<String>,
+}
+
+impl AnthropicStreamAccumulator {
+    /// Apply one Anthropic SSE event.
+    fn apply_event(
+        &mut self,
+        event: AnthropicStreamEvent,
+    ) -> Result<Option<()>, ChatCompletionsError> {
+        match event.kind.as_str() {
+            "error" => {
+                let message = event
+                    .error
+                    .as_ref()
+                    .and_then(|error| error.message.as_deref())
+                    .filter(|message| !message.trim().is_empty())
+                    .unwrap_or("anthropic stream returned an error event");
+                Err(invalid_response(message.to_string()))
+            }
+            "message_start" => {
+                if let Some(usage) = event.message.and_then(|message| message.usage) {
+                    self.merge_usage(usage);
+                }
+                Ok(None)
+            }
+            "content_block_start" => {
+                let index = event.index.unwrap_or(0);
+                let block = event.content_block.unwrap_or(AnthropicContentIn {
+                    kind: "text".to_string(),
+                    text: None,
+                    id: None,
+                    name: None,
+                    input: None,
+                });
+                self.start_block(index, block);
+                Ok(None)
+            }
+            "content_block_delta" => {
+                let index = event.index.unwrap_or(0);
+                if let Some(delta) = event.delta {
+                    self.apply_block_delta(index, delta);
+                }
+                Ok(None)
+            }
+            "message_delta" => {
+                if let Some(delta) = event.delta
+                    && let Some(stop_reason) = delta.stop_reason
+                {
+                    self.stop_reason = Some(stop_reason);
+                }
+                if let Some(usage) = event.usage {
+                    self.merge_usage(usage);
+                }
+                Ok(None)
+            }
+            "message_stop" => Ok(Some(())),
+            "content_block_stop" | "ping" => Ok(None),
+            _ => Ok(None),
+        }
+    }
+
+    /// Insert or replace one starting content block at the given index.
+    fn start_block(&mut self, index: usize, block: AnthropicContentIn) {
+        while self.blocks.len() <= index {
+            self.blocks.push(AnthropicStreamContentBlock::Other);
+        }
+
+        self.blocks[index] = match block.kind.as_str() {
+            "text" => AnthropicStreamContentBlock::Text {
+                text: block.text.unwrap_or_default(),
+            },
+            "tool_use" => AnthropicStreamContentBlock::ToolUse {
+                id: block.id,
+                name: block.name,
+                initial_input: block.input,
+                input_json: String::new(),
+            },
+            _ => AnthropicStreamContentBlock::Other,
+        };
+    }
+
+    /// Apply one block-scoped delta.
+    fn apply_block_delta(&mut self, index: usize, delta: AnthropicStreamDelta) {
+        let Some(block) = self.blocks.get_mut(index) else {
+            return;
+        };
+
+        match (block, delta.kind.as_deref()) {
+            (AnthropicStreamContentBlock::Text { text }, Some("text_delta")) => {
+                if let Some(delta_text) = delta.text {
+                    text.push_str(&delta_text);
+                }
+            }
+            (AnthropicStreamContentBlock::ToolUse { input_json, .. }, Some("input_json_delta")) => {
+                if let Some(partial_json) = delta.partial_json {
+                    input_json.push_str(&partial_json);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Merge a new provider usage snapshot into the current one.
+    fn merge_usage(&mut self, incoming: ChatUsage) {
+        let usage = self.usage.get_or_insert_default();
+        usage.input_tokens = incoming.input_tokens.or(usage.input_tokens);
+        usage.output_tokens = incoming.output_tokens.or(usage.output_tokens);
+        usage.total_tokens = incoming.total_tokens.or(usage.total_tokens);
+        usage.prompt_tokens_details = incoming
+            .prompt_tokens_details
+            .or(usage.prompt_tokens_details.take());
+        usage.input_tokens_details = incoming
+            .input_tokens_details
+            .or(usage.input_tokens_details.take());
+        usage.cache_read_input_tokens = incoming
+            .cache_read_input_tokens
+            .or(usage.cache_read_input_tokens);
+        usage.cache_creation_input_tokens = incoming
+            .cache_creation_input_tokens
+            .or(usage.cache_creation_input_tokens);
+        usage.completion_tokens_details = incoming
+            .completion_tokens_details
+            .or(usage.completion_tokens_details.take());
+        usage.output_tokens_details = incoming
+            .output_tokens_details
+            .or(usage.output_tokens_details.take());
+    }
+
+    /// Convert the accumulated stream state into SA's canonical response.
+    fn into_response(self) -> Result<ChatCompletionsResponse, ChatCompletionsError> {
+        let mut content = Vec::<AnthropicContentIn>::new();
+
+        for block in self.blocks {
+            match block.into_content_block()? {
+                Some(block) => content.push(block),
+                None => {}
+            }
+        }
+
+        Ok(normalize_anthropic_messages_response(
+            AnthropicMessagesResponse {
+                content,
+                stop_reason: self.stop_reason,
+                usage: self.usage,
+            },
+        ))
+    }
+}
+
+/// One in-progress Anthropic streamed content block.
+#[derive(Debug, Clone)]
+enum AnthropicStreamContentBlock {
+    /// Text block being accumulated via `text_delta`.
+    Text {
+        /// Aggregated text payload.
+        text: String,
+    },
+    /// Tool-use block being accumulated via `input_json_delta`.
+    ToolUse {
+        /// Provider tool-use id.
+        id: Option<String>,
+        /// Tool name.
+        name: Option<String>,
+        /// Optional initial full input object from `content_block_start`.
+        initial_input: Option<Value>,
+        /// Incremental JSON fragments from later deltas.
+        input_json: String,
+    },
+    /// Unknown or intentionally ignored block kind (thinking, redacted thinking, etc.).
+    Other,
+}
+
+impl AnthropicStreamContentBlock {
+    /// Finalize one in-progress block into the normal unary Anthropic content
+    /// shape reused by SA's normalization layer.
+    fn into_content_block(self) -> Result<Option<AnthropicContentIn>, ChatCompletionsError> {
+        match self {
+            AnthropicStreamContentBlock::Text { text } => {
+                if non_empty_text(Some(&text)).is_none() {
+                    return Ok(None);
+                }
+                Ok(Some(AnthropicContentIn {
+                    kind: "text".to_string(),
+                    text: Some(text),
+                    id: None,
+                    name: None,
+                    input: None,
+                }))
+            }
+            AnthropicStreamContentBlock::ToolUse {
+                id,
+                name,
+                initial_input,
+                input_json,
+            } => {
+                let Some(name) = sanitize_id(name.as_deref()) else {
+                    return Ok(None);
+                };
+                let input = if input_json.trim().is_empty() {
+                    initial_input.unwrap_or_else(|| Value::Object(serde_json::Map::new()))
+                } else {
+                    serde_json::from_str::<Value>(&input_json).map_err(|err| {
+                        invalid_response(format!(
+                            "anthropic tool_use input_json_delta is not valid JSON: {err}; body={}",
+                            summarize_stream_payload(&input_json)
+                        ))
+                    })?
+                };
+
+                Ok(Some(AnthropicContentIn {
+                    kind: "tool_use".to_string(),
+                    text: None,
+                    id,
+                    name: Some(name),
+                    input: Some(input),
+                }))
+            }
+            AnthropicStreamContentBlock::Other => Ok(None),
+        }
+    }
 }
 
 /// Inbound Anthropic content block.
@@ -2590,6 +2948,11 @@ fn sanitize_id(value: Option<&str>) -> Option<String> {
     non_empty_text(value).map(str::to_string)
 }
 
+/// Helper for `serde(skip_serializing_if = ...)` on boolean flags.
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// `Reasoning.content` is optional; when present but empty it should still be
 /// omitted so the replayed item stays compact.
 fn responses_reasoning_content_is_empty(
@@ -2650,13 +3013,13 @@ fn merge_responses_output_items(
 #[cfg(test)]
 mod tests {
     use super::{
-        AnthropicMessagesRequest, AuthStyle, ChatCompletionsRequest, ChatCompletionsResponse,
-        ChatCompletionsStreamAccumulator, ChatCompletionsStreamChunk, ChatMessage, ChatUsage,
-        InputTokenDetails, OutputTokenDetails, ResponsesFunctionCallOutputContentItem,
-        ResponsesInputItem, ResponsesReasoningContentItem, ResponsesReasoningSummaryItem,
-        ResponsesRequest, ResponsesStreamAccumulator, ToolCall, ToolDefinition, ToolFunctionCall,
-        ToolFunctionDefinition, WireApi, build_auth_headers, normalize_anthropic_messages_response,
-        normalize_responses_response, process_sse_line,
+        AnthropicMessagesRequest, AnthropicStreamAccumulator, AnthropicStreamEvent, AuthStyle,
+        ChatCompletionsRequest, ChatCompletionsResponse, ChatCompletionsStreamAccumulator,
+        ChatCompletionsStreamChunk, ChatMessage, ChatUsage, InputTokenDetails, OutputTokenDetails,
+        ResponsesFunctionCallOutputContentItem, ResponsesInputItem, ResponsesReasoningContentItem,
+        ResponsesReasoningSummaryItem, ResponsesRequest, ResponsesStreamAccumulator, ToolCall,
+        ToolDefinition, ToolFunctionCall, ToolFunctionDefinition, WireApi, build_auth_headers,
+        normalize_anthropic_messages_response, normalize_responses_response, process_sse_line,
     };
 
     #[test]
@@ -2961,6 +3324,128 @@ mod tests {
         assert_eq!(tool_calls[0].function.name, "Read");
         assert_eq!(usage.cache_write_tokens(), 10);
         assert_eq!(choice.finish_reason.as_deref(), Some("tool_calls"));
+    }
+
+    #[test]
+    fn anthropic_stream_accumulator_reconstructs_text_and_tool_use() {
+        let mut acc = AnthropicStreamAccumulator::default();
+
+        for raw in [
+            serde_json::json!({
+                "type": "message_start",
+                "message": {
+                    "usage": {
+                        "input_tokens": 120,
+                        "cache_creation_input_tokens": 7
+                    }
+                }
+            }),
+            serde_json::json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {
+                    "type": "text",
+                    "text": ""
+                }
+            }),
+            serde_json::json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {
+                    "type": "text_delta",
+                    "text": "先"
+                }
+            }),
+            serde_json::json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {
+                    "type": "text_delta",
+                    "text": "读文件"
+                }
+            }),
+            serde_json::json!({
+                "type": "content_block_start",
+                "index": 1,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": "tool_1",
+                    "name": "Read",
+                    "input": {}
+                }
+            }),
+            serde_json::json!({
+                "type": "content_block_delta",
+                "index": 1,
+                "delta": {
+                    "type": "input_json_delta",
+                    "partial_json": "{\"path\":\"sa.toml\"}"
+                }
+            }),
+            serde_json::json!({
+                "type": "message_delta",
+                "delta": {
+                    "stop_reason": "tool_use"
+                },
+                "usage": {
+                    "output_tokens": 20
+                }
+            }),
+            serde_json::json!({
+                "type": "message_stop"
+            }),
+        ] {
+            let event = serde_json::from_value::<AnthropicStreamEvent>(raw)
+                .expect("anthropic stream event should deserialize");
+            let _ = acc.apply_event(event).expect("event should parse");
+        }
+
+        let normalized = acc.into_response().expect("stream should normalize");
+        let usage = normalized.usage.clone().expect("usage should exist");
+        let choice = normalized.first_choice().expect("choice should exist");
+        assert_eq!(choice.message.content.as_deref(), Some("先读文件"));
+        let tool_calls = choice
+            .message
+            .tool_calls
+            .as_ref()
+            .expect("tool calls should exist");
+        assert_eq!(tool_calls[0].id, "tool_1");
+        assert_eq!(tool_calls[0].function.name, "Read");
+        assert_eq!(tool_calls[0].function.arguments, "{\"path\":\"sa.toml\"}");
+        assert_eq!(usage.input_tokens, Some(120));
+        assert_eq!(usage.output_tokens, Some(20));
+        assert_eq!(usage.cache_write_tokens(), 7);
+        assert_eq!(choice.finish_reason.as_deref(), Some("tool_calls"));
+    }
+
+    #[test]
+    fn anthropic_stream_accumulator_ignores_thinking_and_surfaces_errors() {
+        let mut acc = AnthropicStreamAccumulator::default();
+        let thinking = serde_json::from_value::<AnthropicStreamEvent>(serde_json::json!({
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {
+                "type": "thinking",
+                "text": "internal"
+            }
+        }))
+        .expect("thinking event should deserialize");
+        assert!(
+            acc.apply_event(thinking)
+                .expect("thinking block should be ignored")
+                .is_none()
+        );
+
+        let error = serde_json::from_value::<AnthropicStreamEvent>(serde_json::json!({
+            "type": "error",
+            "error": {
+                "message": "rate limited"
+            }
+        }))
+        .expect("error event should deserialize");
+
+        let err = acc.apply_event(error).expect_err("error event should fail");
+        assert!(err.to_string().contains("rate limited"));
     }
 
     #[test]

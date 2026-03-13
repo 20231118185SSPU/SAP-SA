@@ -93,7 +93,8 @@
 当前补充说明：
 
 - OpenAI `chat_completions` / `responses` 路径会优先尝试流式请求
-- Anthropic `anthropic_messages` 路径当前先走稳定的非流式 `/v1/messages`
+- Anthropic `anthropic_messages` 路径现在也支持流式 SSE 聚合
+- 如果 Claude-compatible 网关拒绝流式，SA 会自动退回一次非流式 `/v1/messages`
 - 这样做的目的是直接对接 Claude-compatible 协议，而不是继续依赖某些网关把 OpenAI 请求“转换”为 Claude 请求
 
 ### 2. 工作区上下文注入
