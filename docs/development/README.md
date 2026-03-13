@@ -11,6 +11,7 @@
 
 专题文档：
 
+- `anthropic-wire-api.md`：`/v1/messages` 兼容层如何对齐 Anthropic/Claude 协议
 - `token-accounting.md`：SA 当前的 token 统计、usage 回填与 compact 估算策略
 - `responses-wire-api.md`：`/v1/responses` 兼容层如何对齐 `codex` 官方实现
 - `ws-handshake.md`：前后端双向握手与协议身份校验
@@ -168,6 +169,7 @@ cargo build --release
 这套最小后端实现虽然做了大量裁剪，但设计来源仍可追溯到已有实现：
 
 - OpenAI 兼容接口调用：`../zeroclaw/src/providers/compatible.rs`
+- Anthropic `/v1/messages` 调用：`../zeroclaw/src/providers/anthropic.rs`
 - Agent 工具循环：`../zeroclaw/src/agent/loop_.rs`
 - MCP 参考实现：`../zeroclaw` 中 MCP 相关模块
 - 记忆装载方式：参考 `../openclaw` 的注入策略并做适配

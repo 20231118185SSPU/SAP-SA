@@ -1578,7 +1578,13 @@ async fn main() -> anyhow::Result<()> {
     let system_role_name = cfg.llm.effective_system_role_name().to_string();
     let reasoning_effort = cfg.llm.effective_reasoning_effort().map(str::to_string);
     let wire_api = cfg.llm.effective_wire_api();
-    let llm = OpenAiClient::with_wire_api(cfg.llm.base_url, cfg.llm.api_key, wire_api)?;
+    let auth_style = cfg.llm.effective_auth_style(wire_api);
+    let llm = OpenAiClient::with_wire_api_and_auth_style(
+        cfg.llm.base_url,
+        cfg.llm.api_key,
+        wire_api,
+        auth_style,
+    )?;
 
     // Build agent runner.
     let runner_cfg = AgentRunnerConfig {

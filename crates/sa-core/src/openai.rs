@@ -1,12 +1,13 @@
-//! OpenAI-compatible client used by SA.
+//! OpenAI/Anthropic-compatible client used by SA.
 //!
 //! SA keeps one canonical internal request/response model based on chat-style
 //! messages and tool calls, then maps that model to the configured wire API:
 //! - `chat_completions` => `POST /v1/chat/completions`
 //! - `responses` => `POST /v1/responses`
+//! - `anthropic_messages` => `POST /v1/messages`
 //!
 //! This keeps the agent loop and compaction logic stable while still allowing
-//! compatibility with providers that expose only the newer Responses endpoint.
+//! compatibility with providers that expose different upstream wire formats.
 
 use anyhow::Context as _;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
@@ -33,6 +34,48 @@ pub enum WireApi {
     /// Newer `POST /v1/responses`.
     #[serde(rename = "responses", alias = "response")]
     Responses,
+
+    /// Anthropic-style `POST /v1/messages`.
+    ///
+    /// Alias values such as `anthropic` and `claude` are accepted because the
+    /// user-facing need is usually "talk to a Claude-compatible endpoint"
+    /// rather than "I specifically know the endpoint is `/v1/messages`".
+    #[serde(
+        rename = "anthropic_messages",
+        alias = "anthropic-messages",
+        alias = "anthropic",
+        alias = "claude"
+    )]
+    AnthropicMessages,
+}
+
+/// Authentication style used when sending requests to the configured provider.
+///
+/// Why make this explicit?
+/// - OpenAI-style gateways normally expect `Authorization: Bearer ...`
+/// - Anthropic-style gateways normally expect `x-api-key: ...`
+/// - Anthropic setup-token / OAuth flows instead expect `Authorization`
+/// - some vendors proxy Anthropic but keep Anthropic auth semantics
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum AuthStyle {
+    /// `Authorization: Bearer <token>`
+    #[default]
+    #[serde(rename = "bearer", alias = "authorization")]
+    Bearer,
+
+    /// `x-api-key: <token>`
+    #[serde(rename = "x_api_key", alias = "x-api-key", alias = "api-key")]
+    XApiKey,
+
+    /// Anthropic-compatible auto detection:
+    /// - setup/OAuth tokens => `Authorization: Bearer ...` + `anthropic-beta`
+    /// - normal API keys => `x-api-key: ...`
+    #[serde(
+        rename = "anthropic_auto",
+        alias = "anthropic-auto",
+        alias = "anthropic"
+    )]
+    AnthropicAuto,
 }
 
 /// Error returned by [`OpenAiClient::chat_completions`].
@@ -109,13 +152,20 @@ pub struct OpenAiClient {
     base_url: String,
     /// Selected wire protocol.
     wire_api: WireApi,
+    /// Authentication headers cloned onto each request.
+    auth_headers: HeaderMap,
 }
 
 impl OpenAiClient {
     /// Create a new client using the historical default wire protocol:
     /// Chat Completions.
     pub fn new(base_url: String, api_key: String) -> anyhow::Result<Self> {
-        Self::with_wire_api(base_url, api_key, WireApi::ChatCompletions)
+        Self::with_wire_api_and_auth_style(
+            base_url,
+            api_key,
+            WireApi::ChatCompletions,
+            AuthStyle::Bearer,
+        )
     }
 
     /// Create a new client with an explicit wire protocol.
@@ -124,30 +174,42 @@ impl OpenAiClient {
         api_key: String,
         wire_api: WireApi,
     ) -> anyhow::Result<Self> {
+        let auth_style = match wire_api {
+            WireApi::AnthropicMessages => AuthStyle::AnthropicAuto,
+            WireApi::ChatCompletions | WireApi::Responses => AuthStyle::Bearer,
+        };
+
+        Self::with_wire_api_and_auth_style(base_url, api_key, wire_api, auth_style)
+    }
+
+    /// Create a new client with both explicit wire protocol and explicit
+    /// authentication style.
+    pub fn with_wire_api_and_auth_style(
+        base_url: String,
+        api_key: String,
+        wire_api: WireApi,
+        auth_style: AuthStyle,
+    ) -> anyhow::Result<Self> {
         // Normalize base URL by trimming trailing slashes. This avoids double
         // slashes when we append endpoint suffixes.
         let base_url = base_url.trim_end_matches('/').to_string();
 
-        // Build default headers.
+        // Build default content headers. Authorization-style headers are kept
+        // separately because different protocols need different auth schemes.
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-
-        // Note: we do not log the API key. We also avoid embedding it into errors.
-        let bearer = format!("Bearer {api_key}");
-        headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&bearer).context("Invalid API key for Authorization header")?,
-        );
 
         let http = reqwest::Client::builder()
             .default_headers(headers)
             .build()
             .context("Failed to build HTTP client")?;
+        let auth_headers = build_auth_headers(&api_key, auth_style)?;
 
         Ok(Self {
             http,
             base_url,
             wire_api,
+            auth_headers,
         })
     }
 
@@ -184,6 +246,29 @@ impl OpenAiClient {
         }
     }
 
+    /// Compute the Anthropic-style `messages` URL.
+    fn anthropic_messages_url(&self) -> String {
+        if self.path_ends_with("/messages") {
+            return self.base_url.clone();
+        }
+
+        let normalized_base = self.base_url.trim_end_matches('/');
+
+        if let Some(prefix) = normalized_base.strip_suffix("/chat/completions") {
+            return format!("{prefix}/messages");
+        }
+
+        if let Some(prefix) = normalized_base.strip_suffix("/responses") {
+            return format!("{prefix}/messages");
+        }
+
+        if self.has_explicit_api_path() {
+            format!("{normalized_base}/messages")
+        } else {
+            format!("{normalized_base}/v1/messages")
+        }
+    }
+
     /// Return whether the configured base URL already ends with one exact suffix.
     fn path_ends_with(&self, suffix: &str) -> bool {
         if let Ok(url) = reqwest::Url::parse(&self.base_url) {
@@ -211,7 +296,13 @@ impl OpenAiClient {
         match self.wire_api {
             WireApi::ChatCompletions => self.send_chat_completions_request(req).await,
             WireApi::Responses => self.send_responses_request(req).await,
+            WireApi::AnthropicMessages => self.send_anthropic_messages_request(req).await,
         }
+    }
+
+    /// Apply the configured authentication headers to one outgoing request.
+    fn apply_auth_headers(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        request.headers(self.auth_headers.clone())
     }
 
     /// Send a classic `POST /chat/completions` request.
@@ -245,8 +336,7 @@ impl OpenAiClient {
 
         // Send request.
         let resp = self
-            .http
-            .post(url)
+            .apply_auth_headers(self.http.post(url))
             .json(req)
             .send()
             .await
@@ -281,8 +371,7 @@ impl OpenAiClient {
     ) -> Result<ChatCompletionsResponse, ChatCompletionsError> {
         let url = self.chat_completions_url();
         let resp = self
-            .http
-            .post(url)
+            .apply_auth_headers(self.http.post(url))
             .header("Accept", "text/event-stream")
             .json(req)
             .send()
@@ -356,8 +445,7 @@ impl OpenAiClient {
         let wire_request = ResponsesRequest::from_chat_request(req);
 
         let resp = self
-            .http
-            .post(url)
+            .apply_auth_headers(self.http.post(url))
             .json(&wire_request)
             .send()
             .await
@@ -391,8 +479,7 @@ impl OpenAiClient {
         let wire_request = ResponsesRequest::from_chat_request(req);
 
         let resp = self
-            .http
-            .post(url)
+            .apply_auth_headers(self.http.post(url))
             .header("Accept", "text/event-stream")
             .json(&wire_request)
             .send()
@@ -426,6 +513,48 @@ impl OpenAiClient {
             .clone()
             .unwrap_or_else(|| accumulator.synthetic_response());
         Ok(normalize_responses_response(response))
+    }
+
+    /// Send one Anthropic-style `POST /messages` request and normalize it back
+    /// into SA's canonical chat-style response model.
+    ///
+    /// Current design choice:
+    /// - SA always uses the unary `/messages` response here, even when the
+    ///   canonical request asked for streaming.
+    /// - This keeps Claude-compatible support small and robust first.
+    /// - If later needed, Anthropic SSE can be added without changing the
+    ///   higher-level agent loop because the normalization boundary stays here.
+    async fn send_anthropic_messages_request(
+        &self,
+        req: &ChatCompletionsRequest,
+    ) -> Result<ChatCompletionsResponse, ChatCompletionsError> {
+        let url = self.anthropic_messages_url();
+        let wire_request = AnthropicMessagesRequest::from_chat_request(req);
+
+        let resp = self
+            .apply_auth_headers(self.http.post(url))
+            .header("anthropic-version", "2023-06-01")
+            .json(&wire_request)
+            .send()
+            .await
+            .map_err(ChatCompletionsError::Transport)?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp
+                .text()
+                .await
+                .unwrap_or_else(|_| "<failed to read body>".to_string());
+            let body = truncate_error_body(body);
+            return Err(ChatCompletionsError::Http { status, body });
+        }
+
+        let wire_response = resp
+            .json::<AnthropicMessagesResponse>()
+            .await
+            .map_err(ChatCompletionsError::Transport)?;
+
+        Ok(normalize_anthropic_messages_response(wire_response))
     }
 
     /// Read one SSE response until the supplied handler returns a value.
@@ -483,6 +612,77 @@ impl OpenAiClient {
             "stream ended before a terminal completion event arrived".to_string(),
         ))
     }
+}
+
+/// Build the authentication headers that should be attached to every request
+/// made by this client.
+fn build_auth_headers(api_key: &str, auth_style: AuthStyle) -> anyhow::Result<HeaderMap> {
+    let mut headers = HeaderMap::new();
+    let api_key = api_key.trim();
+
+    match auth_style {
+        AuthStyle::Bearer => {
+            let bearer = format!("Bearer {api_key}");
+            headers.insert(
+                AUTHORIZATION,
+                HeaderValue::from_str(&bearer)
+                    .context("Invalid API key for Authorization header")?,
+            );
+        }
+        AuthStyle::XApiKey => {
+            headers.insert(
+                "x-api-key",
+                HeaderValue::from_str(api_key).context("Invalid API key for x-api-key header")?,
+            );
+        }
+        AuthStyle::AnthropicAuto => match detect_anthropic_auth_kind(api_key) {
+            AnthropicResolvedAuthKind::ApiKey => {
+                headers.insert(
+                    "x-api-key",
+                    HeaderValue::from_str(api_key)
+                        .context("Invalid API key for x-api-key header")?,
+                );
+            }
+            AnthropicResolvedAuthKind::Authorization => {
+                let bearer = format!("Bearer {api_key}");
+                headers.insert(
+                    AUTHORIZATION,
+                    HeaderValue::from_str(&bearer)
+                        .context("Invalid API key for Authorization header")?,
+                );
+                headers.insert(
+                    "anthropic-beta",
+                    HeaderValue::from_static("oauth-2025-04-20"),
+                );
+            }
+        },
+    }
+
+    Ok(headers)
+}
+
+/// Resolved authentication style used for Anthropic-compatible endpoints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnthropicResolvedAuthKind {
+    /// `x-api-key: ...`
+    ApiKey,
+    /// `Authorization: Bearer ...`
+    Authorization,
+}
+
+/// Best-effort detection for Anthropic authentication style.
+///
+/// This intentionally mirrors the mature logic already used in `zeroclaw`:
+/// - setup/OAuth tokens often look JWT-like or use Anthropic setup prefixes
+/// - regular Anthropic platform keys should go via `x-api-key`
+fn detect_anthropic_auth_kind(token: &str) -> AnthropicResolvedAuthKind {
+    let trimmed = token.trim();
+
+    if trimmed.starts_with("sk-ant-oat01-") || trimmed.matches('.').count() >= 2 {
+        return AnthropicResolvedAuthKind::Authorization;
+    }
+
+    AnthropicResolvedAuthKind::ApiKey
 }
 
 /// Truncate a response body that is going to be included in an error.
@@ -617,6 +817,7 @@ pub struct ChatCompletionsRequest {
     /// Mapping by wire protocol:
     /// - Chat Completions => `max_tokens`
     /// - Responses => `max_output_tokens`
+    /// - Anthropic Messages => `max_tokens`
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
 
@@ -625,6 +826,7 @@ pub struct ChatCompletionsRequest {
     /// Mapping by wire protocol:
     /// - Chat Completions => top-level `reasoning_effort`
     /// - Responses => top-level `reasoning: { effort }`
+    /// - Anthropic Messages => currently ignored
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
 
@@ -1100,6 +1302,306 @@ impl ChatCompletionsStreamToolCallAccumulator {
                 },
             },
         })
+    }
+}
+
+/// Conservative default `max_tokens` for Anthropic `/messages` when SA did not
+/// set an explicit completion budget.
+const DEFAULT_ANTHROPIC_MAX_TOKENS: u32 = 4_096;
+
+/// Anthropic `/messages` request body.
+#[derive(Debug, Clone, Serialize)]
+struct AnthropicMessagesRequest {
+    /// Model identifier.
+    model: String,
+    /// Completion budget.
+    max_tokens: u32,
+    /// Top-level system/developer instructions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    system: Option<String>,
+    /// Conversation history.
+    messages: Vec<AnthropicMessage>,
+    /// Optional native tool definitions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<AnthropicToolDefinition>>,
+}
+
+impl AnthropicMessagesRequest {
+    /// Convert SA's canonical request into Anthropic `/messages`.
+    fn from_chat_request(req: &ChatCompletionsRequest) -> Self {
+        let (system, messages) = convert_messages_to_anthropic(&req.messages);
+        let tools = req.tools.as_ref().and_then(|tools| {
+            let native = tools
+                .iter()
+                .map(AnthropicToolDefinition::from_tool_definition)
+                .collect::<Vec<_>>();
+            (!native.is_empty()).then_some(native)
+        });
+
+        Self {
+            model: req.model.clone(),
+            max_tokens: req.max_tokens.unwrap_or(DEFAULT_ANTHROPIC_MAX_TOKENS),
+            system,
+            messages,
+            tools,
+        }
+    }
+}
+
+/// Anthropic conversation message.
+#[derive(Debug, Clone, Serialize)]
+struct AnthropicMessage {
+    /// Anthropic role (`user` or `assistant`).
+    role: String,
+    /// Structured content blocks.
+    content: Vec<AnthropicContentOut>,
+}
+
+impl AnthropicMessage {
+    /// Build a simple text-only user message.
+    fn user_text(text: String) -> Self {
+        Self {
+            role: "user".to_string(),
+            content: vec![AnthropicContentOut::Text { text }],
+        }
+    }
+}
+
+/// Outbound Anthropic content block.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type")]
+enum AnthropicContentOut {
+    /// Plain text block.
+    #[serde(rename = "text")]
+    Text { text: String },
+    /// Assistant-native tool-use block.
+    #[serde(rename = "tool_use")]
+    ToolUse {
+        /// Provider-stable tool-use id.
+        id: String,
+        /// Tool name.
+        name: String,
+        /// JSON arguments object.
+        input: Value,
+    },
+    /// User-side tool-result block answering one previous `tool_use`.
+    #[serde(rename = "tool_result")]
+    ToolResult {
+        /// Previously emitted `tool_use.id`.
+        tool_use_id: String,
+        /// Textual tool result body.
+        content: String,
+    },
+}
+
+/// Native Anthropic tool definition.
+#[derive(Debug, Clone, Serialize)]
+struct AnthropicToolDefinition {
+    /// Tool name.
+    name: String,
+    /// Human-readable description.
+    description: String,
+    /// JSON schema for tool input.
+    input_schema: Value,
+}
+
+impl AnthropicToolDefinition {
+    /// Convert SA's canonical function tool schema into Anthropic tool format.
+    fn from_tool_definition(tool: &ToolDefinition) -> Self {
+        Self {
+            name: tool.function.name.clone(),
+            description: tool.function.description.clone(),
+            input_schema: tool.function.parameters.clone(),
+        }
+    }
+}
+
+/// Unary Anthropic `/messages` response.
+#[derive(Debug, Clone, Deserialize)]
+struct AnthropicMessagesResponse {
+    /// Structured content blocks.
+    #[serde(default)]
+    content: Vec<AnthropicContentIn>,
+    /// Provider-native stop reason.
+    #[serde(default)]
+    stop_reason: Option<String>,
+    /// Provider-reported usage.
+    #[serde(default)]
+    usage: Option<ChatUsage>,
+}
+
+/// Inbound Anthropic content block.
+#[derive(Debug, Clone, Deserialize)]
+struct AnthropicContentIn {
+    /// Block discriminator.
+    #[serde(rename = "type")]
+    kind: String,
+    /// Optional text content.
+    #[serde(default)]
+    text: Option<String>,
+    /// Optional tool-use id.
+    #[serde(default)]
+    id: Option<String>,
+    /// Optional tool name.
+    #[serde(default)]
+    name: Option<String>,
+    /// Optional tool input object.
+    #[serde(default)]
+    input: Option<Value>,
+}
+
+/// Convert canonical SA history into Anthropic system text plus `/messages`
+/// message blocks.
+fn convert_messages_to_anthropic(
+    messages: &[ChatMessage],
+) -> (Option<String>, Vec<AnthropicMessage>) {
+    let mut system_parts = Vec::<String>::new();
+    let mut native_messages = Vec::<AnthropicMessage>::new();
+
+    for message in messages {
+        match message.role.as_str() {
+            "system" | "developer" => {
+                if let Some(text) = non_empty_text(message.content.as_deref()) {
+                    system_parts.push(text.to_string());
+                }
+            }
+            "assistant" => {
+                let native = build_anthropic_assistant_message(message);
+                if let Some(native) = native {
+                    native_messages.push(native);
+                }
+            }
+            "tool" => {
+                if let Some(native) = build_anthropic_tool_result_message(message) {
+                    native_messages.push(native);
+                } else if let Some(text) = non_empty_text(message.content.as_deref()) {
+                    native_messages.push(AnthropicMessage::user_text(text.to_string()));
+                }
+            }
+            _ => {
+                if let Some(text) = non_empty_text(message.content.as_deref()) {
+                    native_messages.push(AnthropicMessage::user_text(text.to_string()));
+                }
+            }
+        }
+    }
+
+    let system = (!system_parts.is_empty()).then(|| system_parts.join("\n\n"));
+    (system, native_messages)
+}
+
+/// Build one Anthropic assistant message from SA's canonical assistant turn.
+fn build_anthropic_assistant_message(message: &ChatMessage) -> Option<AnthropicMessage> {
+    let mut content = Vec::<AnthropicContentOut>::new();
+
+    if let Some(text) = non_empty_text(message.content.as_deref()) {
+        content.push(AnthropicContentOut::Text {
+            text: text.to_string(),
+        });
+    }
+
+    if let Some(tool_calls) = message.tool_calls.as_ref() {
+        for tool_call in tool_calls {
+            let id = sanitize_id(Some(&tool_call.id)).unwrap_or_else(|| Uuid::new_v4().to_string());
+            let input = serde_json::from_str::<Value>(&tool_call.function.arguments)
+                .unwrap_or_else(|_| Value::Object(serde_json::Map::new()));
+            content.push(AnthropicContentOut::ToolUse {
+                id,
+                name: tool_call.function.name.clone(),
+                input,
+            });
+        }
+    }
+
+    (!content.is_empty()).then(|| AnthropicMessage {
+        role: "assistant".to_string(),
+        content,
+    })
+}
+
+/// Build one Anthropic user-side tool-result message from SA's canonical tool
+/// result history item.
+fn build_anthropic_tool_result_message(message: &ChatMessage) -> Option<AnthropicMessage> {
+    let tool_use_id = sanitize_id(message.tool_call_id.as_deref())?;
+    let content = message.content.clone().unwrap_or_default();
+    Some(AnthropicMessage {
+        role: "user".to_string(),
+        content: vec![AnthropicContentOut::ToolResult {
+            tool_use_id,
+            content,
+        }],
+    })
+}
+
+/// Normalize an Anthropic `/messages` reply back into SA's canonical
+/// chat-style response.
+fn normalize_anthropic_messages_response(
+    response: AnthropicMessagesResponse,
+) -> ChatCompletionsResponse {
+    let mut text_parts = Vec::<String>::new();
+    let mut tool_calls = Vec::<ToolCall>::new();
+
+    for block in response.content {
+        match block.kind.as_str() {
+            "text" => {
+                if let Some(text) = non_empty_text(block.text.as_deref()) {
+                    text_parts.push(text.to_string());
+                }
+            }
+            "tool_use" => {
+                let Some(name) = non_empty_text(block.name.as_deref()) else {
+                    continue;
+                };
+                let arguments = block
+                    .input
+                    .unwrap_or_else(|| Value::Object(serde_json::Map::new()))
+                    .to_string();
+                tool_calls.push(ToolCall {
+                    id: sanitize_id(block.id.as_deref())
+                        .unwrap_or_else(|| Uuid::new_v4().to_string()),
+                    kind: "function".to_string(),
+                    function: ToolFunctionCall {
+                        name: name.to_string(),
+                        arguments,
+                    },
+                });
+            }
+            _ => {}
+        }
+    }
+
+    let finish_reason = if tool_calls.is_empty() {
+        normalize_anthropic_stop_reason(response.stop_reason.as_deref())
+    } else {
+        Some("tool_calls".to_string())
+    };
+    let content = (!text_parts.is_empty()).then(|| text_parts.join("\n"));
+
+    ChatCompletionsResponse {
+        choices: vec![ChatChoice {
+            message: ChatMessage {
+                role: "assistant".to_string(),
+                content,
+                tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
+                tool_call_id: None,
+                request_usage: None,
+                responses_input_items: None,
+            },
+            finish_reason,
+        }],
+        usage: response.usage,
+    }
+}
+
+/// Convert Anthropic-native stop reasons into the canonical finish reasons SA
+/// already uses elsewhere.
+fn normalize_anthropic_stop_reason(stop_reason: Option<&str>) -> Option<String> {
+    match stop_reason {
+        Some("max_tokens") => Some("length".to_string()),
+        Some("tool_use") => Some("tool_calls".to_string()),
+        Some("end_turn") | Some("stop_sequence") => Some("stop".to_string()),
+        Some(other) if !other.trim().is_empty() => Some(other.to_string()),
+        _ => Some("stop".to_string()),
     }
 }
 
@@ -2148,11 +2650,12 @@ fn merge_responses_output_items(
 #[cfg(test)]
 mod tests {
     use super::{
-        ChatCompletionsRequest, ChatCompletionsResponse, ChatCompletionsStreamAccumulator,
-        ChatCompletionsStreamChunk, ChatMessage, ChatUsage, InputTokenDetails, OutputTokenDetails,
-        ResponsesFunctionCallOutputContentItem, ResponsesInputItem, ResponsesReasoningContentItem,
-        ResponsesReasoningSummaryItem, ResponsesRequest, ResponsesStreamAccumulator, ToolCall,
-        ToolDefinition, ToolFunctionCall, ToolFunctionDefinition, WireApi,
+        AnthropicMessagesRequest, AuthStyle, ChatCompletionsRequest, ChatCompletionsResponse,
+        ChatCompletionsStreamAccumulator, ChatCompletionsStreamChunk, ChatMessage, ChatUsage,
+        InputTokenDetails, OutputTokenDetails, ResponsesFunctionCallOutputContentItem,
+        ResponsesInputItem, ResponsesReasoningContentItem, ResponsesReasoningSummaryItem,
+        ResponsesRequest, ResponsesStreamAccumulator, ToolCall, ToolDefinition, ToolFunctionCall,
+        ToolFunctionDefinition, WireApi, build_auth_headers, normalize_anthropic_messages_response,
         normalize_responses_response, process_sse_line,
     };
 
@@ -2164,6 +2667,41 @@ mod tests {
         let parsed =
             serde_json::from_str::<WireApi>(r#""responses""#).expect("responses should parse");
         assert_eq!(parsed, WireApi::Responses);
+
+        let parsed =
+            serde_json::from_str::<WireApi>(r#""claude""#).expect("claude alias should parse");
+        assert_eq!(parsed, WireApi::AnthropicMessages);
+    }
+
+    #[test]
+    fn anthropic_auto_auth_uses_x_api_key_for_regular_keys() {
+        let headers = build_auth_headers("sk-ant-api03-demo", AuthStyle::AnthropicAuto)
+            .expect("headers should build");
+        assert_eq!(
+            headers
+                .get("x-api-key")
+                .and_then(|value| value.to_str().ok()),
+            Some("sk-ant-api03-demo")
+        );
+        assert!(headers.get("authorization").is_none());
+    }
+
+    #[test]
+    fn anthropic_auto_auth_uses_bearer_for_setup_tokens() {
+        let headers = build_auth_headers("sk-ant-oat01-demo", AuthStyle::AnthropicAuto)
+            .expect("headers should build");
+        assert_eq!(
+            headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer sk-ant-oat01-demo")
+        );
+        assert_eq!(
+            headers
+                .get("anthropic-beta")
+                .and_then(|value| value.to_str().ok()),
+            Some("oauth-2025-04-20")
+        );
     }
 
     #[test]
@@ -2322,6 +2860,107 @@ mod tests {
         let normalized = normalize_responses_response(response);
         let choice = normalized.first_choice().expect("choice should exist");
         assert_eq!(choice.message.content.as_deref(), Some("hello world"));
+    }
+
+    #[test]
+    fn anthropic_request_extracts_system_tools_and_tool_results() {
+        let req = ChatCompletionsRequest {
+            model: "claude-sonnet-4-5".to_string(),
+            messages: vec![
+                ChatMessage::text("system", "系统规则"),
+                ChatMessage::text("developer", "开发规则"),
+                ChatMessage::text("user", "看一下 a.txt"),
+                ChatMessage {
+                    role: "assistant".to_string(),
+                    content: Some("先读文件".to_string()),
+                    tool_calls: Some(vec![ToolCall {
+                        id: "call_123".to_string(),
+                        kind: "function".to_string(),
+                        function: ToolFunctionCall {
+                            name: "Read".to_string(),
+                            arguments: "{\"path\":\"a.txt\"}".to_string(),
+                        },
+                    }]),
+                    tool_call_id: None,
+                    request_usage: None,
+                    responses_input_items: None,
+                },
+                ChatMessage::tool_result("call_123", "文件内容"),
+            ],
+            max_tokens: Some(512),
+            reasoning_effort: Some("high".to_string()),
+            tools: Some(vec![ToolDefinition {
+                kind: "function".to_string(),
+                function: ToolFunctionDefinition {
+                    name: "Read".to_string(),
+                    description: "读取文件".to_string(),
+                    parameters: serde_json::json!({"type":"object"}),
+                },
+            }]),
+            tool_choice: Some(serde_json::json!("auto")),
+            stream: Some(true),
+        };
+
+        let wire = AnthropicMessagesRequest::from_chat_request(&req);
+        let value = serde_json::to_value(wire).expect("serialize anthropic request");
+
+        assert_eq!(value["system"], "系统规则\n\n开发规则");
+        assert_eq!(value["max_tokens"], 512);
+        assert_eq!(value["messages"][0]["role"], "user");
+        assert_eq!(value["messages"][0]["content"][0]["type"], "text");
+        assert_eq!(value["messages"][1]["role"], "assistant");
+        assert_eq!(value["messages"][1]["content"][0]["type"], "text");
+        assert_eq!(value["messages"][1]["content"][1]["type"], "tool_use");
+        assert_eq!(value["messages"][1]["content"][1]["id"], "call_123");
+        assert_eq!(value["messages"][2]["role"], "user");
+        assert_eq!(value["messages"][2]["content"][0]["type"], "tool_result");
+        assert_eq!(
+            value["messages"][2]["content"][0]["tool_use_id"],
+            "call_123"
+        );
+        assert_eq!(value["tools"][0]["name"], "Read");
+    }
+
+    #[test]
+    fn normalize_anthropic_response_extracts_text_and_tool_calls() {
+        let raw = serde_json::json!({
+            "content": [
+                {
+                    "type": "text",
+                    "text": "先读取配置"
+                },
+                {
+                    "type": "tool_use",
+                    "id": "tool_1",
+                    "name": "Read",
+                    "input": {
+                        "path": "sa.toml"
+                    }
+                }
+            ],
+            "stop_reason": "tool_use",
+            "usage": {
+                "input_tokens": 120,
+                "output_tokens": 30,
+                "cache_creation_input_tokens": 10
+            }
+        });
+
+        let response = serde_json::from_value(raw).expect("anthropic response should deserialize");
+        let normalized = normalize_anthropic_messages_response(response);
+        let usage = normalized.usage.clone().expect("usage should exist");
+        let choice = normalized.first_choice().expect("choice should exist");
+        assert_eq!(choice.message.content.as_deref(), Some("先读取配置"));
+        let tool_calls = choice
+            .message
+            .tool_calls
+            .as_ref()
+            .expect("tool calls should exist");
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id, "tool_1");
+        assert_eq!(tool_calls[0].function.name, "Read");
+        assert_eq!(usage.cache_write_tokens(), 10);
+        assert_eq!(choice.finish_reason.as_deref(), Some("tool_calls"));
     }
 
     #[test]

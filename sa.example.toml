@@ -3,28 +3,52 @@
 # Copy this file to `sa.toml` (which is gitignored) and fill secrets.
 
 [llm]
-# OpenAI-compatible base URL.
-# Example from the request: "https://withapi.mosoft.icu/v1"
+# Provider base URL.
+# OpenAI-compatible examples:
+# - "https://withapi.mosoft.icu/v1"
+# Anthropic-compatible examples:
+# - "https://api.anthropic.com"
+# - "https://example.com/v1"
 base_url = "https://withapi.mosoft.icu/v1"
 
-# OpenAI-compatible API key.
+# Provider API credential.
 # Put real key in `sa.toml` (NOT committed).
 api_key = "sk-REPLACE_ME"
 
-# Model name (OpenAI-compatible).
-# Example from the request: "gpt-5.2"
+# Model name.
+# Examples:
+# - OpenAI: "gpt-5.2"
+# - Anthropic: "claude-sonnet-4-5"
 model = "gpt-5.2"
 
-# Wire protocol used for the OpenAI-compatible endpoint.
+# Wire protocol used for the upstream endpoint.
 #
 # Supported values:
 # - "chat_completions"  => POST /v1/chat/completions
 # - "responses"         => POST /v1/responses
+# - "anthropic_messages"=> POST /v1/messages
 #
-# Alias spellings like "chat-completions" and "chat" are also accepted.
+# Alias spellings like "chat-completions", "chat", "anthropic", and "claude"
+# are also accepted.
 #
 # Leave it unset to keep the historical default: "chat_completions".
 # wire_api = "chat_completions"
+
+# Optional explicit auth style.
+#
+# Supported values:
+# - "bearer"
+# - "x_api_key"
+# - "anthropic_auto"
+#
+# Defaults:
+# - chat_completions / responses => bearer
+# - anthropic_messages           => anthropic_auto
+#
+# anthropic_auto behavior:
+# - regular Anthropic-compatible API keys => x-api-key
+# - Anthropic setup/OAuth tokens         => Authorization: Bearer ...
+# auth_style = "anthropic_auto"
 
 # Some providers accept `role: system`, others only accept `role: developer`.
 # This option controls the role-name we use for the "system" instructions.
@@ -36,6 +60,8 @@ system_role_name = "developer"
 #
 # This is forwarded as the OpenAI-compatible top-level `reasoning_effort`
 # request field when set.
+#
+# Note: Anthropic `/v1/messages` currently ignores this field in SA.
 #
 # Common values include:
 # - "none"

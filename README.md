@@ -32,14 +32,15 @@
 
 ## 核心能力
 
-### 1. OpenAI 兼容调用
+### 1. 模型协议调用
 
-后端通过可配置的 OpenAI 兼容接口访问模型，支持配置：
+后端通过可配置的 OpenAI / Anthropic 兼容接口访问模型，支持配置：
 
 - `base_url`
 - `api_key`
 - `model`
 - `wire_api`
+- `auth_style`
 - `system_role_name`
 - `reasoning_effort`
 - `max_steps`
@@ -62,14 +63,38 @@
   - 使用 `/v1/chat/completions`
 - `responses`
   - 使用 `/v1/responses`
+- `anthropic_messages`
+  - 使用 `/v1/messages`
 
 如果不填写，默认使用 `chat_completions`。
+
+`auth_style` 用于控制鉴权头格式：
+
+- `bearer`
+  - 发送 `Authorization: Bearer ...`
+- `x_api_key`
+  - 发送 `x-api-key: ...`
+- `anthropic_auto`
+  - 对 Anthropic-compatible 渠道自动判定：
+  - 普通 API key 使用 `x-api-key`
+  - setup / OAuth token 使用 `Authorization: Bearer ...`
+
+如果不填写，默认策略如下：
+
+- `chat_completions` / `responses` => `bearer`
+- `anthropic_messages` => `anthropic_auto`
 
 另外，主 Agent 运行时的模型调用现在默认优先使用流式请求：
 
 - 目的：降低长请求在某些网关上的 503 / 超时概率
 - 行为：SA 在内部聚合流式结果，对上层仍保持原来的完整响应语义
 - 回退：如果供应商明确不支持流式，SA 会自动退回一次非流式请求
+
+当前补充说明：
+
+- OpenAI `chat_completions` / `responses` 路径会优先尝试流式请求
+- Anthropic `anthropic_messages` 路径当前先走稳定的非流式 `/v1/messages`
+- 这样做的目的是直接对接 Claude-compatible 协议，而不是继续依赖某些网关把 OpenAI 请求“转换”为 Claude 请求
 
 ### 2. 工作区上下文注入
 
@@ -231,6 +256,20 @@ copy sa.example.toml sa.toml
 ```toml
 [llm]
 wire_api = "responses"
+```
+
+如果你的供应商是 Claude / Anthropic-compatible `/v1/messages`，则设置：
+
+```toml
+[llm]
+wire_api = "anthropic_messages"
+```
+
+如果该渠道要求显式 `x-api-key` 或 `Authorization`，也可以继续设置：
+
+```toml
+[llm]
+auth_style = "anthropic_auto"
 ```
 
 如果你的渠道不接受 `system` 角色，只接受 `developer`，则设置：

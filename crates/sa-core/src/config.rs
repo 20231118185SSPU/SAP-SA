@@ -10,7 +10,7 @@
 //!     `role: "developer"`; the config makes this adjustable.
 
 use crate::compact::CompactionConfig;
-use crate::openai::WireApi;
+use crate::openai::{AuthStyle, WireApi};
 use anyhow::Context as _;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -57,13 +57,28 @@ pub struct LlmConfig {
     /// Supported values:
     /// - `chat_completions`
     /// - `responses`
+    /// - `anthropic_messages`
     ///
-    /// Alias spellings such as `chat-completions` and `chat` are also accepted.
+    /// Alias spellings such as `chat-completions`, `chat`, `anthropic`, and
+    /// `claude` are also accepted.
     ///
     /// If this field is absent, SA keeps the historical default:
     /// `chat_completions`.
     #[serde(default)]
     pub wire_api: Option<WireApi>,
+
+    /// Authentication style used for outbound provider calls.
+    ///
+    /// Common values:
+    /// - `bearer`
+    /// - `x_api_key`
+    /// - `anthropic_auto`
+    ///
+    /// If omitted:
+    /// - OpenAI-compatible protocols default to `bearer`
+    /// - `anthropic_messages` defaults to `anthropic_auto`
+    #[serde(default)]
+    pub auth_style: Option<AuthStyle>,
 
     /// Role name used for the "system instructions" message.
     ///
@@ -134,6 +149,15 @@ impl LlmConfig {
     /// Return the effective OpenAI-compatible wire protocol.
     pub fn effective_wire_api(&self) -> WireApi {
         self.wire_api.unwrap_or_default()
+    }
+
+    /// Return the effective authentication style for the selected wire
+    /// protocol.
+    pub fn effective_auth_style(&self, wire_api: WireApi) -> AuthStyle {
+        self.auth_style.unwrap_or(match wire_api {
+            WireApi::AnthropicMessages => AuthStyle::AnthropicAuto,
+            WireApi::ChatCompletions | WireApi::Responses => AuthStyle::Bearer,
+        })
     }
 }
 
@@ -364,7 +388,7 @@ fn validate_mcp_config(config: &McpConfig) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{Config, LlmConfig, McpConfig, McpServerConfig, McpTransport, validate_mcp_config};
-    use crate::openai::WireApi;
+    use crate::openai::{AuthStyle, WireApi};
     use std::collections::HashMap;
 
     fn sample_llm() -> LlmConfig {
@@ -373,6 +397,7 @@ mod tests {
             api_key: "sk-test".to_string(),
             model: "gpt-5.2".to_string(),
             wire_api: None,
+            auth_style: None,
             system_role_name: None,
             reasoning_effort: None,
             max_steps: 32,
@@ -409,6 +434,50 @@ agents_md = "Agents.md"
         let raw = raw.replace("wire_api = \"chat\"", "wire_api = \"responses\"");
         let cfg = toml::from_str::<Config>(&raw).expect("responses wire_api should parse");
         assert_eq!(cfg.llm.effective_wire_api(), WireApi::Responses);
+
+        let raw = raw.replace("wire_api = \"responses\"", "wire_api = \"claude\"");
+        let cfg = toml::from_str::<Config>(&raw).expect("claude wire_api alias should parse");
+        assert_eq!(cfg.llm.effective_wire_api(), WireApi::AnthropicMessages);
+    }
+
+    #[test]
+    fn effective_auth_style_defaults_follow_wire_api() {
+        let cfg = sample_llm();
+        assert_eq!(
+            cfg.effective_auth_style(WireApi::ChatCompletions),
+            AuthStyle::Bearer
+        );
+        assert_eq!(
+            cfg.effective_auth_style(WireApi::Responses),
+            AuthStyle::Bearer
+        );
+        assert_eq!(
+            cfg.effective_auth_style(WireApi::AnthropicMessages),
+            AuthStyle::AnthropicAuto
+        );
+    }
+
+    #[test]
+    fn auth_style_aliases_deserialize() {
+        let raw = r#"
+[llm]
+base_url = "https://example.com"
+api_key = "sk-test"
+model = "claude-sonnet-4-5"
+wire_api = "anthropic_messages"
+auth_style = "x-api-key"
+
+[server]
+bind = "127.0.0.1:8765"
+ws_path = "/ws"
+
+[workspace]
+root_dir = "."
+agents_md = "Agents.md"
+"#;
+
+        let cfg = toml::from_str::<Config>(raw).expect("auth_style alias should parse");
+        assert_eq!(cfg.llm.auth_style, Some(AuthStyle::XApiKey));
     }
 
     #[test]
