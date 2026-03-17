@@ -6,6 +6,7 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
@@ -53,7 +54,8 @@ pub struct StdioTransport {
 impl StdioTransport {
     /// Spawn the configured stdio MCP server.
     pub fn new(config: &McpServerConfig) -> Result<Self> {
-        let mut child = Command::new(&config.command)
+        let resolved_program = resolve_stdio_program(&config.command);
+        let mut child = Command::new(&resolved_program)
             .args(&config.args)
             .envs(&config.env)
             .stdin(std::process::Stdio::piped())
@@ -61,7 +63,13 @@ impl StdioTransport {
             .stderr(std::process::Stdio::inherit())
             .kill_on_drop(true)
             .spawn()
-            .with_context(|| format!("failed to spawn MCP server `{}`", config.name))?;
+            .with_context(|| {
+                format!(
+                    "failed to spawn MCP server `{}` with program `{}`",
+                    config.name,
+                    resolved_program.display()
+                )
+            })?;
 
         let stdin = child
             .stdin
@@ -105,6 +113,33 @@ impl StdioTransport {
         }
         Ok(line)
     }
+}
+
+/// Resolve a stdio MCP program name into the executable path we should pass to
+/// `Command::new()`.
+///
+/// Why this exists:
+///
+/// - On Unix, `Command::new("npx")` can execute PATH entries directly.
+/// - On Windows, many tool launchers are actually `*.cmd` shims on PATH
+///   (`npx.cmd`, `pnpm.cmd`, `yarn.cmd`, ...).
+/// - `tokio::process::Command` does not reliably resolve those shim names when
+///   the extension is omitted, so `command = "npx"` fails even though the
+///   command works in PowerShell.
+///
+/// We therefore resolve through `which`, which respects `PATH` + `PATHEXT`, and
+/// fall back to the original string if resolution fails so the eventual spawn
+/// error still reflects the user-configured command.
+#[cfg(windows)]
+fn resolve_stdio_program(program: &str) -> PathBuf {
+    which::which(program).unwrap_or_else(|_| PathBuf::from(program))
+}
+
+/// Unix kernels already handle PATH lookup and shebang execution correctly, so
+/// we keep the original program name untouched.
+#[cfg(not(windows))]
+fn resolve_stdio_program(program: &str) -> PathBuf {
+    PathBuf::from(program)
 }
 
 #[async_trait]
@@ -819,6 +854,7 @@ pub fn create_transport(config: &McpServerConfig) -> Result<Box<dyn McpTransport
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn parse_plain_json_response() {
@@ -834,5 +870,44 @@ mod tests {
         )
         .expect("parse SSE-framed JSON");
         assert_eq!(parsed.id, Some(serde_json::json!(2)));
+    }
+
+    /// On Windows, MCP stdio launchers such as `npx` are often `.cmd` shims on
+    /// PATH. We must resolve them before calling `Command::new()`.
+    #[cfg(windows)]
+    #[test]
+    fn resolve_stdio_program_finds_cmd_shim_on_path() {
+        let temp = tempfile::TempDir::new().expect("temp dir should exist");
+        let shim = temp.path().join("test-mcp-launcher.cmd");
+        fs::write(&shim, "@echo off\r\nexit /b 0\r\n").expect("cmd shim should be written");
+
+        let original_path = std::env::var("PATH").ok();
+        let original_pathext = std::env::var("PATHEXT").ok();
+
+        let sep = if cfg!(windows) { ";" } else { ":" };
+        let new_path = match &original_path {
+            Some(existing) if !existing.is_empty() => {
+                format!("{}{}{}", temp.path().display(), sep, existing)
+            }
+            _ => temp.path().display().to_string(),
+        };
+
+        unsafe {
+            std::env::set_var("PATH", new_path);
+            std::env::set_var("PATHEXT", ".CMD;.EXE;.BAT;.COM");
+        }
+
+        let resolved = resolve_stdio_program("test-mcp-launcher");
+
+        match original_path {
+            Some(value) => unsafe { std::env::set_var("PATH", value) },
+            None => unsafe { std::env::remove_var("PATH") },
+        }
+        match original_pathext {
+            Some(value) => unsafe { std::env::set_var("PATHEXT", value) },
+            None => unsafe { std::env::remove_var("PATHEXT") },
+        }
+
+        assert_eq!(resolved, shim);
     }
 }
