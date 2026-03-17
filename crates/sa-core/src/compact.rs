@@ -230,6 +230,11 @@ impl CompactionState {
         self.summary.as_deref()
     }
 
+    /// Restore the current checkpoint summary from durable state.
+    pub fn restore_summary(&mut self, summary: Option<String>) {
+        self.summary = summary;
+    }
+
     /// Replace the stored checkpoint summary.
     fn set_summary(&mut self, summary: String) {
         self.summary = Some(summary);

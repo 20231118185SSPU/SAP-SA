@@ -28,6 +28,7 @@ use sa_core::config::load_config_from_file;
 use sa_core::mcp_client::McpRegistry;
 use sa_core::memory::{build_prompt_block as build_memory_prompt_block, is_memory_reference};
 use sa_core::openai::OpenAiClient;
+use sa_core::session::SessionStore;
 use sa_core::skills::SkillRegistry;
 use sa_core::tools::{
     AskQuestionFn, AskRequest, MAX_SUBAGENT_DEPTH, RunSubAgentFn, SendMessageFn, ShowFileFn,
@@ -152,6 +153,9 @@ struct Hub {
     /// Reloading makes this behavior verifiable and fixes "Agents.md not loaded" confusion.
     agents_md_path: PathBuf,
 
+    /// Durable top-level conversation store rooted at `workspace/sessions/`.
+    session_store: Arc<SessionStore>,
+
     /// Stable machine identity reused by every WS handshake.
     ws_identity: LocalIdentity,
 }
@@ -162,6 +166,7 @@ impl Hub {
         runner: AgentRunner,
         agents_md_path: PathBuf,
         preload_ctx: ToolContext,
+        session_store: Arc<SessionStore>,
         ws_identity: LocalIdentity,
     ) -> Arc<Self> {
         // Task queue capacity (small but adequate for minimal agent).
@@ -184,6 +189,7 @@ impl Hub {
             preload_ctx,
             runner,
             agents_md_path,
+            session_store,
             ws_identity,
         });
 
@@ -709,6 +715,7 @@ impl Hub {
                 request.task.clone(),
                 &agents_md,
                 Some(extra_prompt.as_str()),
+                None,
                 runtime,
                 &cancel,
                 None,
@@ -811,6 +818,7 @@ impl Hub {
                     req.task.clone(),
                     &agents_md,
                     Some(extra_prompt.as_str()),
+                    Some(Arc::clone(&self.session_store)),
                     runtime,
                     &cancel_token,
                     Some(drain_queued_user_messages),
@@ -1569,6 +1577,7 @@ async fn main() -> anyhow::Result<()> {
     // Build tools.
     let tool_ctx = ToolContext::new(workspace_root, Arc::clone(&skills))?;
     let preload_ctx = tool_ctx.clone();
+    let session_store = Arc::new(SessionStore::new(preload_ctx.workspace_root.clone())?);
 
     let tools = ToolExecutor::new(tool_ctx, mcp_registry);
 
@@ -1599,7 +1608,13 @@ async fn main() -> anyhow::Result<()> {
     // Hub (spawns worker loop).
     let ws_identity = load_local_identity()?;
     tracing::info!("WS identity machine hint: {}", ws_identity.machine_hint);
-    let hub = Hub::new(runner, agents_md_path, preload_ctx, ws_identity);
+    let hub = Hub::new(
+        runner,
+        agents_md_path,
+        preload_ctx,
+        session_store,
+        ws_identity,
+    );
 
     // Build HTTP router (WS only).
     let app = Router::new()
@@ -1659,6 +1674,10 @@ mod tests {
         let tool_ctx = ToolContext::new(workspace.path().to_path_buf(), Arc::clone(&skills))
             .expect("tool context should build for temp workspace");
         let preload_ctx = tool_ctx.clone();
+        let session_store = Arc::new(
+            SessionStore::new(preload_ctx.workspace_root.clone())
+                .expect("session store should build for temp workspace"),
+        );
         let tools = ToolExecutor::new(tool_ctx, None);
         let llm = OpenAiClient::new("http://127.0.0.1:1".to_string(), "test-key".to_string())
             .expect("test OpenAI client should build");
@@ -1679,6 +1698,7 @@ mod tests {
             runner,
             workspace.path().join("AGENTS.md"),
             preload_ctx,
+            session_store,
             load_local_identity().expect("local WS identity should load"),
         )
     }

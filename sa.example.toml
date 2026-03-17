@@ -81,6 +81,10 @@ max_steps = 32
 # Whether SA should automatically compress long-running conversation history.
 enabled = true
 
+# Top-level conversation persistence is always enabled.
+# SA writes the durable main session to `workspace/sessions/*.jsonl`, and every
+# successful compaction rotation switches to a fresh session file automatically.
+
 # Approximate total request size at which compaction is triggered.
 # This budget includes system/developer prompt, retained history, and tool schemas.
 trigger_tokens = 180000

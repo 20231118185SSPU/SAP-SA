@@ -18,6 +18,7 @@ use crate::compact::{
 };
 use crate::openai::{ChatCompletionsRequest, ChatMessage, OpenAiClient, ToolCall};
 use crate::retry::retry_delay;
+use crate::session::SessionStore;
 use crate::skills::SkillRegistry;
 use crate::tools::{ToolExecutor, ToolRuntime, ToolSession};
 use crate::ws_protocol::EventKind;
@@ -93,6 +94,7 @@ impl AgentRunner {
         task: String,
         agents_md: &AgentsMd,
         extra_system_prompt: Option<&str>,
+        persistent_session: Option<Arc<SessionStore>>,
         runtime: ToolRuntime,
         cancel: &CancelToken,
         drain_queued_user_messages: Option<DrainQueuedUserMessagesFn>,
@@ -120,20 +122,57 @@ impl AgentRunner {
             );
         }
 
-        // Build the "system prompt" (or "developer prompt") that stays constant.
-        let system_prompt = self.build_system_prompt(agents_md, extra_system_prompt);
+        // Restore the top-level persisted session if this run is attached to
+        // the durable workspace conversation. Sub-agents pass `None` here and
+        // therefore stay ephemeral.
+        let mut session_compaction_context = None::<String>;
+        let mut messages = Vec::<ChatMessage>::new();
+        let mut compaction_state = CompactionState::default();
 
-        // Keep the stable system/developer instruction block separate from the
-        // mutable conversation history so compaction only touches the real
-        // dialogue and never rewrites the base instructions.
-        let system_message = ChatMessage::text(self.cfg.system_role_name.clone(), system_prompt);
+        if let Some(session_store) = persistent_session.as_ref() {
+            let snapshot = session_store
+                .load_snapshot()
+                .context("Failed to load persisted session snapshot")?;
+            compaction_state.restore_summary(snapshot.compaction_summary.clone());
+            session_compaction_context = Some(build_session_compaction_context_block(&snapshot));
+            messages = snapshot.messages;
+
+            (emit)(
+                EventKind::Log,
+                task_id,
+                format!(
+                    "Loaded persisted session {} (conversation_id={}, messages={}, compacted={}, truncated_incomplete={}).",
+                    snapshot.descriptor.current_session_path,
+                    snapshot.descriptor.conversation_id,
+                    messages.len(),
+                    snapshot.compaction_summary.is_some(),
+                    snapshot.truncated_incomplete_messages,
+                ),
+            );
+        }
+
+        // Build the "system prompt" (or "developer prompt") that stays
+        // constant, except when compaction rotates the backing session file and
+        // we therefore need to refresh the injected compaction metadata block.
+        let mut system_message = ChatMessage::text(
+            self.cfg.system_role_name.clone(),
+            self.build_system_prompt(
+                agents_md,
+                join_extra_system_prompt(
+                    extra_system_prompt,
+                    session_compaction_context.as_deref(),
+                )
+                .as_deref(),
+            ),
+        );
 
         // Store only the real conversation here. Synthetic compaction summaries
         // are injected later when we build the provider request.
-        let mut messages = vec![ChatMessage::text("user", task.clone())];
-
-        // One task keeps one evolving checkpoint summary.
-        let mut compaction_state = CompactionState::default();
+        append_message_and_persist(
+            &mut messages,
+            ChatMessage::text("user", task.clone()),
+            persistent_session.as_deref(),
+        )?;
 
         // We pre-compute tool definitions once. This keeps requests stable.
         let tool_definitions = self.tools.tool_definitions();
@@ -161,9 +200,10 @@ impl AgentRunner {
             drain_follow_up_messages(
                 task_id,
                 &mut messages,
+                persistent_session.as_deref(),
                 drain_queued_user_messages.as_ref(),
                 &emit,
-            );
+            )?;
 
             match maybe_compact_history(
                 &self.llm,
@@ -180,6 +220,42 @@ impl AgentRunner {
             .await
             {
                 Ok(Some(report)) => {
+                    if let Some(session_store) = persistent_session.as_ref() {
+                        let summary = compaction_state.summary().ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "Compaction succeeded but no checkpoint summary remained in state"
+                            )
+                        })?;
+                        let descriptor = session_store
+                            .rollover_after_compaction(summary, &messages)
+                            .context("Failed to rotate persisted session after compaction")?;
+                        session_compaction_context = Some(descriptor.compaction_prompt_block());
+                        system_message = ChatMessage::text(
+                            self.cfg.system_role_name.clone(),
+                            self.build_system_prompt(
+                                agents_md,
+                                join_extra_system_prompt(
+                                    extra_system_prompt,
+                                    session_compaction_context.as_deref(),
+                                )
+                                .as_deref(),
+                            ),
+                        );
+
+                        (emit)(
+                            EventKind::Log,
+                            task_id,
+                            format!(
+                                "Rotated persisted session after compaction: current={}, previous={}",
+                                descriptor.current_session_path,
+                                descriptor
+                                    .previous_session_path
+                                    .as_deref()
+                                    .unwrap_or("(none)")
+                            ),
+                        );
+                    }
+
                     (emit)(
                         EventKind::Log,
                         task_id,
@@ -310,16 +386,17 @@ impl AgentRunner {
             let tool_calls: Vec<ToolCall> = assistant.tool_calls.clone().unwrap_or_default();
 
             // Persist assistant message in history.
-            messages.push(assistant);
+            append_message_and_persist(&mut messages, assistant, persistent_session.as_deref())?;
 
             // If no tool calls => done.
             if tool_calls.is_empty() {
                 if drain_follow_up_messages(
                     task_id,
                     &mut messages,
+                    persistent_session.as_deref(),
                     drain_queued_user_messages.as_ref(),
                     &emit,
-                ) {
+                )? {
                     continue;
                 }
 
@@ -392,7 +469,11 @@ impl AgentRunner {
                 (emit)(EventKind::Tool, task_id, tool_result.clone());
 
                 // Append tool result message.
-                messages.push(ChatMessage::tool_result(call.id, tool_result));
+                append_message_and_persist(
+                    &mut messages,
+                    ChatMessage::tool_result(call.id, tool_result),
+                    persistent_session.as_deref(),
+                )?;
             }
         }
 
@@ -509,6 +590,13 @@ SubAgent 是保护主上下文窗口的利器。用不用子代理的判断标�
 - 如果没有命中或证据不足，明确说明你查过但仍不确定，不要假装记得。\n\n",
         );
 
+        out.push_str("## 压缩与会话\n\n");
+        out.push_str(
+            "顶层主会话会持久化到工作区 `sessions/*.jsonl`，并在上下文过长时做压缩。\n\
+如果附加运行时上下文里出现“压缩上下文”块，其中给出的“上一段原始会话文件”就是被压缩掉的原始记录来源。\n\
+当你需要某条已不在当前上下文窗口中的精确原文时，优先使用 `Read` 读取那个会话文件，而不是让同学重复。\n\n",
+        );
+
         if !self.skills.list().is_empty() {
             out.push_str("## 技能授权\n\n");
             out.push_str("所有已注册技能都已经过授权，可以按需使用。同学的任务如果明显需要某项技能，就直接用 `Skill` 读取它，不要凭空编造\"策略限制\"来回避。\n\n");
@@ -573,6 +661,63 @@ SubAgent 是保护主上下文窗口的利器。用不用子代理的判断标�
     }
 }
 
+/// Build one runtime context block that describes the currently active
+/// compaction/session state restored from disk.
+fn build_session_compaction_context_block(snapshot: &crate::session::SessionSnapshot) -> String {
+    let mut out = snapshot.descriptor.compaction_prompt_block();
+
+    if let Some(summary) = snapshot.compaction_summary.as_deref() {
+        out.push_str("\n### 当前压缩摘要\n\n");
+        out.push_str("<summary>\n");
+        out.push_str(summary);
+        out.push_str("\n</summary>\n");
+    } else {
+        out.push_str("\n- 当前还没有已生效的压缩摘要。\n");
+    }
+
+    out
+}
+
+/// Join daemon-provided runtime context with session/compaction context.
+fn join_extra_system_prompt(
+    daemon_extra_system_prompt: Option<&str>,
+    session_compaction_context: Option<&str>,
+) -> Option<String> {
+    let mut parts = Vec::<String>::new();
+
+    if let Some(extra) = daemon_extra_system_prompt {
+        let trimmed = extra.trim();
+        if !trimmed.is_empty() {
+            parts.push(trimmed.to_string());
+        }
+    }
+
+    if let Some(compaction_context) = session_compaction_context {
+        let trimmed = compaction_context.trim();
+        if !trimmed.is_empty() {
+            parts.push(trimmed.to_string());
+        }
+    }
+
+    (!parts.is_empty()).then(|| parts.join("\n\n"))
+}
+
+/// Append one real message to the in-memory conversation and, when enabled,
+/// mirror it into the durable JSONL session segment.
+fn append_message_and_persist(
+    messages: &mut Vec<ChatMessage>,
+    message: ChatMessage,
+    persistent_session: Option<&SessionStore>,
+) -> anyhow::Result<()> {
+    if let Some(session_store) = persistent_session {
+        session_store
+            .append_message(&message)
+            .context("Failed to append message to persisted session")?;
+    }
+    messages.push(message);
+    Ok(())
+}
+
 /// Drain any queued follow-up user messages and append them to the current
 /// conversation history as fresh user turns.
 ///
@@ -585,11 +730,12 @@ SubAgent 是保护主上下文窗口的利器。用不用子代理的判断标�
 fn drain_follow_up_messages(
     task_id: Uuid,
     messages: &mut Vec<ChatMessage>,
+    persistent_session: Option<&SessionStore>,
     drain_queued_user_messages: Option<&DrainQueuedUserMessagesFn>,
     emit: &EmitEventFn,
-) -> bool {
+) -> anyhow::Result<bool> {
     let Some(drain) = drain_queued_user_messages else {
-        return false;
+        return Ok(false);
     };
 
     let queued: Vec<String> = (drain)()
@@ -599,7 +745,7 @@ fn drain_follow_up_messages(
         .collect();
 
     if queued.is_empty() {
-        return false;
+        return Ok(false);
     }
 
     (emit)(
@@ -612,10 +758,14 @@ fn drain_follow_up_messages(
     );
 
     for text in queued {
-        messages.push(ChatMessage::text("user", text));
+        append_message_and_persist(
+            messages,
+            ChatMessage::text("user", text),
+            persistent_session,
+        )?;
     }
 
-    true
+    Ok(true)
 }
 
 /// Normalize third-party skill descriptions so prompt wording stays consistent

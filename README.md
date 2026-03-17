@@ -9,6 +9,7 @@
 - 注入工作区上下文文件（如 `AGENTS.md`、`SOUL.md`、`USER.md`）
 - 加载 `SKILL.md` 形式的技能
 - 运行带工具调用的自治 Agent 循环
+- 将顶层主会话持久化为 `workspace/sessions/*.jsonl`
 - 通过 WebSocket 暴露后端服务
 - 支持 `Send` / `Ask` / `Show` / `SubAgent`
 - 按 OpenClaw 风格处理记忆文件（`MEMORY.md`、`memory/*.md`）
@@ -164,7 +165,26 @@
   - `MemorySearch`
   - `MemoryGet`
 
-### 6. 自治工具调用循环
+### 6. 会话持久化与压缩恢复
+
+`SA` 会把顶层主会话写入工作区下的：
+
+- `sessions/*.jsonl`
+
+行为要点：
+
+- 每条真实会话消息都会实时追加到当前 session 文件
+- 新启动的 `sa` 会从当前 session 文件恢复消息历史，而不是从空白状态重新开始
+- 当 compact 触发时，`SA` 会创建新的 session 文件，而不是改写旧文件
+- 新的 session 文件会记录当前压缩摘要，并保留上一段原始 session 文件路径
+- 运行时 prompt 会把这段“压缩上下文”注入给 Agent，方便它在需要时用 `Read` 精确回看被压缩掉的原始记录
+
+这样做的结果是：
+
+- 后端重启后不会丢掉主会话上下文
+- 被压缩掉的历史仍然保存在旧 session 文件里，可按路径追溯
+
+### 7. 自治工具调用循环
 
 后端会重复执行以下循环直到任务完成：
 
@@ -179,6 +199,7 @@
 - 用户中断当前任务
 - 断线后继续运行
 - 模型调用失败后的无限重试退避
+- 主会话 JSONL 持久化与重启恢复
 
 ## 内置工具
 
@@ -311,6 +332,8 @@ cargo run -p sa --release
 - `127.0.0.1:8765`
 - WS 路径：`/ws`
 
+启动后，顶层主会话会自动落盘到工作区 `sessions/` 目录，不需要额外配置 session 路径。
+
 ### 3. 启动测试前端
 
 `sa-cli` 是单独项目，只是当前阶段的测试前端：
@@ -368,6 +391,10 @@ cargo build --release
 
 ## 版本节点
 
+- `v0.7.2`
+  - 新增 `workspace/sessions/*.jsonl` 顶层会话持久化
+  - 当前模型请求历史改为可从 session 文件恢复
+  - compact 后自动切换新的 session 文件，并把上一段原始会话路径注入压缩上下文
 - `v0.7.0`
   - 切换到 OpenClaw 风格记忆加载
   - 新增 `MemorySearch` / `MemoryGet`

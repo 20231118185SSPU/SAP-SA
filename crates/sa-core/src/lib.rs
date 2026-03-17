@@ -20,6 +20,7 @@ pub mod mcp_transport;
 pub mod memory;
 pub mod openai;
 pub mod retry;
+pub mod session;
 pub mod skills;
 pub mod tools;
 pub mod ws_identity;

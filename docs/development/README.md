@@ -12,6 +12,7 @@
 专题文档：
 
 - `anthropic-wire-api.md`：`/v1/messages` 兼容层如何对齐 Anthropic/Claude 协议
+- `session-persistence.md`：`workspace/sessions/*.jsonl` 会话持久化、恢复与 compaction 切段
 - `token-accounting.md`：SA 当前的 token 统计、usage 回填与 compact 估算策略
 - `responses-wire-api.md`：`/v1/responses` 兼容层如何对齐 `codex` 官方实现
 - `ws-handshake.md`：前后端双向握手与协议身份校验
@@ -36,7 +37,8 @@
    - 当前支持 `stdio`、`http`、`sse`
    - 动态工具注册名格式为 `<server>__<tool>`
 4. 在工作区根目录准备 `AGENTS.md` 以及它引用的上下文文件
-5. 启动后端：
+5. 顶层主会话会自动持久化到工作区 `sessions/` 目录
+6. 启动后端：
 
 ```bash
 cargo run -p sa --release
@@ -152,6 +154,7 @@ cargo build --release
 - Memory 检索仍是 Markdown 词法搜索，不是 embedding 语义检索
 - `Search` 依赖轻量网页搜索解析，若上游页面结构变化，解析逻辑可能需要维护
 - MCP 目前主要覆盖 tools，尚未扩展到更完整的协议面
+- 当前只有顶层主会话会持久化到 `sessions/*.jsonl`，子代理仍然是一次性临时会话
 
 ## 更新日志
 
@@ -163,6 +166,7 @@ cargo build --release
 - `0.6.0`：加入 `Fetch` / `Search` / `Show`，并增强用户可见文件展示协议
 - `0.7.0`：记忆加载改为 OpenClaw 风格 Markdown 记忆文件，`Skill` 改为路径隔离读取
 - `0.7.1`：加入前端先发起的 WS 双向身份握手，新增 `client_hello` / `server_hello` / `hello_reject`
+- `0.7.2`：加入 `workspace/sessions/*.jsonl` 会话持久化、重启恢复与 compact 分段切换
 
 ## 可追溯性
 
