@@ -148,6 +148,3 @@ enabled = false
 # transport = "sse"
 # url = "https://example.com/mcp/sse"
 # tool_timeout_secs = 180
-#
-# Legacy compatibility format (`[[mcp.servers]]`) is still accepted, but new
-# configs should prefer named tables under `[mcp.<name>]`.

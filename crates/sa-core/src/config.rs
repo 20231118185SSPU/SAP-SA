@@ -253,13 +253,9 @@ pub struct McpServerConfig {
 
 /// External MCP client configuration (`[mcp]`).
 ///
-/// Preferred format:
+/// Supported format:
 /// - `[mcp]`
 /// - `[mcp.<server_name>]`
-///
-/// Legacy compatibility format:
-/// - `[mcp]`
-/// - `[[mcp.servers]]`
 #[derive(Debug, Clone, Default)]
 pub struct McpConfig {
     /// Whether MCP support is enabled.
@@ -271,9 +267,8 @@ pub struct McpConfig {
 impl<'de> Deserialize<'de> for McpServerConfig {
     /// Parse one MCP server entry.
     ///
-    /// Supported styles:
-    /// - legacy array item under `[[mcp.servers]]`
-    /// - new named-table item under `[mcp.<name>]`
+    /// Supported style:
+    /// - named-table item under `[mcp.<name>]`
     ///
     /// Transport behavior:
     /// - if `transport` is present, we obey it
@@ -345,19 +340,15 @@ impl<'de> Deserialize<'de> for McpServerConfig {
 impl<'de> Deserialize<'de> for McpConfig {
     /// Parse `[mcp]`.
     ///
-    /// Accepted input forms:
-    /// - new preferred named-table format:
-    ///   - `[mcp]`
-    ///   - `[mcp.filesystem]`
-    /// - legacy compatibility format:
-    ///   - `[mcp]`
-    ///   - `[[mcp.servers]]`
+    /// Accepted input form:
+    /// - `[mcp]`
+    /// - `[mcp.filesystem]`
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
         let raw = RawMcpConfig::deserialize(deserializer)?;
-        let mut servers = raw.servers;
+        let mut servers = Vec::<McpServerConfig>::new();
 
         for (table_name, mut server) in raw.named_servers {
             let table_name = table_name.trim().to_string();
@@ -389,8 +380,6 @@ impl<'de> Deserialize<'de> for McpConfig {
 /// We keep this separate from [`McpServerConfig`] because:
 /// - `[mcp.<name>]` tables do not need an inline `name`
 /// - `transport` is now optional and may be inferred
-/// - we still want to preserve backward compatibility with legacy
-///   `[[mcp.servers]]` entries
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 struct RawMcpServerConfig {
@@ -418,9 +407,7 @@ struct RawMcpServerConfig {
 struct RawMcpConfig {
     /// Whether MCP support is enabled.
     enabled: bool,
-    /// Legacy array-of-tables format.
-    servers: Vec<McpServerConfig>,
-    /// New named-table format: `[mcp.<name>]`.
+    /// Named-table format: `[mcp.<name>]`.
     #[serde(flatten)]
     named_servers: BTreeMap<String, McpServerConfig>,
 }
@@ -490,9 +477,7 @@ fn validate_mcp_config(config: &McpConfig) -> anyhow::Result<()> {
     for server in &config.servers {
         let name = server.name.trim();
         if name.is_empty() {
-            anyhow::bail!(
-                "MCP server name must not be empty; use `[mcp.<name>]` or set `name` in `[[mcp.servers]]`"
-            );
+            anyhow::bail!("MCP server name must not be empty; use `[mcp.<name>]`");
         }
         if !seen_names.insert(name.to_ascii_lowercase()) {
             anyhow::bail!("mcp contains duplicate server name: {name}");
@@ -809,7 +794,7 @@ url = "https://example.com/mcp"
     }
 
     #[test]
-    fn mcp_legacy_array_format_still_parses() {
+    fn mcp_legacy_array_format_is_rejected() {
         let raw = r#"
 [llm]
 base_url = "https://example.com/v1"
@@ -833,11 +818,12 @@ transport = "stdio"
 command = "legacy-mcp"
 "#;
 
-        let cfg = toml::from_str::<Config>(raw).expect("legacy mcp array should parse");
-        assert!(cfg.mcp.enabled);
-        assert_eq!(cfg.mcp.servers.len(), 1);
-        assert_eq!(cfg.mcp.servers[0].name, "legacy");
-        assert_eq!(cfg.mcp.servers[0].transport, McpTransport::Stdio);
+        let err = toml::from_str::<Config>(raw).expect_err("legacy mcp array should fail");
+        assert!(
+            err.to_string().contains("servers")
+                || err.to_string().contains("expected")
+                || err.to_string().contains("unknown field")
+        );
     }
 
     #[test]
