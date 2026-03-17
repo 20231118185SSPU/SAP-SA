@@ -666,11 +666,10 @@ SubAgent 是保护主上下文窗口的利器。用不用子代理的判断标�
 fn build_session_compaction_context_block(snapshot: &crate::session::SessionSnapshot) -> String {
     let mut out = snapshot.descriptor.compaction_prompt_block();
 
-    if let Some(summary) = snapshot.compaction_summary.as_deref() {
-        out.push_str("\n### 当前压缩摘要\n\n");
-        out.push_str("<summary>\n");
-        out.push_str(summary);
-        out.push_str("\n</summary>\n");
+    if snapshot.compaction_summary.is_some() {
+        out.push_str(
+            "\n- 当前已有已恢复的压缩摘要检查点；摘要正文会作为单独的上下文消息自动注入，本块不重复展开。\n",
+        );
     } else {
         out.push_str("\n- 当前还没有已生效的压缩摘要。\n");
     }
@@ -791,4 +790,34 @@ fn normalize_skill_description(raw: &str) -> String {
     }
 
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::{SessionDescriptor, SessionSnapshot};
+
+    /// Restored sessions should describe the compaction checkpoint once, but the
+    /// actual summary body must stay out of the system prompt so request
+    /// building can inject it exactly once in synthetic message form.
+    #[test]
+    fn restored_compaction_context_omits_summary_body() {
+        let summary_body = "## 目标\n- 保持唯一摘要注入";
+        let snapshot = SessionSnapshot {
+            descriptor: SessionDescriptor {
+                conversation_id: Uuid::nil(),
+                current_session_path: "sessions/current.jsonl".to_string(),
+                previous_session_path: Some("sessions/previous.jsonl".to_string()),
+            },
+            compaction_summary: Some(summary_body.to_string()),
+            messages: Vec::new(),
+            truncated_incomplete_messages: 0,
+        };
+
+        let context = build_session_compaction_context_block(&snapshot);
+        assert!(context.contains("sessions/current.jsonl"));
+        assert!(context.contains("sessions/previous.jsonl"));
+        assert!(context.contains("摘要正文会作为单独的上下文消息自动注入"));
+        assert!(!context.contains(summary_body));
+    }
 }

@@ -27,11 +27,12 @@
 use crate::openai::{ChatMessage, ChatUsage, ResponsesInputItem, ToolCall};
 use anyhow::Context as _;
 use chrono::{DateTime, Utc};
+use fs4::fs_std::FileExt as _;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead as _, BufReader, Write as _};
+use std::io::Write as _;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
@@ -42,6 +43,10 @@ pub const SESSIONS_DIR_NAME: &str = "sessions";
 /// Pointer file that stores the workspace-relative path of the active session
 /// segment.
 const CURRENT_SESSION_POINTER_FILE_NAME: &str = ".current";
+
+/// Lock file used to guard one workspace session directory from concurrent
+/// backend ownership.
+const SESSION_STORE_LOCK_FILE_NAME: &str = ".sa-session.lock";
 
 /// JSONL schema version for session files.
 const SESSION_SCHEMA_VERSION: u32 = 1;
@@ -104,6 +109,8 @@ pub struct SessionStore {
     sessions_dir: PathBuf,
     /// `<workspace>/sessions/.current`.
     pointer_path: PathBuf,
+    /// File handle that keeps the cross-process lock alive.
+    _process_lock: Arc<File>,
     /// Mutable pointer to the currently active segment.
     state: Arc<Mutex<SessionState>>,
 }
@@ -130,6 +137,8 @@ struct ParsedSessionFile {
     compaction_summary: Option<String>,
     /// Real conversation messages stored in this segment.
     messages: Vec<ChatMessage>,
+    /// Whether the parser discarded one truncated trailing JSONL fragment.
+    truncated_partial_tail: bool,
 }
 
 /// One replay-safety repair result.
@@ -256,13 +265,27 @@ impl SessionStore {
                 sessions_dir.display()
             )
         })?;
+        let sessions_dir = fs::canonicalize(&sessions_dir).with_context(|| {
+            format!(
+                "Failed to canonicalize session directory after creation: {}",
+                sessions_dir.display()
+            )
+        })?;
+        ensure_path_is_under_directory(&sessions_dir, &workspace_root).with_context(|| {
+            format!(
+                "Session directory resolved outside workspace root: {}",
+                sessions_dir.display()
+            )
+        })?;
         let pointer_path = sessions_dir.join(CURRENT_SESSION_POINTER_FILE_NAME);
+        let process_lock = acquire_session_store_lock(&sessions_dir)?;
         let state = resolve_or_create_current_state(&workspace_root, &sessions_dir, &pointer_path)?;
 
         Ok(Self {
             workspace_root,
             sessions_dir,
             pointer_path,
+            _process_lock: Arc::new(process_lock),
             state: Arc::new(Mutex::new(state)),
         })
     }
@@ -281,7 +304,7 @@ impl SessionStore {
         let parsed = parse_session_file(&state.current_absolute_path)?;
         let repaired = sanitize_replayable_messages(parsed.messages);
 
-        if repaired.truncated_count > 0 {
+        if parsed.truncated_partial_tail || repaired.truncated_count > 0 {
             rewrite_existing_segment(
                 &state.current_absolute_path,
                 &parsed.meta,
@@ -371,7 +394,8 @@ fn resolve_or_create_current_state(
     pointer_path: &Path,
 ) -> anyhow::Result<SessionState> {
     if let Some(relative_path) = read_pointer_file(pointer_path)? {
-        let absolute_path = resolve_workspace_relative_path(workspace_root, &relative_path)?;
+        let absolute_path =
+            resolve_session_segment_path(workspace_root, sessions_dir, &relative_path)?;
         if absolute_path.is_file() {
             let parsed = parse_session_file(&absolute_path)?;
             return Ok(SessionState {
@@ -383,7 +407,7 @@ fn resolve_or_create_current_state(
         }
     }
 
-    if let Some(absolute_path) = latest_session_file(sessions_dir)? {
+    if let Some(absolute_path) = latest_session_file(workspace_root, sessions_dir)? {
         let parsed = parse_session_file(&absolute_path)?;
         let relative_path = workspace_relative_path(workspace_root, &absolute_path)?;
         write_pointer_file(pointer_path, &relative_path)?;
@@ -436,62 +460,53 @@ fn create_new_segment(
 
 /// Parse one full session segment file.
 fn parse_session_file(path: &Path) -> anyhow::Result<ParsedSessionFile> {
-    let file = File::open(path)
-        .with_context(|| format!("Failed to open session file: {}", path.display()))?;
-    let reader = BufReader::new(file);
-
+    let raw = fs::read(path)
+        .with_context(|| format!("Failed to read session file: {}", path.display()))?;
     let mut meta = None::<SessionMetaEntry>;
     let mut compaction_summary = None::<String>;
     let mut messages = Vec::<ChatMessage>::new();
+    let mut truncated_partial_tail = false;
+    let mut line_number = 0usize;
+    let mut line_start = 0usize;
 
-    for (line_index, line_result) in reader.lines().enumerate() {
-        let line_number = line_index + 1;
-        let line = line_result.with_context(|| {
-            format!(
-                "Failed to read line {line_number} from session file {}",
-                path.display()
-            )
-        })?;
-
-        if line.trim().is_empty() {
+    for (index, byte) in raw.iter().enumerate() {
+        if *byte != b'\n' {
             continue;
         }
 
-        let entry: SessionEntry = serde_json::from_str(&line).with_context(|| {
-            format!(
-                "Failed to parse JSONL entry at {} line {}",
-                path.display(),
-                line_number
-            )
-        })?;
+        line_number += 1;
+        if let Some(entry) = parse_session_line(&raw[line_start..index], path, line_number)? {
+            apply_session_entry(
+                entry,
+                path,
+                line_number,
+                &mut meta,
+                &mut compaction_summary,
+                &mut messages,
+            )?;
+        }
+        line_start = index + 1;
+    }
 
-        match entry {
-            SessionEntry::SessionMeta(item) => {
-                if meta.is_some() {
-                    anyhow::bail!(
-                        "Session file {} contains more than one `session_meta` entry",
-                        path.display()
-                    );
-                }
-                meta = Some(item);
+    if line_start < raw.len() {
+        line_number += 1;
+        match parse_session_line(&raw[line_start..], path, line_number) {
+            Ok(Some(entry)) => {
+                apply_session_entry(
+                    entry,
+                    path,
+                    line_number,
+                    &mut meta,
+                    &mut compaction_summary,
+                    &mut messages,
+                )?;
             }
-            SessionEntry::CompactionCheckpoint(item) => {
-                if meta.is_none() {
-                    anyhow::bail!(
-                        "Session file {} contains `compaction_checkpoint` before `session_meta`",
-                        path.display()
-                    );
-                }
-                compaction_summary = Some(item.summary);
-            }
-            SessionEntry::Message(item) => {
-                if meta.is_none() {
-                    anyhow::bail!(
-                        "Session file {} contains `message` before `session_meta`",
-                        path.display()
-                    );
-                }
-                messages.push(item.message.into());
+            Ok(None) => {}
+            Err(_) => {
+                // A crash can leave one final JSONL fragment without a newline.
+                // We discard only that trailing fragment; all earlier lines stay
+                // strict and must still parse.
+                truncated_partial_tail = true;
             }
         }
     }
@@ -507,6 +522,7 @@ fn parse_session_file(path: &Path) -> anyhow::Result<ParsedSessionFile> {
         meta,
         compaction_summary,
         messages,
+        truncated_partial_tail,
     })
 }
 
@@ -688,6 +704,7 @@ fn read_pointer_file(pointer_path: &Path) -> anyhow::Result<Option<String>> {
     if !pointer_path.is_file() {
         return Ok(None);
     }
+    reject_symlink_path(pointer_path, "Current-session pointer file")?;
 
     let raw = fs::read_to_string(pointer_path).with_context(|| {
         format!(
@@ -705,6 +722,7 @@ fn read_pointer_file(pointer_path: &Path) -> anyhow::Result<Option<String>> {
 
 /// Persist the active-session pointer file.
 fn write_pointer_file(pointer_path: &Path, relative_path: &str) -> anyhow::Result<()> {
+    reject_symlink_path(pointer_path, "Current-session pointer file")?;
     fs::write(pointer_path, format!("{relative_path}\n")).with_context(|| {
         format!(
             "Failed to write current-session pointer file: {}",
@@ -715,7 +733,10 @@ fn write_pointer_file(pointer_path: &Path, relative_path: &str) -> anyhow::Resul
 
 /// Locate the lexicographically newest `*.jsonl` session file in the sessions
 /// directory.
-fn latest_session_file(sessions_dir: &Path) -> anyhow::Result<Option<PathBuf>> {
+fn latest_session_file(
+    workspace_root: &Path,
+    sessions_dir: &Path,
+) -> anyhow::Result<Option<PathBuf>> {
     let mut candidates = fs::read_dir(sessions_dir)
         .with_context(|| {
             format!(
@@ -723,8 +744,12 @@ fn latest_session_file(sessions_dir: &Path) -> anyhow::Result<Option<PathBuf>> {
                 sessions_dir.display()
             )
         })?
-        .filter_map(|entry| entry.ok().map(|item| item.path()))
-        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("jsonl"))
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let path = entry.path();
+            let relative_path = workspace_relative_path(workspace_root, &path).ok()?;
+            resolve_session_segment_path(workspace_root, sessions_dir, &relative_path).ok()
+        })
         .collect::<Vec<_>>();
 
     candidates.sort();
@@ -733,10 +758,7 @@ fn latest_session_file(sessions_dir: &Path) -> anyhow::Result<Option<PathBuf>> {
 
 /// Resolve a workspace-relative path and reject any attempt to escape the
 /// workspace root.
-fn resolve_workspace_relative_path(
-    workspace_root: &Path,
-    relative_path: &str,
-) -> anyhow::Result<PathBuf> {
+fn normalize_workspace_relative_path(relative_path: &str) -> anyhow::Result<PathBuf> {
     let raw = Path::new(relative_path);
     if raw.is_absolute() {
         anyhow::bail!("Session pointer path must be workspace-relative: {relative_path}");
@@ -756,7 +778,171 @@ fn resolve_workspace_relative_path(
         }
     }
 
-    Ok(workspace_root.join(normalized))
+    Ok(normalized)
+}
+
+/// Resolve one session-segment path from the pointer file and enforce the
+/// `workspace/sessions/*.jsonl` boundary.
+fn resolve_session_segment_path(
+    workspace_root: &Path,
+    sessions_dir: &Path,
+    relative_path: &str,
+) -> anyhow::Result<PathBuf> {
+    let normalized = normalize_workspace_relative_path(relative_path)?;
+    let Some(Component::Normal(first_component)) = normalized.components().next() else {
+        anyhow::bail!("Session pointer path must target a file under `sessions/`: {relative_path}");
+    };
+    if first_component != std::ffi::OsStr::new(SESSIONS_DIR_NAME) {
+        anyhow::bail!("Session pointer path must stay under `sessions/`: {relative_path}");
+    }
+    if normalized.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+        anyhow::bail!("Session pointer path must target a `.jsonl` file: {relative_path}");
+    }
+
+    let absolute_path = workspace_root.join(&normalized);
+    if !absolute_path.exists() {
+        return Ok(absolute_path);
+    }
+
+    reject_symlink_path(&absolute_path, "Session segment path")?;
+    let canonical = fs::canonicalize(&absolute_path).with_context(|| {
+        format!(
+            "Failed to canonicalize session segment path: {}",
+            absolute_path.display()
+        )
+    })?;
+    ensure_path_is_under_directory(&canonical, sessions_dir).with_context(|| {
+        format!(
+            "Session segment path resolved outside `sessions/`: {}",
+            canonical.display()
+        )
+    })?;
+
+    Ok(canonical)
+}
+
+/// Acquire one exclusive lock for the whole persistent session directory.
+fn acquire_session_store_lock(sessions_dir: &Path) -> anyhow::Result<File> {
+    let lock_path = sessions_dir.join(SESSION_STORE_LOCK_FILE_NAME);
+    let lock_file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("Failed to open session lock file: {}", lock_path.display()))?;
+
+    let acquired = lock_file.try_lock_exclusive().with_context(|| {
+        format!(
+            "Failed to acquire session storage lock for {}",
+            sessions_dir.display()
+        )
+    })?;
+    if !acquired {
+        anyhow::bail!(
+            "Another SA backend instance is already using session storage under {}",
+            sessions_dir.display()
+        );
+    }
+
+    Ok(lock_file)
+}
+
+/// Reject symbolic links for security-sensitive session metadata paths.
+fn reject_symlink_path(path: &Path, label: &str) -> anyhow::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            anyhow::bail!("{label} must not be a symbolic link: {}", path.display());
+        }
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => {
+            Err(err).with_context(|| format!("Failed to inspect {label}: {}", path.display()))
+        }
+    }
+}
+
+/// Verify that a canonicalized path still stays under the expected directory.
+fn ensure_path_is_under_directory(path: &Path, directory: &Path) -> anyhow::Result<()> {
+    path.strip_prefix(directory).map(|_| ()).with_context(|| {
+        format!(
+            "Path {} is not under {}",
+            path.display(),
+            directory.display()
+        )
+    })
+}
+
+/// Parse one raw JSONL line into a session entry.
+fn parse_session_line(
+    line_bytes: &[u8],
+    path: &Path,
+    line_number: usize,
+) -> anyhow::Result<Option<SessionEntry>> {
+    let line_bytes = line_bytes.strip_suffix(b"\r").unwrap_or(line_bytes);
+    let line = std::str::from_utf8(line_bytes).with_context(|| {
+        format!(
+            "Failed to decode UTF-8 session entry at {} line {}",
+            path.display(),
+            line_number
+        )
+    })?;
+    if line.trim().is_empty() {
+        return Ok(None);
+    }
+
+    let entry = serde_json::from_str::<SessionEntry>(line).with_context(|| {
+        format!(
+            "Failed to parse JSONL entry at {} line {}",
+            path.display(),
+            line_number
+        )
+    })?;
+    Ok(Some(entry))
+}
+
+/// Apply one parsed entry while enforcing the session-file ordering rules.
+fn apply_session_entry(
+    entry: SessionEntry,
+    path: &Path,
+    line_number: usize,
+    meta: &mut Option<SessionMetaEntry>,
+    compaction_summary: &mut Option<String>,
+    messages: &mut Vec<ChatMessage>,
+) -> anyhow::Result<()> {
+    match entry {
+        SessionEntry::SessionMeta(item) => {
+            if meta.is_some() {
+                anyhow::bail!(
+                    "Session file {} contains more than one `session_meta` entry (line {})",
+                    path.display(),
+                    line_number
+                );
+            }
+            *meta = Some(item);
+        }
+        SessionEntry::CompactionCheckpoint(item) => {
+            if meta.is_none() {
+                anyhow::bail!(
+                    "Session file {} contains `compaction_checkpoint` before `session_meta` (line {})",
+                    path.display(),
+                    line_number
+                );
+            }
+            *compaction_summary = Some(item.summary);
+        }
+        SessionEntry::Message(item) => {
+            if meta.is_none() {
+                anyhow::bail!(
+                    "Session file {} contains `message` before `session_meta` (line {})",
+                    path.display(),
+                    line_number
+                );
+            }
+            messages.push(item.message.into());
+        }
+    }
+
+    Ok(())
 }
 
 /// Convert an absolute path under the workspace root into a forward-slash
@@ -821,6 +1007,7 @@ mod tests {
             .append_message(&assistant)
             .expect("assistant message should append");
 
+        drop(store);
         let reloaded = SessionStore::new(workspace.path().to_path_buf())
             .expect("reloaded session store should build");
         let snapshot = reloaded
@@ -915,5 +1102,68 @@ mod tests {
         assert_eq!(snapshot.truncated_incomplete_messages, 1);
         assert_eq!(snapshot.messages.len(), 1);
         assert_eq!(snapshot.messages[0].role, "user");
+    }
+
+    /// A truncated final JSONL fragment should be discarded and repaired in
+    /// place so the durable session remains readable after a crash.
+    #[test]
+    fn session_store_repairs_truncated_partial_jsonl_tail() {
+        let (workspace, store) = create_store();
+        store
+            .append_message(&ChatMessage::text("user", "hello"))
+            .expect("user message should append");
+
+        let current_path = workspace.path().join(store.current_session_path());
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(&current_path)
+            .expect("session file should open for append");
+        file.write_all(br#"{"type":"message","created_at":"#)
+            .expect("partial JSONL fragment should append");
+        file.flush().expect("partial JSONL fragment should flush");
+
+        let snapshot = store
+            .load_snapshot()
+            .expect("snapshot should recover from truncated final line");
+        assert_eq!(snapshot.messages.len(), 1);
+        assert_eq!(snapshot.messages[0].content.as_deref(), Some("hello"));
+
+        let repaired = fs::read_to_string(&current_path).expect("repaired session should read");
+        assert_eq!(repaired.lines().count(), 2);
+        assert!(repaired.ends_with('\n'));
+        let reloaded = store
+            .load_snapshot()
+            .expect("repaired session should stay readable on later loads");
+        assert_eq!(reloaded.messages.len(), 1);
+    }
+
+    /// Pointer files must not redirect recovery outside the dedicated
+    /// `workspace/sessions/` directory.
+    #[test]
+    fn session_store_rejects_pointer_outside_sessions_dir() {
+        let (workspace, store) = create_store();
+        let pointer_path = workspace
+            .path()
+            .join(SESSIONS_DIR_NAME)
+            .join(CURRENT_SESSION_POINTER_FILE_NAME);
+        fs::write(&pointer_path, "notes.jsonl\n").expect("pointer file should be overwritten");
+        drop(store);
+
+        let err = SessionStore::new(workspace.path().to_path_buf())
+            .expect_err("pointer outside sessions dir must be rejected");
+        let message = format!("{err:#}");
+        assert!(message.contains("must stay under `sessions/`"));
+    }
+
+    /// Only one live backend owner may hold the persistent session directory at
+    /// a time.
+    #[test]
+    fn session_store_rejects_second_live_owner_for_same_workspace() {
+        let (workspace, _store) = create_store();
+
+        let err = SessionStore::new(workspace.path().to_path_buf())
+            .expect_err("second live owner should be rejected");
+        let message = format!("{err:#}");
+        assert!(message.contains("already using session storage"));
     }
 }

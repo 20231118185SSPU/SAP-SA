@@ -8,6 +8,7 @@ anyhow = "1.0.99"
 async-trait = "0.1.89"
 base64 = "0.22.1"
 chrono = { version = "0.4.42", features = ["serde"] }
+fs4 = "0.13.1"
 hex = "0.4.3"
 hostname = "0.4.1"
 mac_address = "1.1.8"
