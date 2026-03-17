@@ -6,6 +6,7 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -54,10 +55,12 @@ pub struct StdioTransport {
 impl StdioTransport {
     /// Spawn the configured stdio MCP server.
     pub fn new(config: &McpServerConfig) -> Result<Self> {
-        let resolved_program = resolve_stdio_program(&config.command);
+        let spawn_env = create_env_for_mcp_server(Some(config.env.clone()));
+        let resolved_program = resolve_stdio_program(OsString::from(&config.command), &spawn_env)?;
         let mut child = Command::new(&resolved_program)
             .args(&config.args)
-            .envs(&config.env)
+            .env_clear()
+            .envs(&spawn_env)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit())
@@ -115,31 +118,107 @@ impl StdioTransport {
     }
 }
 
+/// Build the environment map passed to one stdio MCP child process.
+///
+/// This intentionally follows the same shape as Codex:
+/// - start from a small allowlist of host environment variables
+/// - then apply explicit per-server overrides from config
+///
+/// The resulting map is used for both:
+/// - Windows program resolution (`PATH` + `PATHEXT`)
+/// - the actual `env_clear() + envs(...)` child spawn
+fn create_env_for_mcp_server(
+    extra_env: Option<HashMap<String, String>>,
+) -> HashMap<String, String> {
+    DEFAULT_ENV_VARS
+        .iter()
+        .copied()
+        .filter_map(|var| {
+            std::env::var(var)
+                .ok()
+                .map(|value| (var.to_string(), value))
+        })
+        .chain(extra_env.unwrap_or_default())
+        .collect()
+}
+
+/// Default inherited environment allowlist for Unix stdio MCP children.
+#[cfg(unix)]
+const DEFAULT_ENV_VARS: &[&str] = &[
+    "HOME",
+    "LOGNAME",
+    "PATH",
+    "SHELL",
+    "USER",
+    "__CF_USER_TEXT_ENCODING",
+    "LANG",
+    "LC_ALL",
+    "TERM",
+    "TMPDIR",
+    "TZ",
+];
+
+/// Default inherited environment allowlist for Windows stdio MCP children.
+#[cfg(windows)]
+const DEFAULT_ENV_VARS: &[&str] = &[
+    "PATH",
+    "PATHEXT",
+    "COMSPEC",
+    "SYSTEMROOT",
+    "SYSTEMDRIVE",
+    "USERNAME",
+    "USERDOMAIN",
+    "USERPROFILE",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "PROGRAMFILES",
+    "PROGRAMFILES(X86)",
+    "PROGRAMW6432",
+    "PROGRAMDATA",
+    "LOCALAPPDATA",
+    "APPDATA",
+    "TEMP",
+    "TMP",
+    "POWERSHELL",
+    "PWSH",
+];
+
 /// Resolve a stdio MCP program name into the executable path we should pass to
 /// `Command::new()`.
 ///
-/// Why this exists:
-///
-/// - On Unix, `Command::new("npx")` can execute PATH entries directly.
-/// - On Windows, many tool launchers are actually `*.cmd` shims on PATH
-///   (`npx.cmd`, `pnpm.cmd`, `yarn.cmd`, ...).
-/// - `tokio::process::Command` does not reliably resolve those shim names when
-///   the extension is omitted, so `command = "npx"` fails even though the
-///   command works in PowerShell.
-///
-/// We therefore resolve through `which`, which respects `PATH` + `PATHEXT`, and
-/// fall back to the original string if resolution fails so the eventual spawn
-/// error still reflects the user-configured command.
+/// This mirrors Codex's MCP program resolver so Windows `.cmd` / `.bat` shims
+/// such as `npx` and `pnpm` work reliably.
 #[cfg(windows)]
-fn resolve_stdio_program(program: &str) -> PathBuf {
-    which::which(program).unwrap_or_else(|_| PathBuf::from(program))
+fn resolve_stdio_program(
+    program: OsString,
+    env: &HashMap<String, String>,
+) -> std::io::Result<PathBuf> {
+    let cwd = std::env::current_dir().map_err(|error| {
+        std::io::Error::other(format!("Failed to get current directory: {error}"))
+    })?;
+    let search_path = env.get("PATH");
+
+    match which::which_in(&program, search_path, &cwd) {
+        Ok(resolved) => Ok(resolved),
+        Err(error) => {
+            tracing::debug!(
+                "Failed to resolve MCP stdio program {:?}: {}. Falling back to original path.",
+                program,
+                error
+            );
+            Ok(PathBuf::from(program))
+        }
+    }
 }
 
 /// Unix kernels already handle PATH lookup and shebang execution correctly, so
 /// we keep the original program name untouched.
 #[cfg(not(windows))]
-fn resolve_stdio_program(program: &str) -> PathBuf {
-    PathBuf::from(program)
+fn resolve_stdio_program(
+    program: OsString,
+    _env: &HashMap<String, String>,
+) -> std::io::Result<PathBuf> {
+    Ok(PathBuf::from(program))
 }
 
 #[async_trait]
@@ -855,6 +934,7 @@ pub fn create_transport(config: &McpServerConfig) -> Result<Box<dyn McpTransport
 mod tests {
     use super::*;
     use std::fs;
+    use tempfile::TempDir;
 
     #[test]
     fn parse_plain_json_response() {
@@ -872,42 +952,91 @@ mod tests {
         assert_eq!(parsed.id, Some(serde_json::json!(2)));
     }
 
-    /// On Windows, MCP stdio launchers such as `npx` are often `.cmd` shims on
-    /// PATH. We must resolve them before calling `Command::new()`.
-    #[cfg(windows)]
-    #[test]
-    fn resolve_stdio_program_finds_cmd_shim_on_path() {
-        let temp = tempfile::TempDir::new().expect("temp dir should exist");
-        let shim = temp.path().join("test-mcp-launcher.cmd");
-        fs::write(&shim, "@echo off\r\nexit /b 0\r\n").expect("cmd shim should be written");
+    /// Build a temporary test executable plus the environment map used to
+    /// resolve and launch it.
+    struct TestExecutableEnv {
+        _temp_dir: TempDir,
+        program_name: String,
+        mcp_env: HashMap<String, String>,
+    }
 
-        let original_path = std::env::var("PATH").ok();
-        let original_pathext = std::env::var("PATHEXT").ok();
+    impl TestExecutableEnv {
+        const TEST_PROGRAM: &'static str = "test_mcp_server";
 
-        let sep = if cfg!(windows) { ";" } else { ":" };
-        let new_path = match &original_path {
-            Some(existing) if !existing.is_empty() => {
-                format!("{}{}{}", temp.path().display(), sep, existing)
+        fn new() -> anyhow::Result<Self> {
+            let temp_dir = TempDir::new()?;
+            let dir_path = temp_dir.path();
+
+            Self::create_executable(dir_path)?;
+
+            let mut extra_env = HashMap::new();
+            extra_env.insert("PATH".to_string(), Self::build_path(dir_path));
+
+            #[cfg(windows)]
+            extra_env.insert("PATHEXT".to_string(), Self::ensure_cmd_extension());
+
+            let mcp_env = create_env_for_mcp_server(Some(extra_env));
+
+            Ok(Self {
+                _temp_dir: temp_dir,
+                program_name: Self::TEST_PROGRAM.to_string(),
+                mcp_env,
+            })
+        }
+
+        #[cfg(windows)]
+        fn create_executable(dir: &std::path::Path) -> anyhow::Result<()> {
+            let file = dir.join(format!("{}.cmd", Self::TEST_PROGRAM));
+            fs::write(&file, "@echo off\r\nexit /b 0\r\n")?;
+            Ok(())
+        }
+
+        #[cfg(unix)]
+        fn create_executable(dir: &std::path::Path) -> anyhow::Result<()> {
+            use std::os::unix::fs::PermissionsExt;
+
+            let file = dir.join(Self::TEST_PROGRAM);
+            fs::write(&file, "#!/bin/sh\nexit 0\n")?;
+            let mut perms = fs::metadata(&file)?.permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&file, perms)?;
+            Ok(())
+        }
+
+        fn build_path(dir: &std::path::Path) -> String {
+            let current = std::env::var("PATH").unwrap_or_default();
+            let sep = if cfg!(windows) { ";" } else { ":" };
+            format!("{}{sep}{current}", dir.to_string_lossy())
+        }
+
+        #[cfg(windows)]
+        fn ensure_cmd_extension() -> String {
+            let current = std::env::var("PATHEXT").unwrap_or_default();
+            if current.to_uppercase().contains(".CMD") {
+                current
+            } else {
+                format!(".CMD;{current}")
             }
-            _ => temp.path().display().to_string(),
-        };
-
-        unsafe {
-            std::env::set_var("PATH", new_path);
-            std::env::set_var("PATHEXT", ".CMD;.EXE;.BAT;.COM");
         }
+    }
 
-        let resolved = resolve_stdio_program("test-mcp-launcher");
+    /// Program resolution should produce an executable path that actually
+    /// launches under the same child environment we will use for MCP stdio.
+    #[tokio::test]
+    async fn resolved_stdio_program_executes_successfully() -> anyhow::Result<()> {
+        let env = TestExecutableEnv::new()?;
+        let resolved = resolve_stdio_program(OsString::from(&env.program_name), &env.mcp_env)?;
 
-        match original_path {
-            Some(value) => unsafe { std::env::set_var("PATH", value) },
-            None => unsafe { std::env::remove_var("PATH") },
-        }
-        match original_pathext {
-            Some(value) => unsafe { std::env::set_var("PATHEXT", value) },
-            None => unsafe { std::env::remove_var("PATHEXT") },
-        }
+        let output = Command::new(resolved)
+            .env_clear()
+            .envs(&env.mcp_env)
+            .output()
+            .await;
 
-        assert_eq!(resolved, shim);
+        assert!(
+            output.is_ok(),
+            "Resolved stdio program should execute successfully"
+        );
+        Ok(())
     }
 }
