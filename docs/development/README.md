@@ -33,8 +33,11 @@
    - `reasoning_effort`（可选，例如 `low`、`high`、`xhigh`）
 3. 可选配置 `[mcp]`
    - `enabled = true`
-   - 配置一个或多个 `[[mcp.servers]]`
+   - 配置一个或多个 `[mcp.<name>]`
    - 当前支持 `stdio`、`http`、`sse`
+   - `command` 会自动推断为 `stdio`
+   - `url` 会自动推断为 `http`
+   - 只有需要 SSE 时才额外设置 `transport = "sse"`
    - 动态工具注册名格式为 `<server>__<tool>`
 4. 在工作区根目录准备 `AGENTS.md` 以及它引用的上下文文件
 5. 顶层主会话会自动持久化到工作区 `sessions/` 目录

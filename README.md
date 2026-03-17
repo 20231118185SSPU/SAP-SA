@@ -139,9 +139,16 @@
 加载方式：
 
 - 在 `sa.toml` 中配置 `[mcp]`
+- 具体 server 使用 `[mcp.<name>]` 命名子表
 - 启动时连接所有配置的 MCP server
 - 成功连接后，把它们暴露的工具自动注册进 Agent 工具表
 - 工具名会带服务器前缀，格式为：`<server>__<tool>`
+
+配置风格参考 Codex，但根表简化为 `mcp`：
+
+- `command` => 自动推断为 `stdio`
+- `url` => 自动推断为 `http`
+- 只有需要 SSE 时，才额外设置 `transport = "sse"`
 
 例如：
 
@@ -313,9 +320,7 @@ reasoning_effort = "high"
 [mcp]
 enabled = true
 
-[[mcp.servers]]
-name = "filesystem"
-transport = "stdio"
+[mcp.filesystem]
 command = "npx"
 args = ["-y", "@modelcontextprotocol/server-filesystem", "."]
 tool_timeout_secs = 180

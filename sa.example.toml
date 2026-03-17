@@ -125,24 +125,29 @@ enabled = false
 
 # Configure one or more MCP servers.
 #
+# Preferred format: `[mcp.<name>]`
+#
+# Transport selection is Codex-like:
+# - set `command` => infer `stdio`
+# - set `url`     => infer `http`
+# - if you specifically need SSE, add `transport = "sse"`
+#
 # Stdio example:
-# [[mcp.servers]]
-# name = "filesystem"
-# transport = "stdio"
+# [mcp.filesystem]
 # command = "npx"
 # args = ["-y", "@modelcontextprotocol/server-filesystem", "."]
 # tool_timeout_secs = 180
 #
 # HTTP example:
-# [[mcp.servers]]
-# name = "remote"
-# transport = "http"
+# [mcp.remote]
 # url = "https://example.com/mcp"
 # tool_timeout_secs = 180
 #
 # SSE example:
-# [[mcp.servers]]
-# name = "remote-sse"
+# [mcp.remote_sse]
 # transport = "sse"
 # url = "https://example.com/mcp/sse"
 # tool_timeout_secs = 180
+#
+# Legacy compatibility format (`[[mcp.servers]]`) is still accepted, but new
+# configs should prefer named tables under `[mcp.<name>]`.

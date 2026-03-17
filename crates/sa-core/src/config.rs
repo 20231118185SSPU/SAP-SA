@@ -12,7 +12,9 @@
 use crate::compact::CompactionConfig;
 use crate::openai::{AuthStyle, WireApi};
 use anyhow::Context as _;
-use serde::Deserialize;
+use serde::de::Error as SerdeError;
+use serde::{Deserialize, Deserializer};
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 /// Root configuration object (maps to the full `sa.toml`).
@@ -229,42 +231,198 @@ pub enum McpTransport {
 }
 
 /// Configuration for one external MCP server.
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct McpServerConfig {
     /// Display name used as the tool prefix (`<server>__<tool>`).
     pub name: String,
     /// Transport type.
-    #[serde(default)]
     pub transport: McpTransport,
     /// URL for HTTP/SSE transports.
-    #[serde(default)]
     pub url: Option<String>,
     /// Executable for stdio transport.
-    #[serde(default)]
     pub command: String,
     /// Arguments for stdio transport.
-    #[serde(default)]
     pub args: Vec<String>,
     /// Extra environment variables for stdio transport.
-    #[serde(default)]
     pub env: std::collections::HashMap<String, String>,
     /// Extra HTTP headers for HTTP/SSE transports.
-    #[serde(default)]
     pub headers: std::collections::HashMap<String, String>,
     /// Optional per-call timeout in seconds.
-    #[serde(default)]
     pub tool_timeout_secs: Option<u64>,
 }
 
 /// External MCP client configuration (`[mcp]`).
-#[derive(Debug, Clone, Deserialize, Default)]
+///
+/// Preferred format:
+/// - `[mcp]`
+/// - `[mcp.<server_name>]`
+///
+/// Legacy compatibility format:
+/// - `[mcp]`
+/// - `[[mcp.servers]]`
+#[derive(Debug, Clone, Default)]
 pub struct McpConfig {
     /// Whether MCP support is enabled.
-    #[serde(default)]
     pub enabled: bool,
     /// Configured MCP servers.
-    #[serde(default)]
     pub servers: Vec<McpServerConfig>,
+}
+
+impl<'de> Deserialize<'de> for McpServerConfig {
+    /// Parse one MCP server entry.
+    ///
+    /// Supported styles:
+    /// - legacy array item under `[[mcp.servers]]`
+    /// - new named-table item under `[mcp.<name>]`
+    ///
+    /// Transport behavior:
+    /// - if `transport` is present, we obey it
+    /// - otherwise:
+    ///   - `command` => `stdio`
+    ///   - `url` => `http`
+    /// - `sse` remains available via explicit `transport = "sse"`
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = RawMcpServerConfig::deserialize(deserializer)?;
+
+        let name = raw.name.unwrap_or_default().trim().to_string();
+        let command = raw.command.unwrap_or_default();
+        let url = raw.url.unwrap_or_default();
+        let has_command = !command.trim().is_empty();
+        let has_url = !url.trim().is_empty();
+
+        if has_command && has_url {
+            return Err(SerdeError::custom(
+                "MCP server config must not set both `command` and `url`",
+            ));
+        }
+
+        let transport = match raw.transport {
+            Some(transport) => transport,
+            None if has_command => McpTransport::Stdio,
+            None if has_url => McpTransport::Http,
+            None => {
+                return Err(SerdeError::custom(
+                    "MCP server config must set either `command` or `url`",
+                ));
+            }
+        };
+
+        match transport {
+            McpTransport::Stdio if !has_command => {
+                return Err(SerdeError::custom(
+                    "MCP server with transport=stdio requires non-empty `command`",
+                ));
+            }
+            McpTransport::Http | McpTransport::Sse if !has_url => {
+                return Err(SerdeError::custom(format!(
+                    "MCP server with transport={} requires non-empty `url`",
+                    match transport {
+                        McpTransport::Http => "http",
+                        McpTransport::Sse => "sse",
+                        McpTransport::Stdio => "stdio",
+                    }
+                )));
+            }
+            _ => {}
+        }
+
+        Ok(Self {
+            name,
+            transport,
+            url: has_url.then_some(url),
+            command,
+            args: raw.args,
+            env: raw.env,
+            headers: raw.headers,
+            tool_timeout_secs: raw.tool_timeout_secs,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for McpConfig {
+    /// Parse `[mcp]`.
+    ///
+    /// Accepted input forms:
+    /// - new preferred named-table format:
+    ///   - `[mcp]`
+    ///   - `[mcp.filesystem]`
+    /// - legacy compatibility format:
+    ///   - `[mcp]`
+    ///   - `[[mcp.servers]]`
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = RawMcpConfig::deserialize(deserializer)?;
+        let mut servers = raw.servers;
+
+        for (table_name, mut server) in raw.named_servers {
+            let table_name = table_name.trim().to_string();
+            if table_name.is_empty() {
+                return Err(SerdeError::custom("MCP named table key must not be empty"));
+            }
+
+            if server.name.trim().is_empty() {
+                server.name = table_name;
+            } else if server.name.trim() != table_name {
+                return Err(SerdeError::custom(format!(
+                    "MCP named table `[mcp.{table_name}]` conflicts with inline name `{}`",
+                    server.name.trim()
+                )));
+            }
+
+            servers.push(server);
+        }
+
+        Ok(Self {
+            enabled: raw.enabled,
+            servers,
+        })
+    }
+}
+
+/// Raw single-server shape accepted in `sa.toml`.
+///
+/// We keep this separate from [`McpServerConfig`] because:
+/// - `[mcp.<name>]` tables do not need an inline `name`
+/// - `transport` is now optional and may be inferred
+/// - we still want to preserve backward compatibility with legacy
+///   `[[mcp.servers]]` entries
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+struct RawMcpServerConfig {
+    /// Optional explicit display name.
+    name: Option<String>,
+    /// Optional explicit transport selector.
+    transport: Option<McpTransport>,
+    /// URL for HTTP/SSE transports.
+    url: Option<String>,
+    /// Executable for stdio transport.
+    command: Option<String>,
+    /// Arguments for stdio transport.
+    args: Vec<String>,
+    /// Extra environment variables for stdio transport.
+    env: HashMap<String, String>,
+    /// Extra HTTP headers for HTTP/SSE transports.
+    headers: HashMap<String, String>,
+    /// Optional per-call timeout in seconds.
+    tool_timeout_secs: Option<u64>,
+}
+
+/// Raw `[mcp]` table shape accepted in `sa.toml`.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+struct RawMcpConfig {
+    /// Whether MCP support is enabled.
+    enabled: bool,
+    /// Legacy array-of-tables format.
+    servers: Vec<McpServerConfig>,
+    /// New named-table format: `[mcp.<name>]`.
+    #[serde(flatten)]
+    named_servers: BTreeMap<String, McpServerConfig>,
 }
 
 impl SkillsConfig {
@@ -329,22 +487,26 @@ const MCP_MAX_TOOL_TIMEOUT_SECS: u64 = 600;
 fn validate_mcp_config(config: &McpConfig) -> anyhow::Result<()> {
     let mut seen_names = std::collections::HashSet::<String>::new();
 
-    for (index, server) in config.servers.iter().enumerate() {
+    for server in &config.servers {
         let name = server.name.trim();
         if name.is_empty() {
-            anyhow::bail!("mcp.servers[{index}].name must not be empty");
+            anyhow::bail!(
+                "MCP server name must not be empty; use `[mcp.<name>]` or set `name` in `[[mcp.servers]]`"
+            );
         }
         if !seen_names.insert(name.to_ascii_lowercase()) {
-            anyhow::bail!("mcp.servers contains duplicate name: {name}");
+            anyhow::bail!("mcp contains duplicate server name: {name}");
         }
+
+        let location = format!("mcp.{name}");
 
         if let Some(timeout) = server.tool_timeout_secs {
             if timeout == 0 {
-                anyhow::bail!("mcp.servers[{index}].tool_timeout_secs must be greater than 0");
+                anyhow::bail!("{location}.tool_timeout_secs must be greater than 0");
             }
             if timeout > MCP_MAX_TOOL_TIMEOUT_SECS {
                 anyhow::bail!(
-                    "mcp.servers[{index}].tool_timeout_secs exceeds max {MCP_MAX_TOOL_TIMEOUT_SECS}"
+                    "{location}.tool_timeout_secs exceeds max {MCP_MAX_TOOL_TIMEOUT_SECS}"
                 );
             }
         }
@@ -352,9 +514,7 @@ fn validate_mcp_config(config: &McpConfig) -> anyhow::Result<()> {
         match server.transport {
             McpTransport::Stdio => {
                 if server.command.trim().is_empty() {
-                    anyhow::bail!(
-                        "mcp.servers[{index}] with transport=stdio requires non-empty command"
-                    );
+                    anyhow::bail!("{location} with transport=stdio requires non-empty command");
                 }
             }
             McpTransport::Http | McpTransport::Sse => {
@@ -365,7 +525,7 @@ fn validate_mcp_config(config: &McpConfig) -> anyhow::Result<()> {
                     .filter(|value| !value.is_empty())
                     .ok_or_else(|| {
                         anyhow::anyhow!(
-                            "mcp.servers[{index}] with transport={} requires url",
+                            "{location} with transport={} requires url",
                             match server.transport {
                                 McpTransport::Http => "http",
                                 McpTransport::Sse => "sse",
@@ -374,9 +534,9 @@ fn validate_mcp_config(config: &McpConfig) -> anyhow::Result<()> {
                         )
                     })?;
                 let parsed = reqwest::Url::parse(url)
-                    .with_context(|| format!("mcp.servers[{index}].url is not a valid URL"))?;
+                    .with_context(|| format!("{location}.url is not a valid URL"))?;
                 if !matches!(parsed.scheme(), "http" | "https") {
-                    anyhow::bail!("mcp.servers[{index}].url must use http/https");
+                    anyhow::bail!("{location}.url must use http/https");
                 }
             }
         }
@@ -582,7 +742,127 @@ keep_recent_tokens = 6789
         };
 
         let err = validate_mcp_config(&config).expect_err("duplicate names must fail");
-        assert!(err.to_string().contains("duplicate name"));
+        assert!(err.to_string().contains("duplicate server name"));
+    }
+
+    #[test]
+    fn mcp_named_table_format_parses_and_infers_stdio_transport() {
+        let raw = r#"
+[llm]
+base_url = "https://example.com/v1"
+api_key = "sk-test"
+model = "gpt-5.2"
+
+[server]
+bind = "127.0.0.1:8765"
+ws_path = "/ws"
+
+[workspace]
+root_dir = "."
+agents_md = "Agents.md"
+
+[mcp]
+enabled = true
+
+[mcp.filesystem]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "."]
+tool_timeout_secs = 180
+"#;
+
+        let cfg = toml::from_str::<Config>(raw).expect("named mcp table should parse");
+        assert!(cfg.mcp.enabled);
+        assert_eq!(cfg.mcp.servers.len(), 1);
+        let server = &cfg.mcp.servers[0];
+        assert_eq!(server.name, "filesystem");
+        assert_eq!(server.transport, McpTransport::Stdio);
+        assert_eq!(server.command, "npx");
+        assert_eq!(server.tool_timeout_secs, Some(180));
+    }
+
+    #[test]
+    fn mcp_named_table_format_parses_and_infers_http_transport() {
+        let raw = r#"
+[llm]
+base_url = "https://example.com/v1"
+api_key = "sk-test"
+model = "gpt-5.2"
+
+[server]
+bind = "127.0.0.1:8765"
+ws_path = "/ws"
+
+[workspace]
+root_dir = "."
+agents_md = "Agents.md"
+
+[mcp.remote]
+url = "https://example.com/mcp"
+"#;
+
+        let cfg = toml::from_str::<Config>(raw).expect("named HTTP mcp table should parse");
+        assert_eq!(cfg.mcp.servers.len(), 1);
+        let server = &cfg.mcp.servers[0];
+        assert_eq!(server.name, "remote");
+        assert_eq!(server.transport, McpTransport::Http);
+        assert_eq!(server.url.as_deref(), Some("https://example.com/mcp"));
+    }
+
+    #[test]
+    fn mcp_legacy_array_format_still_parses() {
+        let raw = r#"
+[llm]
+base_url = "https://example.com/v1"
+api_key = "sk-test"
+model = "gpt-5.2"
+
+[server]
+bind = "127.0.0.1:8765"
+ws_path = "/ws"
+
+[workspace]
+root_dir = "."
+agents_md = "Agents.md"
+
+[mcp]
+enabled = true
+
+[[mcp.servers]]
+name = "legacy"
+transport = "stdio"
+command = "legacy-mcp"
+"#;
+
+        let cfg = toml::from_str::<Config>(raw).expect("legacy mcp array should parse");
+        assert!(cfg.mcp.enabled);
+        assert_eq!(cfg.mcp.servers.len(), 1);
+        assert_eq!(cfg.mcp.servers[0].name, "legacy");
+        assert_eq!(cfg.mcp.servers[0].transport, McpTransport::Stdio);
+    }
+
+    #[test]
+    fn mcp_named_table_rejects_inline_name_mismatch() {
+        let raw = r#"
+[llm]
+base_url = "https://example.com/v1"
+api_key = "sk-test"
+model = "gpt-5.2"
+
+[server]
+bind = "127.0.0.1:8765"
+ws_path = "/ws"
+
+[workspace]
+root_dir = "."
+agents_md = "Agents.md"
+
+[mcp.docs]
+name = "other"
+command = "mcp-docs"
+"#;
+
+        let err = toml::from_str::<Config>(raw).expect_err("mismatched inline name must fail");
+        assert!(err.to_string().contains("conflicts with inline name"));
     }
 
     #[test]
