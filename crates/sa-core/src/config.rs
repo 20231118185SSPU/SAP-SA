@@ -243,6 +243,12 @@ pub struct McpServerConfig {
     pub command: String,
     /// Arguments for stdio transport.
     pub args: Vec<String>,
+    /// Optional stdio child working directory.
+    ///
+    /// Relative values from `sa.toml` are resolved against the config file
+    /// directory during config loading, so runtime code receives the final
+    /// absolute path.
+    pub cwd: Option<PathBuf>,
     /// Extra environment variables for stdio transport.
     pub env: std::collections::HashMap<String, String>,
     /// Extra HTTP headers for HTTP/SSE transports.
@@ -285,6 +291,12 @@ impl<'de> Deserialize<'de> for McpServerConfig {
         let name = raw.name.unwrap_or_default().trim().to_string();
         let command = raw.command.unwrap_or_default();
         let url = raw.url.unwrap_or_default();
+        let cwd = raw
+            .cwd
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from);
         let has_command = !command.trim().is_empty();
         let has_url = !url.trim().is_empty();
 
@@ -330,6 +342,7 @@ impl<'de> Deserialize<'de> for McpServerConfig {
             url: has_url.then_some(url),
             command,
             args: raw.args,
+            cwd,
             env: raw.env,
             headers: raw.headers,
             tool_timeout_secs: raw.tool_timeout_secs,
@@ -393,6 +406,8 @@ struct RawMcpServerConfig {
     command: Option<String>,
     /// Arguments for stdio transport.
     args: Vec<String>,
+    /// Optional stdio child working directory.
+    cwd: Option<String>,
     /// Extra environment variables for stdio transport.
     env: HashMap<String, String>,
     /// Extra HTTP headers for HTTP/SSE transports.
@@ -432,8 +447,16 @@ pub fn load_config_from_file(path: &Path) -> anyhow::Result<Config> {
         .with_context(|| format!("Failed to read config file: {}", path.display()))?;
 
     // Parse TOML into typed config.
-    let config = toml::from_str::<Config>(&raw)
+    let mut config = toml::from_str::<Config>(&raw)
         .with_context(|| format!("Failed to parse TOML config file: {}", path.display()))?;
+    let config_file_dir = std::path::absolute(path.parent().unwrap_or_else(|| Path::new(".")))
+        .with_context(|| {
+            format!(
+                "Failed to resolve config file directory for {}",
+                path.display()
+            )
+        })?;
+    normalize_mcp_config_paths(&mut config.mcp, &config_file_dir)?;
     validate_mcp_config(&config.mcp)?;
     Ok(config)
 }
@@ -470,6 +493,65 @@ pub fn expand_tilde(path: &str) -> PathBuf {
 /// Hard safety ceiling for MCP per-tool call timeouts.
 const MCP_MAX_TOOL_TIMEOUT_SECS: u64 = 600;
 
+/// Resolve all MCP filesystem paths into their final runtime form.
+///
+/// We do this during config loading so startup fails early with a precise
+/// error instead of deferring path issues to MCP connection time.
+fn normalize_mcp_config_paths(
+    config: &mut McpConfig,
+    config_file_dir: &Path,
+) -> anyhow::Result<()> {
+    for server in &mut config.servers {
+        let Some(raw_cwd) = server.cwd.as_ref() else {
+            continue;
+        };
+
+        let resolved_cwd =
+            resolve_config_relative_path(raw_cwd, config_file_dir).with_context(|| {
+                format!(
+                    "failed to resolve working directory for MCP server `{}`",
+                    server.name
+                )
+            })?;
+
+        if !resolved_cwd.exists() {
+            anyhow::bail!(
+                "mcp.{}.cwd does not exist: {}",
+                server.name,
+                resolved_cwd.display()
+            );
+        }
+        if !resolved_cwd.is_dir() {
+            anyhow::bail!(
+                "mcp.{}.cwd must point to a directory: {}",
+                server.name,
+                resolved_cwd.display()
+            );
+        }
+
+        server.cwd = Some(resolved_cwd);
+    }
+
+    Ok(())
+}
+
+/// Resolve one `sa.toml` path against the directory containing that config
+/// file.
+fn resolve_config_relative_path(path: &Path, config_file_dir: &Path) -> anyhow::Result<PathBuf> {
+    let candidate = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        config_file_dir.join(path)
+    };
+
+    std::path::absolute(&candidate).with_context(|| {
+        format!(
+            "failed to resolve config-relative path `{}`",
+            candidate.display()
+        )
+    })
+}
+
 /// Validate MCP configuration early so startup errors are explicit.
 fn validate_mcp_config(config: &McpConfig) -> anyhow::Result<()> {
     let mut seen_names = std::collections::HashSet::<String>::new();
@@ -501,8 +583,25 @@ fn validate_mcp_config(config: &McpConfig) -> anyhow::Result<()> {
                 if server.command.trim().is_empty() {
                     anyhow::bail!("{location} with transport=stdio requires non-empty command");
                 }
+                if let Some(cwd) = &server.cwd {
+                    if !cwd.is_absolute() {
+                        anyhow::bail!("{location}.cwd must be an absolute path");
+                    }
+                    if !cwd.exists() {
+                        anyhow::bail!("{location}.cwd does not exist: {}", cwd.display());
+                    }
+                    if !cwd.is_dir() {
+                        anyhow::bail!(
+                            "{location}.cwd must point to a directory: {}",
+                            cwd.display()
+                        );
+                    }
+                }
             }
             McpTransport::Http | McpTransport::Sse => {
+                if server.cwd.is_some() {
+                    anyhow::bail!("{location}.cwd is only supported for transport=stdio");
+                }
                 let url = server
                     .url
                     .as_deref()
@@ -532,9 +631,14 @@ fn validate_mcp_config(config: &McpConfig) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, LlmConfig, McpConfig, McpServerConfig, McpTransport, validate_mcp_config};
+    use super::{
+        Config, LlmConfig, McpConfig, McpServerConfig, McpTransport, load_config_from_file,
+        validate_mcp_config,
+    };
     use crate::openai::{AuthStyle, WireApi};
     use std::collections::HashMap;
+    use std::fs;
+    use tempfile::TempDir;
 
     fn sample_llm() -> LlmConfig {
         LlmConfig {
@@ -709,6 +813,7 @@ keep_recent_tokens = 6789
                     url: None,
                     command: "server-a".to_string(),
                     args: Vec::new(),
+                    cwd: None,
                     env: HashMap::new(),
                     headers: HashMap::new(),
                     tool_timeout_secs: None,
@@ -719,6 +824,7 @@ keep_recent_tokens = 6789
                     url: None,
                     command: "server-b".to_string(),
                     args: Vec::new(),
+                    cwd: None,
                     env: HashMap::new(),
                     headers: HashMap::new(),
                     tool_timeout_secs: None,
@@ -752,6 +858,7 @@ enabled = true
 [mcp.filesystem]
 command = "npx"
 args = ["-y", "@modelcontextprotocol/server-filesystem", "."]
+cwd = "./tooling"
 tool_timeout_secs = 180
 "#;
 
@@ -762,6 +869,10 @@ tool_timeout_secs = 180
         assert_eq!(server.name, "filesystem");
         assert_eq!(server.transport, McpTransport::Stdio);
         assert_eq!(server.command, "npx");
+        assert_eq!(
+            server.cwd.as_deref(),
+            Some(std::path::Path::new("./tooling"))
+        );
         assert_eq!(server.tool_timeout_secs, Some(180));
     }
 
@@ -861,6 +972,7 @@ command = "mcp-docs"
                 url: None,
                 command: "   ".to_string(),
                 args: Vec::new(),
+                cwd: None,
                 env: HashMap::new(),
                 headers: HashMap::new(),
                 tool_timeout_secs: None,
@@ -869,5 +981,121 @@ command = "mcp-docs"
 
         let err = validate_mcp_config(&config).expect_err("stdio command must be required");
         assert!(err.to_string().contains("requires non-empty command"));
+    }
+
+    #[test]
+    fn load_config_resolves_mcp_cwd_relative_to_config_file_dir() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let config_dir = temp.path().join("config");
+        let mcp_cwd = config_dir.join("mcp-workdir");
+        fs::create_dir_all(&mcp_cwd).expect("mcp cwd should be created");
+
+        let config_path = config_dir.join("sa.toml");
+        fs::create_dir_all(&config_dir).expect("config dir should be created");
+        fs::write(
+            &config_path,
+            r#"
+[llm]
+base_url = "https://example.com/v1"
+api_key = "sk-test"
+model = "gpt-5.2"
+
+[server]
+bind = "127.0.0.1:8765"
+ws_path = "/ws"
+
+[workspace]
+root_dir = "."
+agents_md = "Agents.md"
+
+[mcp.playwright]
+command = "npx"
+args = ["@playwright/mcp@latest"]
+cwd = "mcp-workdir"
+"#,
+        )
+        .expect("config file should be written");
+
+        let cfg =
+            load_config_from_file(&config_path).expect("config with relative cwd should load");
+        assert_eq!(cfg.mcp.servers.len(), 1);
+        assert_eq!(cfg.mcp.servers[0].cwd.as_deref(), Some(mcp_cwd.as_path()));
+    }
+
+    #[test]
+    fn load_config_rejects_missing_mcp_cwd_directory() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let config_dir = temp.path().join("config");
+        fs::create_dir_all(&config_dir).expect("config dir should be created");
+
+        let config_path = config_dir.join("sa.toml");
+        fs::write(
+            &config_path,
+            r#"
+[llm]
+base_url = "https://example.com/v1"
+api_key = "sk-test"
+model = "gpt-5.2"
+
+[server]
+bind = "127.0.0.1:8765"
+ws_path = "/ws"
+
+[workspace]
+root_dir = "."
+agents_md = "Agents.md"
+
+[mcp.playwright]
+command = "npx"
+args = ["@playwright/mcp@latest"]
+cwd = "missing-dir"
+"#,
+        )
+        .expect("config file should be written");
+
+        let err =
+            load_config_from_file(&config_path).expect_err("missing mcp cwd should be rejected");
+        assert!(
+            err.to_string()
+                .contains("mcp.playwright.cwd does not exist")
+        );
+    }
+
+    #[test]
+    fn load_config_rejects_cwd_on_http_transport() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let config_dir = temp.path().join("config");
+        let http_cwd = config_dir.join("http-cwd");
+        fs::create_dir_all(&http_cwd).expect("dummy cwd should be created");
+
+        let config_path = config_dir.join("sa.toml");
+        fs::write(
+            &config_path,
+            r#"
+[llm]
+base_url = "https://example.com/v1"
+api_key = "sk-test"
+model = "gpt-5.2"
+
+[server]
+bind = "127.0.0.1:8765"
+ws_path = "/ws"
+
+[workspace]
+root_dir = "."
+agents_md = "Agents.md"
+
+[mcp.remote]
+url = "https://example.com/mcp"
+cwd = "http-cwd"
+"#,
+        )
+        .expect("config file should be written");
+
+        let err = load_config_from_file(&config_path).expect_err("HTTP mcp cwd should be rejected");
+        assert!(
+            err.to_string()
+                .contains("mcp.remote.cwd is only supported for transport=stdio")
+        );
     }
 }

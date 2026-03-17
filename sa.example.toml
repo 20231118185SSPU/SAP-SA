@@ -136,7 +136,11 @@ enabled = false
 # [mcp.filesystem]
 # command = "npx"
 # args = ["-y", "@modelcontextprotocol/server-filesystem", "."]
+# cwd = "."
 # tool_timeout_secs = 180
+#
+# `cwd` only applies to `stdio` transports.
+# Relative paths are resolved against the directory containing `sa.toml`.
 #
 # HTTP example:
 # [mcp.remote]

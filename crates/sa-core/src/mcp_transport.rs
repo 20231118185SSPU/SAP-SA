@@ -12,8 +12,9 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, Command};
+use tokio::process::{Child, ChildStderr, Command};
 use tokio::sync::{Mutex, Notify, oneshot};
+use tokio::task::JoinHandle;
 use tokio::time::{Duration, timeout};
 use tokio_stream::StreamExt;
 
@@ -50,6 +51,8 @@ pub struct StdioTransport {
     stdin: tokio::process::ChildStdin,
     /// Line-based stdout reader.
     stdout_lines: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+    /// Background stderr logger for MCP child diagnostics.
+    stderr_task: Option<JoinHandle<()>>,
 }
 
 impl StdioTransport {
@@ -57,22 +60,26 @@ impl StdioTransport {
     pub fn new(config: &McpServerConfig) -> Result<Self> {
         let spawn_env = create_env_for_mcp_server(Some(config.env.clone()));
         let resolved_program = resolve_stdio_program(OsString::from(&config.command), &spawn_env)?;
-        let mut child = Command::new(&resolved_program)
+        let resolved_program_display = resolved_program.display().to_string();
+        let mut command = Command::new(&resolved_program);
+        command
             .args(&config.args)
             .env_clear()
             .envs(&spawn_env)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::inherit())
-            .kill_on_drop(true)
-            .spawn()
-            .with_context(|| {
-                format!(
-                    "failed to spawn MCP server `{}` with program `{}`",
-                    config.name,
-                    resolved_program.display()
-                )
-            })?;
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        if let Some(cwd) = config.cwd.as_deref() {
+            command.current_dir(cwd);
+        }
+
+        let mut child = command.spawn().with_context(|| {
+            format!(
+                "failed to spawn MCP server `{}` with program `{}`",
+                config.name, resolved_program_display
+            )
+        })?;
 
         let stdin = child
             .stdin
@@ -82,11 +89,19 @@ impl StdioTransport {
             .stdout
             .take()
             .ok_or_else(|| anyhow!("no stdout on MCP server `{}`", config.name))?;
+        let stderr_task = child.stderr.take().map(|stderr| {
+            spawn_stdio_stderr_logger(
+                config.name.clone(),
+                resolved_program_display.clone(),
+                stderr,
+            )
+        });
 
         Ok(Self {
             _child: child,
             stdin,
             stdout_lines: BufReader::new(stdout).lines(),
+            stderr_task,
         })
     }
 
@@ -116,6 +131,34 @@ impl StdioTransport {
         }
         Ok(line)
     }
+}
+
+/// Mirror child-process stderr into tracing so MCP startup and runtime errors
+/// remain visible without polluting the daemon's own stderr stream directly.
+fn spawn_stdio_stderr_logger(
+    server_name: String,
+    program_name: String,
+    stderr: ChildStderr,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut reader = BufReader::new(stderr).lines();
+        loop {
+            match reader.next_line().await {
+                Ok(Some(line)) => {
+                    tracing::info!(
+                        "MCP server stderr (`{server_name}` / `{program_name}`): {line}"
+                    );
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    tracing::warn!(
+                        "failed to read MCP server stderr (`{server_name}` / `{program_name}`): {error}"
+                    );
+                    break;
+                }
+            }
+        }
+    })
 }
 
 /// Build the environment map passed to one stdio MCP child process.
@@ -260,6 +303,9 @@ impl McpTransportConn for StdioTransport {
     }
 
     async fn close(&mut self) -> Result<()> {
+        if let Some(stderr_task) = &self.stderr_task {
+            stderr_task.abort();
+        }
         let _ = self.stdin.shutdown().await;
         Ok(())
     }
@@ -933,7 +979,10 @@ pub fn create_transport(config: &McpServerConfig) -> Result<Box<dyn McpTransport
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::McpTransport;
+    use crate::mcp_protocol::JsonRpcRequest;
     use std::fs;
+    use std::path::{Path, PathBuf};
     use tempfile::TempDir;
 
     #[test]
@@ -1037,6 +1086,87 @@ mod tests {
             output.is_ok(),
             "Resolved stdio program should execute successfully"
         );
+        Ok(())
+    }
+
+    /// Temporary MCP test server that records its startup working directory and
+    /// then serves one trivial JSON-RPC response.
+    struct CwdRecordingServerFixture {
+        _temp_dir: TempDir,
+        command_path: PathBuf,
+        cwd_output_path: PathBuf,
+        expected_cwd: PathBuf,
+    }
+
+    impl CwdRecordingServerFixture {
+        fn new() -> anyhow::Result<Self> {
+            let temp_dir = TempDir::new()?;
+            let root = temp_dir.path();
+            let expected_cwd = root.join("stdio-cwd");
+            fs::create_dir_all(&expected_cwd)?;
+            let cwd_output_path = root.join("reported-cwd.txt");
+            let command_path = Self::create_server_script(root)?;
+
+            Ok(Self {
+                _temp_dir: temp_dir,
+                command_path,
+                cwd_output_path,
+                expected_cwd,
+            })
+        }
+
+        #[cfg(windows)]
+        fn create_server_script(root: &Path) -> anyhow::Result<PathBuf> {
+            let script_path = root.join("cwd-recording-server.cmd");
+            fs::write(
+                &script_path,
+                "@echo off\r\ncd > \"%~1\"\r\nset /p line=\r\necho {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\r\n",
+            )?;
+            Ok(script_path)
+        }
+
+        #[cfg(unix)]
+        fn create_server_script(root: &Path) -> anyhow::Result<PathBuf> {
+            use std::os::unix::fs::PermissionsExt;
+
+            let script_path = root.join("cwd-recording-server.sh");
+            fs::write(
+                &script_path,
+                "#!/bin/sh\npwd > \"$1\"\nIFS= read -r line\nprintf '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\\n'\n",
+            )?;
+            let mut perms = fs::metadata(&script_path)?.permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&script_path, perms)?;
+            Ok(script_path)
+        }
+    }
+
+    #[tokio::test]
+    async fn stdio_transport_spawns_child_in_configured_cwd() -> anyhow::Result<()> {
+        let fixture = CwdRecordingServerFixture::new()?;
+        let mut transport = StdioTransport::new(&McpServerConfig {
+            name: "cwd-test".to_string(),
+            transport: McpTransport::Stdio,
+            url: None,
+            command: fixture.command_path.to_string_lossy().to_string(),
+            args: vec![fixture.cwd_output_path.to_string_lossy().to_string()],
+            cwd: Some(fixture.expected_cwd.clone()),
+            env: HashMap::new(),
+            headers: HashMap::new(),
+            tool_timeout_secs: None,
+        })?;
+
+        let response = transport
+            .send_and_recv(&JsonRpcRequest::new(1, "ping", serde_json::json!({})))
+            .await?;
+        assert_eq!(response.id, Some(serde_json::json!(1)));
+
+        let reported_cwd = fs::read_to_string(&fixture.cwd_output_path)?;
+        let expected = std::fs::canonicalize(&fixture.expected_cwd)?;
+        let actual = std::fs::canonicalize(Path::new(reported_cwd.trim()))?;
+        assert_eq!(actual, expected);
+
+        transport.close().await?;
         Ok(())
     }
 }

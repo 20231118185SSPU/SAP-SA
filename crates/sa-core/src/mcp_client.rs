@@ -311,6 +311,7 @@ mod tests {
             url: None,
             command: "/definitely/missing/sa-mcp-test".to_string(),
             args: Vec::new(),
+            cwd: None,
             env: HashMap::new(),
             headers: HashMap::new(),
             tool_timeout_secs: None,

@@ -149,6 +149,7 @@
 - `command` => 自动推断为 `stdio`
 - `url` => 自动推断为 `http`
 - 只有需要 SSE 时，才额外设置 `transport = "sse"`
+- `cwd` => 仅用于 `stdio`；相对路径相对于 `sa.toml` 所在目录解析
 
 例如：
 
@@ -323,6 +324,7 @@ enabled = true
 [mcp.filesystem]
 command = "npx"
 args = ["-y", "@modelcontextprotocol/server-filesystem", "."]
+cwd = "."
 tool_timeout_secs = 180
 ```
 
