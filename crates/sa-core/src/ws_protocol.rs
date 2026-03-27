@@ -13,6 +13,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::openai::{AuthStyle, WireApi};
+
 /// Client -> server messages.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -42,6 +44,10 @@ pub enum ClientMessage {
     /// Answer a pending structured question.
     #[serde(rename = "answer_question")]
     AnswerQuestion { answer: UserQuestionAnswer },
+
+    /// Initialize a missing `sa.toml` through a frontend onboarding flow.
+    #[serde(rename = "initialize_config")]
+    InitializeConfig { request: InitializeConfigRequest },
 }
 
 /// Server -> client messages.
@@ -88,9 +94,114 @@ pub enum ServerMessage {
     #[serde(rename = "recent_shows")]
     RecentShows { files: Vec<UserVisibleFile> },
 
+    /// The backend is running without `sa.toml` and needs first-run setup.
+    #[serde(rename = "init_required")]
+    InitRequired { request: InitRequired },
+
+    /// The frontend-created configuration has been accepted and activated.
+    #[serde(rename = "init_completed")]
+    InitCompleted { info: InitCompleted },
+
+    /// The submitted initialization request failed validation or activation.
+    #[serde(rename = "init_failed")]
+    InitFailed { error: InitFailed },
+
     /// Protocol or request error.
     #[serde(rename = "error")]
     Error { message: String },
+}
+
+/// First-run initialization methods offered by the backend.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InitMethod {
+    /// OpenAI-compatible gateways using Bearer auth.
+    OpenAiCompatible,
+    /// Anthropic-compatible `/v1/messages` providers.
+    AnthropicCompatible,
+    /// Advanced manual mode where the frontend exposes all wire settings.
+    Custom,
+}
+
+/// One frontend-visible initialization option card.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InitMethodOption {
+    /// Stable option id.
+    pub id: InitMethod,
+    /// User-facing label.
+    pub label: String,
+    /// Explanatory help text.
+    pub description: String,
+    /// Recommended default wire protocol for this option.
+    pub default_wire_api: WireApi,
+    /// Recommended default auth style for this option.
+    pub default_auth_style: AuthStyle,
+    /// Recommended role name for the prompt prefix message.
+    pub default_system_role_name: String,
+    /// Whether this option should be highlighted as the recommended path.
+    #[serde(default)]
+    pub recommended: bool,
+}
+
+/// Message sent by the backend when `sa.toml` is missing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InitRequired {
+    /// Absolute path where the backend expects `sa.toml`.
+    pub config_path: String,
+    /// Workspace root the generated config will point at.
+    pub workspace_root: String,
+    /// `Agents.md` path the generated config will use.
+    pub agents_md_path: String,
+    /// Supported initialization methods the frontend should render.
+    pub methods: Vec<InitMethodOption>,
+    /// Recommended method to preselect on the frontend.
+    pub recommended_method: InitMethod,
+}
+
+/// Request sent by the frontend to create the first config file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InitializeConfigRequest {
+    /// Which initialization path the user selected.
+    pub method: InitMethod,
+    /// Provider base URL.
+    pub base_url: String,
+    /// Provider API credential.
+    pub api_key: String,
+    /// Model name.
+    pub model: String,
+    /// Optional explicit wire protocol override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wire_api: Option<WireApi>,
+    /// Optional explicit auth style override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_style: Option<AuthStyle>,
+    /// Optional role name override for the prompt prefix message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_role_name: Option<String>,
+    /// Optional reasoning depth.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+}
+
+/// Positive confirmation returned after first-run initialization succeeds.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InitCompleted {
+    /// Absolute path where the backend wrote the new `sa.toml`.
+    pub config_path: String,
+    /// Workspace root activated by the new runtime.
+    pub workspace_root: String,
+    /// Human-readable summary for the frontend.
+    pub message: String,
+}
+
+/// Structured initialization error returned to the frontend.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InitFailed {
+    /// Short user-facing summary.
+    pub message: String,
+    /// Optional detailed diagnostic text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 /// The client's proof-of-identity packet.

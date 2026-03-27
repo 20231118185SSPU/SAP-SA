@@ -24,10 +24,10 @@ use sa_core::agent::{AgentRunner, AgentRunnerConfig, DrainQueuedUserMessagesFn, 
 use sa_core::agents_md::{extract_markdown_file_references, load_agents_md};
 use sa_core::cancel::{CancelHandle, cancel_pair};
 use sa_core::compact::CompactionConfig;
-use sa_core::config::load_config_from_file;
+use sa_core::config::{Config, load_config_from_file};
 use sa_core::mcp_client::McpRegistry;
 use sa_core::memory::{build_prompt_block as build_memory_prompt_block, is_memory_reference};
-use sa_core::openai::OpenAiClient;
+use sa_core::openai::{AuthStyle, OpenAiClient, WireApi};
 use sa_core::session::SessionStore;
 use sa_core::skills::SkillRegistry;
 use sa_core::tools::{
@@ -39,15 +39,16 @@ use sa_core::ws_identity::{
     load_local_identity, verify_client_hello,
 };
 use sa_core::ws_protocol::{
-    ClientMessage, Event, EventKind, QuestionMode, ServerMessage, UserQuestion, UserQuestionAnswer,
-    UserVisibleFile, UserVisibleFileEncoding,
+    ClientMessage, Event, EventKind, InitCompleted, InitFailed, InitMethod, InitMethodOption,
+    InitRequired, InitializeConfigRequest, QuestionMode, ServerMessage, UserQuestion,
+    UserQuestionAnswer, UserVisibleFile, UserVisibleFileEncoding,
 };
 use std::collections::{HashSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{Mutex as AsyncMutex, broadcast, mpsc, oneshot};
 use tracing::Level;
 use uuid::Uuid;
 
@@ -62,6 +63,12 @@ const MAX_BUFFERED_SHOWS: usize = 32;
 /// Close-frame reason used after a handshake rejection.
 const WS_HANDSHAKE_REJECT_CLOSE_REASON: &str = "sa handshake rejected";
 
+/// Default listen address used when `sa.toml` does not exist yet.
+const DEFAULT_BOOTSTRAP_BIND: &str = "127.0.0.1:8765";
+
+/// Default WS path used when `sa.toml` does not exist yet.
+const DEFAULT_BOOTSTRAP_WS_PATH: &str = "/ws";
+
 /// CLI arguments.
 #[derive(clap::Parser, Debug)]
 #[command(version, about)]
@@ -69,6 +76,90 @@ struct Args {
     /// Path to `sa.toml`.
     #[arg(long, default_value = "sa.toml")]
     config: PathBuf,
+}
+
+/// Bootstrap metadata kept while the backend waits for the first config file.
+#[derive(Debug, Clone)]
+struct BootstrapState {
+    /// Final path where the generated `sa.toml` should be written.
+    config_path: PathBuf,
+    /// Directory containing the future config file.
+    config_dir: PathBuf,
+    /// Workspace root the generated config should point at.
+    workspace_root: PathBuf,
+    /// `Agents.md` path the generated config should point at.
+    agents_md_path: PathBuf,
+    /// Bind address used by the already running bootstrap listener.
+    bind: String,
+    /// WS path used by the already running bootstrap listener.
+    ws_path: String,
+}
+
+impl BootstrapState {
+    /// Build the `init_required` payload shown by the frontend onboarding page.
+    fn init_required_message(&self) -> ServerMessage {
+        ServerMessage::InitRequired {
+            request: InitRequired {
+                config_path: self.config_path.display().to_string(),
+                workspace_root: self.workspace_root.display().to_string(),
+                agents_md_path: self.agents_md_path.display().to_string(),
+                methods: vec![
+                    InitMethodOption {
+                        id: InitMethod::OpenAiCompatible,
+                        label: "OpenAI / 兼容接口".to_string(),
+                        description:
+                            "适用于 OpenAI 兼容网关、常见 Bearer 鉴权接口，以及默认 chat_completions 路径。"
+                                .to_string(),
+                        default_wire_api: WireApi::ChatCompletions,
+                        default_auth_style: AuthStyle::Bearer,
+                        default_system_role_name: "system".to_string(),
+                        recommended: true,
+                    },
+                    InitMethodOption {
+                        id: InitMethod::AnthropicCompatible,
+                        label: "Claude / Anthropic".to_string(),
+                        description:
+                            "适用于 `/v1/messages` 风格接口，默认使用 anthropic_auto 鉴权策略。"
+                                .to_string(),
+                        default_wire_api: WireApi::AnthropicMessages,
+                        default_auth_style: AuthStyle::AnthropicAuto,
+                        default_system_role_name: "system".to_string(),
+                        recommended: false,
+                    },
+                    InitMethodOption {
+                        id: InitMethod::Custom,
+                        label: "高级自定义".to_string(),
+                        description:
+                            "手动指定 wire_api、auth_style 与 system_role_name，适合特殊供应商或网关。"
+                                .to_string(),
+                        default_wire_api: WireApi::Responses,
+                        default_auth_style: AuthStyle::Bearer,
+                        default_system_role_name: "system".to_string(),
+                        recommended: false,
+                    },
+                ],
+                recommended_method: InitMethod::OpenAiCompatible,
+            },
+        }
+    }
+}
+
+/// Runtime state shared by every WS connection.
+#[derive(Debug, Clone)]
+enum RuntimeState {
+    /// First-run bootstrap mode without `sa.toml`.
+    Bootstrap(BootstrapState),
+    /// Fully initialized backend runtime.
+    Ready(Arc<Hub>),
+}
+
+/// Top-level server state shared across all connections.
+#[derive(Debug)]
+struct ServerState {
+    /// Stable machine identity used for WS proofs.
+    ws_identity: LocalIdentity,
+    /// Current runtime mode.
+    runtime: AsyncMutex<RuntimeState>,
 }
 
 /// A single queued task.
@@ -155,9 +246,6 @@ struct Hub {
 
     /// Durable top-level conversation store rooted at `workspace/sessions/`.
     session_store: Arc<SessionStore>,
-
-    /// Stable machine identity reused by every WS handshake.
-    ws_identity: LocalIdentity,
 }
 
 impl Hub {
@@ -167,7 +255,6 @@ impl Hub {
         agents_md_path: PathBuf,
         preload_ctx: ToolContext,
         session_store: Arc<SessionStore>,
-        ws_identity: LocalIdentity,
     ) -> Arc<Self> {
         // Task queue capacity (small but adequate for minimal agent).
         let (task_tx, task_rx) = mpsc::channel::<TaskRequest>(128);
@@ -190,7 +277,6 @@ impl Hub {
             runner,
             agents_md_path,
             session_store,
-            ws_identity,
         });
 
         // Spawn worker loop.
@@ -222,7 +308,7 @@ impl Hub {
             message,
         };
 
-        self.mirror_server_message(&ServerMessage::Event {
+        mirror_server_message(&ServerMessage::Event {
             event: event.clone(),
         });
 
@@ -245,90 +331,8 @@ impl Hub {
 
     /// Broadcast a non-history server message to all connected clients.
     fn broadcast_server_message(&self, msg: ServerMessage) {
-        self.mirror_server_message(&msg);
+        mirror_server_message(&msg);
         let _ = self.events_tx.send(msg);
-    }
-
-    /// Mirror one outbound frontend message to the backend terminal.
-    ///
-    /// This is intentionally verbose for debugging because the current CLI does
-    /// not render the whole stream.
-    fn mirror_server_message(&self, msg: &ServerMessage) {
-        match msg {
-            ServerMessage::ServerHello { hello } => {
-                eprintln!(
-                    "[frontend][server_hello][protocol={}][server={}][version={}][bucket={}][machine_hint={}]",
-                    hello.protocol,
-                    hello.server_name,
-                    hello.server_version,
-                    hello.time_bucket,
-                    hello.machine_hint
-                );
-            }
-            ServerMessage::HelloReject { reject } => {
-                eprintln!(
-                    "[frontend][hello_reject][protocol={}][server={}][version={}] {}",
-                    reject.protocol, reject.server_name, reject.server_version, reject.reason
-                );
-            }
-            ServerMessage::Accepted { task_id } => {
-                eprintln!("[frontend][accepted][task={task_id}]");
-            }
-            ServerMessage::History { events } => {
-                eprintln!("[frontend][history][count={}]", events.len());
-                for event in events {
-                    mirror_event_line("[frontend][history-event]", event);
-                }
-            }
-            ServerMessage::Event { event } => {
-                mirror_event_line("[frontend][event]", event);
-            }
-            ServerMessage::Question { question } => {
-                eprintln!(
-                    "[frontend][ask][task={}][id={}] {}",
-                    question.task_id, question.question_id, question.prompt
-                );
-                for (index, option) in question.options.iter().enumerate() {
-                    match option.description.as_deref() {
-                        Some(description) => eprintln!(
-                            "  {}. {} [{}] - {}",
-                            index + 1,
-                            option.label,
-                            option.id,
-                            description
-                        ),
-                        None => eprintln!("  {}. {} [{}]", index + 1, option.label, option.id),
-                    }
-                }
-                if question.allow_free_text {
-                    eprintln!("  free text: allowed");
-                }
-            }
-            ServerMessage::PendingQuestions { questions } => {
-                eprintln!("[frontend][pending_questions][count={}]", questions.len());
-                for question in questions {
-                    eprintln!(
-                        "  [task={}][id={}] {}",
-                        question.task_id, question.question_id, question.prompt
-                    );
-                }
-            }
-            ServerMessage::QuestionResolved { question_id } => {
-                eprintln!("[frontend][question_resolved][id={question_id}]");
-            }
-            ServerMessage::Show { file } => {
-                mirror_shown_file("[frontend][show]", file);
-            }
-            ServerMessage::RecentShows { files } => {
-                eprintln!("[frontend][recent_shows][count={}]", files.len());
-                for file in files {
-                    mirror_shown_file("  [recent_show]", file);
-                }
-            }
-            ServerMessage::Error { message } => {
-                eprintln!("[frontend][error] {message}");
-            }
-        }
     }
 
     /// Request interruption (cancellation) of a running task.
@@ -942,6 +946,427 @@ impl Hub {
     }
 }
 
+/// Fully built runtime returned from one successfully loaded configuration.
+struct LoadedRuntime {
+    /// Live background hub.
+    hub: Arc<Hub>,
+    /// Bind address selected by the config.
+    bind: String,
+    /// WS path selected by the config.
+    ws_path: String,
+    /// Resolved workspace root.
+    workspace_root: PathBuf,
+}
+
+impl ServerState {
+    /// Return a snapshot of the current runtime mode.
+    async fn runtime_snapshot(&self) -> RuntimeState {
+        self.runtime.lock().await.clone()
+    }
+
+    /// Create `sa.toml`, validate it, build the runtime, and atomically switch
+    /// the daemon out of bootstrap mode.
+    async fn initialize_from_request(
+        &self,
+        request: InitializeConfigRequest,
+    ) -> anyhow::Result<InitCompleted> {
+        let bootstrap = {
+            let runtime = self.runtime.lock().await;
+            match &*runtime {
+                RuntimeState::Bootstrap(bootstrap) => bootstrap.clone(),
+                RuntimeState::Ready(_) => {
+                    anyhow::bail!("SA 已经完成初始化，无需再次创建配置文件")
+                }
+            }
+        };
+
+        if bootstrap.config_path.exists() {
+            anyhow::bail!("目标配置文件已经存在：{}", bootstrap.config_path.display());
+        }
+
+        std::fs::create_dir_all(&bootstrap.config_dir).with_context(|| {
+            format!(
+                "Failed to create config directory: {}",
+                bootstrap.config_dir.display()
+            )
+        })?;
+
+        let rendered = render_initial_config_toml(&bootstrap, &request)?;
+        let temp_config_path = bootstrap
+            .config_dir
+            .join(format!(".sa.init.{}.toml", Uuid::new_v4()));
+
+        std::fs::write(&temp_config_path, rendered).with_context(|| {
+            format!(
+                "Failed to write temporary config file: {}",
+                temp_config_path.display()
+            )
+        })?;
+
+        let load_result = load_config_from_file(&temp_config_path);
+        let runtime_result = match load_result {
+            Ok(cfg) => build_runtime_from_config(cfg, &temp_config_path).await,
+            Err(err) => Err(err),
+        };
+
+        let runtime = match runtime_result {
+            Ok(runtime) => runtime,
+            Err(err) => {
+                let _ = std::fs::remove_file(&temp_config_path);
+                return Err(err);
+            }
+        };
+
+        if runtime.bind != bootstrap.bind || runtime.ws_path != bootstrap.ws_path {
+            let _ = std::fs::remove_file(&temp_config_path);
+            anyhow::bail!(
+                "初始化生成的监听配置与当前 bootstrap 监听器不一致：expected {}{} but got {}{}",
+                bootstrap.bind,
+                bootstrap.ws_path,
+                runtime.bind,
+                runtime.ws_path
+            );
+        }
+
+        std::fs::rename(&temp_config_path, &bootstrap.config_path).with_context(|| {
+            format!(
+                "Failed to move generated config into place: {}",
+                bootstrap.config_path.display()
+            )
+        })?;
+
+        {
+            let mut runtime_state = self.runtime.lock().await;
+            match &*runtime_state {
+                RuntimeState::Bootstrap(_) => {
+                    *runtime_state = RuntimeState::Ready(Arc::clone(&runtime.hub));
+                }
+                RuntimeState::Ready(_) => {
+                    tracing::warn!(
+                        "Bootstrap initialization raced with another ready runtime; keeping the existing runtime state"
+                    );
+                }
+            }
+        }
+
+        Ok(InitCompleted {
+            config_path: bootstrap.config_path.display().to_string(),
+            workspace_root: runtime.workspace_root.display().to_string(),
+            message: "初始化完成，新的 `sa.toml` 已写入并立即生效。".to_string(),
+        })
+    }
+}
+
+/// Build the bootstrap state used when `sa.toml` does not exist yet.
+fn build_bootstrap_state(config_path: &Path) -> anyhow::Result<BootstrapState> {
+    let config_path = std::path::absolute(config_path).with_context(|| {
+        format!(
+            "Failed to resolve bootstrap config path: {}",
+            config_path.display()
+        )
+    })?;
+    let config_dir = config_path
+        .parent()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let workspace_root = config_dir.clone();
+    let agents_md_path = workspace_root.join("Agents.md");
+
+    Ok(BootstrapState {
+        config_path,
+        config_dir,
+        workspace_root,
+        agents_md_path,
+        bind: DEFAULT_BOOTSTRAP_BIND.to_string(),
+        ws_path: DEFAULT_BOOTSTRAP_WS_PATH.to_string(),
+    })
+}
+
+/// Build one fully initialized runtime from an already parsed config object.
+async fn build_runtime_from_config(
+    cfg: Config,
+    config_path: &Path,
+) -> anyhow::Result<LoadedRuntime> {
+    let config_dir = std::path::absolute(config_path.parent().unwrap_or_else(|| Path::new(".")))
+        .with_context(|| {
+            format!(
+                "Failed to resolve config directory for {}",
+                config_path.display()
+            )
+        })?;
+    let bind = cfg.server.bind.clone();
+    let ws_path = cfg.server.ws_path.clone();
+
+    // Resolve workspace paths.
+    let workspace_root = cfg.workspace.root_dir_path(&config_dir);
+    let agents_md_path = cfg.workspace.agents_md_path(&workspace_root);
+
+    tracing::info!("Workspace root: {}", workspace_root.display());
+    tracing::info!("Agents.md path: {}", agents_md_path.display());
+
+    // Best-effort load `Agents.md` once for startup logging.
+    match load_agents_md(agents_md_path.clone()).await {
+        Ok(a) if a.found => {
+            tracing::info!("Agents.md detected ({} bytes).", a.content.len());
+        }
+        Ok(_) => {
+            tracing::info!("Agents.md not found at startup (this is OK).");
+        }
+        Err(err) => {
+            tracing::warn!("Failed to read Agents.md at startup: {err}");
+        }
+    }
+
+    // Discover skills.
+    let skill_dirs = cfg.skills.dirs_as_paths();
+    let skills = Arc::new(SkillRegistry::scan(&skill_dirs)?);
+    tracing::info!("Discovered {} skill(s).", skills.list().len());
+
+    // Connect external MCP servers before freezing the tool registry.
+    let mcp_registry = if cfg.mcp.enabled && !cfg.mcp.servers.is_empty() {
+        tracing::info!(
+            "Initializing MCP client — {} server(s) configured",
+            cfg.mcp.servers.len()
+        );
+        match McpRegistry::connect_all(&cfg.mcp.servers).await {
+            Ok(registry) if !registry.is_empty() => {
+                tracing::info!(
+                    "MCP: {} tool(s) registered from {} server(s)",
+                    registry.tool_count(),
+                    registry.server_count()
+                );
+                Some(Arc::new(registry))
+            }
+            Ok(_) => {
+                tracing::warn!("MCP enabled, but no MCP servers connected successfully.");
+                None
+            }
+            Err(error) => {
+                tracing::error!("MCP registry failed to initialize: {error:#}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Build tools.
+    let tool_ctx = ToolContext::new(workspace_root.clone(), Arc::clone(&skills))?;
+    let preload_ctx = tool_ctx.clone();
+    let session_store = Arc::new(SessionStore::new(preload_ctx.workspace_root.clone())?);
+    let tools = ToolExecutor::new(tool_ctx, mcp_registry);
+
+    // Build LLM client.
+    let system_role_name = cfg.llm.effective_system_role_name().to_string();
+    let reasoning_effort = cfg.llm.effective_reasoning_effort().map(str::to_string);
+    let wire_api = cfg.llm.effective_wire_api();
+    let auth_style = cfg.llm.effective_auth_style(wire_api);
+    let llm = OpenAiClient::with_wire_api_and_auth_style(
+        cfg.llm.base_url,
+        cfg.llm.api_key,
+        wire_api,
+        auth_style,
+    )?;
+
+    // Build agent runner.
+    let runner_cfg = AgentRunnerConfig {
+        model: cfg.llm.model,
+        system_role_name,
+        reasoning_effort,
+        max_steps: cfg.llm.max_steps,
+        compaction: cfg.compaction,
+    };
+    let runner = AgentRunner::new(llm, tools, Arc::clone(&skills), runner_cfg);
+
+    // Hub (spawns worker loop).
+    let hub = Hub::new(runner, agents_md_path, preload_ctx, session_store);
+
+    Ok(LoadedRuntime {
+        hub,
+        bind,
+        ws_path,
+        workspace_root,
+    })
+}
+
+/// Normalize optional free-form config values.
+fn normalize_optional_string(value: Option<String>) -> Option<String> {
+    let value = value?;
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+/// Decide the effective wire protocol for a first-run initialization request.
+fn effective_init_wire_api(request: &InitializeConfigRequest) -> WireApi {
+    request.wire_api.unwrap_or(match request.method {
+        InitMethod::OpenAiCompatible => WireApi::ChatCompletions,
+        InitMethod::AnthropicCompatible => WireApi::AnthropicMessages,
+        InitMethod::Custom => WireApi::Responses,
+    })
+}
+
+/// Decide the effective authentication style for a first-run initialization request.
+fn effective_init_auth_style(request: &InitializeConfigRequest, wire_api: WireApi) -> AuthStyle {
+    request.auth_style.unwrap_or(match request.method {
+        InitMethod::OpenAiCompatible => AuthStyle::Bearer,
+        InitMethod::AnthropicCompatible => AuthStyle::AnthropicAuto,
+        InitMethod::Custom => match wire_api {
+            WireApi::AnthropicMessages => AuthStyle::AnthropicAuto,
+            WireApi::ChatCompletions | WireApi::Responses => AuthStyle::Bearer,
+        },
+    })
+}
+
+/// Render the initial `sa.toml` contents from one frontend onboarding request.
+fn render_initial_config_toml(
+    bootstrap: &BootstrapState,
+    request: &InitializeConfigRequest,
+) -> anyhow::Result<String> {
+    let base_url = request.base_url.trim();
+    let api_key = request.api_key.trim();
+    let model = request.model.trim();
+    if base_url.is_empty() {
+        anyhow::bail!("`base_url` 不能为空");
+    }
+    if !base_url.starts_with("http://") && !base_url.starts_with("https://") {
+        anyhow::bail!("`base_url` 必须以 http:// 或 https:// 开头");
+    }
+    if api_key.is_empty() {
+        anyhow::bail!("`api_key` 不能为空");
+    }
+    if model.is_empty() {
+        anyhow::bail!("`model` 不能为空");
+    }
+
+    let wire_api = effective_init_wire_api(request);
+    let auth_style = effective_init_auth_style(request, wire_api);
+    let system_role_name = normalize_optional_string(request.system_role_name.clone());
+    let reasoning_effort = normalize_optional_string(request.reasoning_effort.clone());
+
+    let mut out = String::new();
+    out.push_str("# Generated by SA first-run initialization.\n");
+    out.push_str("# You can edit this file later if you need more advanced settings.\n\n");
+    out.push_str("[llm]\n");
+    out.push_str(&format!("base_url = {}\n", toml_string(base_url)));
+    out.push_str(&format!("api_key = {}\n", toml_string(api_key)));
+    out.push_str(&format!("model = {}\n", toml_string(model)));
+    out.push_str(&format!(
+        "wire_api = {}\n",
+        toml_string(match wire_api {
+            WireApi::ChatCompletions => "chat_completions",
+            WireApi::Responses => "responses",
+            WireApi::AnthropicMessages => "anthropic_messages",
+        })
+    ));
+    out.push_str(&format!(
+        "auth_style = {}\n",
+        toml_string(match auth_style {
+            AuthStyle::Bearer => "bearer",
+            AuthStyle::XApiKey => "x_api_key",
+            AuthStyle::AnthropicAuto => "anthropic_auto",
+        })
+    ));
+    if let Some(system_role_name) = system_role_name {
+        out.push_str(&format!(
+            "system_role_name = {}\n",
+            toml_string(&system_role_name)
+        ));
+    }
+    if let Some(reasoning_effort) = reasoning_effort {
+        out.push_str(&format!(
+            "reasoning_effort = {}\n",
+            toml_string(&reasoning_effort)
+        ));
+    }
+    out.push_str("max_steps = 32\n\n");
+    out.push_str("[server]\n");
+    out.push_str(&format!("bind = {}\n", toml_string(&bootstrap.bind)));
+    out.push_str(&format!(
+        "ws_path = {}\n\n",
+        toml_string(&bootstrap.ws_path)
+    ));
+    out.push_str("[workspace]\n");
+    out.push_str(&format!(
+        "root_dir = {}\n",
+        toml_string(
+            bootstrap
+                .workspace_root
+                .strip_prefix(&bootstrap.config_dir)
+                .ok()
+                .and_then(|path| if path.as_os_str().is_empty() {
+                    Some(".")
+                } else {
+                    path.to_str()
+                })
+                .unwrap_or(".")
+        )
+    ));
+    out.push_str(&format!(
+        "agents_md = {}\n",
+        toml_string(
+            bootstrap
+                .agents_md_path
+                .strip_prefix(&bootstrap.workspace_root)
+                .ok()
+                .and_then(Path::to_str)
+                .unwrap_or("Agents.md")
+        )
+    ));
+
+    Ok(out)
+}
+
+/// Serialize one plain string as a TOML double-quoted string literal.
+fn toml_string(value: &str) -> String {
+    format!("{value:?}")
+}
+
+/// Send the current ready-runtime snapshots to one freshly connected client.
+fn send_ready_runtime_snapshot(hub: &Arc<Hub>, out_tx: &mpsc::UnboundedSender<ServerMessage>) {
+    send_direct_server_message(
+        out_tx,
+        ServerMessage::PendingQuestions {
+            questions: hub.pending_questions_snapshot(),
+        },
+    );
+    send_direct_server_message(
+        out_tx,
+        ServerMessage::RecentShows {
+            files: hub.recent_shows_snapshot(),
+        },
+    );
+}
+
+/// Start forwarding broadcast events from one ready runtime into one WS
+/// connection.
+fn spawn_event_forwarder_for_connection(
+    hub: Arc<Hub>,
+    out_tx: mpsc::UnboundedSender<ServerMessage>,
+) -> tokio::task::JoinHandle<()> {
+    let mut events_rx = hub.events_tx.subscribe();
+    tokio::spawn(async move {
+        loop {
+            match events_rx.recv().await {
+                Ok(msg) => {
+                    let _ = out_tx.send(msg);
+                }
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    send_direct_server_message(
+                        &out_tx,
+                        ServerMessage::Error {
+                            message: format!("Lagged in event stream; skipped {skipped} events"),
+                        },
+                    );
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    })
+}
+
 /// Expand special placeholders in referenced paths.
 ///
 /// Currently supported:
@@ -1072,24 +1497,125 @@ fn mirror_shown_file(prefix: &str, file: &UserVisibleFile) {
     }
 }
 
+/// Mirror one outbound frontend message to the backend terminal.
+///
+/// This stays global instead of hanging off `Hub` so both the fully initialized
+/// runtime and the first-run bootstrap mode can emit the same diagnostics.
+fn mirror_server_message(msg: &ServerMessage) {
+    match msg {
+        ServerMessage::ServerHello { hello } => {
+            eprintln!(
+                "[frontend][server_hello][protocol={}][server={}][version={}][bucket={}][machine_hint={}]",
+                hello.protocol,
+                hello.server_name,
+                hello.server_version,
+                hello.time_bucket,
+                hello.machine_hint
+            );
+        }
+        ServerMessage::HelloReject { reject } => {
+            eprintln!(
+                "[frontend][hello_reject][protocol={}][server={}][version={}] {}",
+                reject.protocol, reject.server_name, reject.server_version, reject.reason
+            );
+        }
+        ServerMessage::Accepted { task_id } => {
+            eprintln!("[frontend][accepted][task={task_id}]");
+        }
+        ServerMessage::History { events } => {
+            eprintln!("[frontend][history][count={}]", events.len());
+            for event in events {
+                mirror_event_line("[frontend][history-event]", event);
+            }
+        }
+        ServerMessage::Event { event } => {
+            mirror_event_line("[frontend][event]", event);
+        }
+        ServerMessage::Question { question } => {
+            eprintln!(
+                "[frontend][ask][task={}][id={}] {}",
+                question.task_id, question.question_id, question.prompt
+            );
+            for (index, option) in question.options.iter().enumerate() {
+                match option.description.as_deref() {
+                    Some(description) => eprintln!(
+                        "  {}. {} [{}] - {}",
+                        index + 1,
+                        option.label,
+                        option.id,
+                        description
+                    ),
+                    None => eprintln!("  {}. {} [{}]", index + 1, option.label, option.id),
+                }
+            }
+            if question.allow_free_text {
+                eprintln!("  free text: allowed");
+            }
+        }
+        ServerMessage::PendingQuestions { questions } => {
+            eprintln!("[frontend][pending_questions][count={}]", questions.len());
+            for question in questions {
+                eprintln!(
+                    "  [task={}][id={}] {}",
+                    question.task_id, question.question_id, question.prompt
+                );
+            }
+        }
+        ServerMessage::QuestionResolved { question_id } => {
+            eprintln!("[frontend][question_resolved][id={question_id}]");
+        }
+        ServerMessage::Show { file } => {
+            mirror_shown_file("[frontend][show]", file);
+        }
+        ServerMessage::RecentShows { files } => {
+            eprintln!("[frontend][recent_shows][count={}]", files.len());
+            for file in files {
+                mirror_shown_file("  [recent_show]", file);
+            }
+        }
+        ServerMessage::InitRequired { request } => {
+            eprintln!(
+                "[frontend][init_required] config_path={} workspace_root={} agents_md={}",
+                request.config_path, request.workspace_root, request.agents_md_path
+            );
+            for method in &request.methods {
+                eprintln!(
+                    "  [method={:?}] {} - {}",
+                    method.id, method.label, method.description
+                );
+            }
+        }
+        ServerMessage::InitCompleted { info } => {
+            eprintln!(
+                "[frontend][init_completed] {} config_path={} workspace_root={}",
+                info.message, info.config_path, info.workspace_root
+            );
+        }
+        ServerMessage::InitFailed { error } => {
+            eprintln!("[frontend][init_failed] {}", error.message);
+            if let Some(detail) = &error.detail {
+                eprintln!("{detail}");
+            }
+        }
+        ServerMessage::Error { message } => {
+            eprintln!("[frontend][error] {message}");
+        }
+    }
+}
+
 /// Send one direct per-connection message and mirror it to the backend
 /// terminal.
-fn send_direct_server_message(
-    hub: &Arc<Hub>,
-    out_tx: &mpsc::UnboundedSender<ServerMessage>,
-    msg: ServerMessage,
-) {
-    hub.mirror_server_message(&msg);
+fn send_direct_server_message(out_tx: &mpsc::UnboundedSender<ServerMessage>, msg: ServerMessage) {
+    mirror_server_message(&msg);
     let _ = out_tx.send(msg);
 }
 
 /// Send one handshake message before the per-connection writer task exists.
 async fn send_handshake_server_message(
-    hub: &Arc<Hub>,
     ws_tx: &mut futures_util::stream::SplitSink<WebSocket, Message>,
     msg: ServerMessage,
 ) -> anyhow::Result<()> {
-    hub.mirror_server_message(&msg);
+    mirror_server_message(&msg);
 
     let text = serde_json::to_string(&msg).context("Failed to serialize WS handshake message")?;
     ws_tx
@@ -1134,7 +1660,6 @@ async fn close_rejected_handshake(
 
 /// Reject the handshake, send `hello_reject`, and then explicitly close the socket.
 async fn reject_handshake(
-    hub: &Arc<Hub>,
     connection_id: Uuid,
     stage: &'static str,
     server_version: &str,
@@ -1150,7 +1675,6 @@ async fn reject_handshake(
     );
 
     if let Err(err) = send_handshake_server_message(
-        hub,
         ws_tx,
         ServerMessage::HelloReject {
             reject: build_hello_reject(reason, server_version),
@@ -1170,15 +1694,18 @@ async fn reject_handshake(
 }
 
 /// WS upgrade handler.
-async fn ws_route(ws: WebSocketUpgrade, State(hub): State<Arc<Hub>>) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| ws_session(socket, hub))
+async fn ws_route(
+    ws: WebSocketUpgrade,
+    State(state): State<Arc<ServerState>>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| ws_session(socket, state))
 }
 
 /// Handle a single WS connection with the production handshake timeout.
-async fn ws_session(socket: WebSocket, hub: Arc<Hub>) {
+async fn ws_session(socket: WebSocket, state: Arc<ServerState>) {
     ws_session_with_timeout(
         socket,
-        hub,
+        state,
         std::time::Duration::from_secs(WS_HANDSHAKE_TIMEOUT_SECS),
     )
     .await;
@@ -1190,7 +1717,7 @@ async fn ws_session(socket: WebSocket, hub: Arc<Hub>) {
 /// sleeping for the full production timeout.
 async fn ws_session_with_timeout(
     socket: WebSocket,
-    hub: Arc<Hub>,
+    state: Arc<ServerState>,
     handshake_timeout: std::time::Duration,
 ) {
     let connection_id = Uuid::new_v4();
@@ -1211,7 +1738,6 @@ async fn ws_session_with_timeout(
         Ok(Some(Ok(frame))) => frame,
         Ok(Some(Err(err))) => {
             reject_handshake(
-                &hub,
                 connection_id,
                 "read_initial_frame",
                 server_version,
@@ -1230,7 +1756,6 @@ async fn ws_session_with_timeout(
         }
         Err(_) => {
             reject_handshake(
-                &hub,
                 connection_id,
                 "handshake_timeout",
                 server_version,
@@ -1244,7 +1769,6 @@ async fn ws_session_with_timeout(
 
     let Message::Text(first_text) = first_frame else {
         reject_handshake(
-            &hub,
             connection_id,
             "first_frame_not_text",
             server_version,
@@ -1259,7 +1783,6 @@ async fn ws_session_with_timeout(
         Ok(msg) => msg,
         Err(err) => {
             reject_handshake(
-                &hub,
                 connection_id,
                 "invalid_handshake_json",
                 server_version,
@@ -1275,7 +1798,6 @@ async fn ws_session_with_timeout(
         ClientMessage::ClientHello { hello } => hello,
         other => {
             reject_handshake(
-                &hub,
                 connection_id,
                 "first_message_wrong_type",
                 server_version,
@@ -1292,7 +1814,6 @@ async fn ws_session_with_timeout(
 
     if let Err(err) = verify_client_hello(&client_hello, std::time::SystemTime::now()) {
         reject_handshake(
-            &hub,
             connection_id,
             "client_hello_verification_failed",
             server_version,
@@ -1303,25 +1824,26 @@ async fn ws_session_with_timeout(
         return;
     }
 
-    let server_hello =
-        match build_server_hello(&hub.ws_identity, server_version, &client_hello.client_nonce) {
-            Ok(hello) => hello,
-            Err(err) => {
-                reject_handshake(
-                    &hub,
-                    connection_id,
-                    "build_server_hello_failed",
-                    server_version,
-                    &mut ws_tx,
-                    format!("Failed to build server hello: {err}"),
-                )
-                .await;
-                return;
-            }
-        };
+    let server_hello = match build_server_hello(
+        &state.ws_identity,
+        server_version,
+        &client_hello.client_nonce,
+    ) {
+        Ok(hello) => hello,
+        Err(err) => {
+            reject_handshake(
+                connection_id,
+                "build_server_hello_failed",
+                server_version,
+                &mut ws_tx,
+                format!("Failed to build server hello: {err}"),
+            )
+            .await;
+            return;
+        }
+    };
 
     if let Err(err) = send_handshake_server_message(
-        &hub,
         &mut ws_tx,
         ServerMessage::ServerHello {
             hello: server_hello,
@@ -1348,24 +1870,6 @@ async fn ws_session_with_timeout(
     // Outbound message channel (single writer task owns `ws_tx`).
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<ServerMessage>();
 
-    // Immediately send any questions that were already pending before this
-    // client connected. This makes reconnecting clients able to continue an
-    // interrupted `Ask` interaction.
-    send_direct_server_message(
-        &hub,
-        &out_tx,
-        ServerMessage::PendingQuestions {
-            questions: hub.pending_questions_snapshot(),
-        },
-    );
-    send_direct_server_message(
-        &hub,
-        &out_tx,
-        ServerMessage::RecentShows {
-            files: hub.recent_shows_snapshot(),
-        },
-    );
-
     // Writer task: serialize ServerMessage -> WS text frame.
     let writer = tokio::spawn(async move {
         while let Some(msg) = out_rx.recv().await {
@@ -1378,29 +1882,16 @@ async fn ws_session_with_timeout(
         }
     });
 
-    // Event forwarder task: broadcast -> out_tx.
-    let mut events_rx = hub.events_tx.subscribe();
-    let out_tx_events = out_tx.clone();
-    let hub_for_forwarder = Arc::clone(&hub);
-    let forwarder = tokio::spawn(async move {
-        loop {
-            match events_rx.recv().await {
-                Ok(msg) => {
-                    let _ = out_tx_events.send(msg);
-                }
-                Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    send_direct_server_message(
-                        &hub_for_forwarder,
-                        &out_tx_events,
-                        ServerMessage::Error {
-                            message: format!("Lagged in event stream; skipped {skipped} events"),
-                        },
-                    );
-                }
-                Err(broadcast::error::RecvError::Closed) => break,
-            }
+    let mut forwarder: Option<tokio::task::JoinHandle<()>> = None;
+    match state.runtime_snapshot().await {
+        RuntimeState::Ready(hub) => {
+            send_ready_runtime_snapshot(&hub, &out_tx);
+            forwarder = Some(spawn_event_forwarder_for_connection(hub, out_tx.clone()));
         }
-    });
+        RuntimeState::Bootstrap(bootstrap) => {
+            send_direct_server_message(&out_tx, bootstrap.init_required_message());
+        }
+    }
 
     // Reader loop: handle client requests.
     while let Some(Ok(frame)) = ws_rx.next().await {
@@ -1411,7 +1902,6 @@ async fn ws_session_with_timeout(
                     Ok(msg) => msg,
                     Err(err) => {
                         send_direct_server_message(
-                            &hub,
                             &out_tx,
                             ServerMessage::Error {
                                 message: format!("Invalid JSON: {err}"),
@@ -1424,55 +1914,111 @@ async fn ws_session_with_timeout(
                 match msg {
                     ClientMessage::ClientHello { .. } => {
                         send_direct_server_message(
-                            &hub,
                             &out_tx,
                             ServerMessage::Error {
                                 message: "`client_hello` is only allowed as the first message on a connection".to_string(),
                             },
                         );
                     }
+                    ClientMessage::InitializeConfig { request } => {
+                        match state.initialize_from_request(request).await {
+                            Ok(info) => {
+                                send_direct_server_message(
+                                    &out_tx,
+                                    ServerMessage::InitCompleted { info },
+                                );
+
+                                if forwarder.is_none() {
+                                    if let RuntimeState::Ready(hub) = state.runtime_snapshot().await
+                                    {
+                                        send_ready_runtime_snapshot(&hub, &out_tx);
+                                        forwarder = Some(spawn_event_forwarder_for_connection(
+                                            hub,
+                                            out_tx.clone(),
+                                        ));
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                send_direct_server_message(
+                                    &out_tx,
+                                    ServerMessage::InitFailed {
+                                        error: InitFailed {
+                                            message: "初始化失败，配置文件尚未生效。".to_string(),
+                                            detail: Some(format!("{err:#}")),
+                                        },
+                                    },
+                                );
+                            }
+                        }
+                    }
                     ClientMessage::Submit { task_id, task } => {
-                        // If the client didn't provide an id, we generate one.
-                        let task_id = task_id.unwrap_or_else(Uuid::new_v4);
+                        match state.runtime_snapshot().await {
+                            RuntimeState::Ready(hub) => {
+                                let task_id = task_id.unwrap_or_else(Uuid::new_v4);
 
-                        // Acknowledge immediately.
-                        send_direct_server_message(
-                            &hub,
-                            &out_tx,
-                            ServerMessage::Accepted { task_id },
-                        );
+                                send_direct_server_message(
+                                    &out_tx,
+                                    ServerMessage::Accepted { task_id },
+                                );
 
-                        // Enqueue (idempotent).
-                        if let Err(err) = hub.submit_task(task_id, task).await {
-                            send_direct_server_message(
-                                &hub,
-                                &out_tx,
-                                ServerMessage::Error {
-                                    message: format!("Failed to submit task: {err}"),
-                                },
-                            );
+                                if let Err(err) = hub.submit_task(task_id, task).await {
+                                    send_direct_server_message(
+                                        &out_tx,
+                                        ServerMessage::Error {
+                                            message: format!("Failed to submit task: {err}"),
+                                        },
+                                    );
+                                }
+                            }
+                            RuntimeState::Bootstrap(bootstrap) => {
+                                send_direct_server_message(
+                                    &out_tx,
+                                    bootstrap.init_required_message(),
+                                );
+                            }
                         }
                     }
                     ClientMessage::GetHistory { from_event_id } => {
-                        let events = hub.history_since(from_event_id).await;
-                        send_direct_server_message(
-                            &hub,
-                            &out_tx,
-                            ServerMessage::History { events },
-                        );
+                        match state.runtime_snapshot().await {
+                            RuntimeState::Ready(hub) => {
+                                let events = hub.history_since(from_event_id).await;
+                                send_direct_server_message(
+                                    &out_tx,
+                                    ServerMessage::History { events },
+                                );
+                            }
+                            RuntimeState::Bootstrap(_) => {
+                                send_direct_server_message(
+                                    &out_tx,
+                                    ServerMessage::History { events: Vec::new() },
+                                );
+                            }
+                        }
                     }
                     ClientMessage::Interrupt { task_id } => {
-                        hub.request_interrupt(task_id);
+                        if let RuntimeState::Ready(hub) = state.runtime_snapshot().await {
+                            hub.request_interrupt(task_id);
+                        }
                     }
                     ClientMessage::AnswerQuestion { answer } => {
-                        if let Err(err) = hub.answer_question(answer) {
-                            send_direct_server_message(
-                                &hub,
-                                &out_tx,
-                                ServerMessage::Error {
-                                    message: format!("Failed to answer question: {err}"),
-                                },
-                            );
+                        match state.runtime_snapshot().await {
+                            RuntimeState::Ready(hub) => {
+                                if let Err(err) = hub.answer_question(answer) {
+                                    send_direct_server_message(
+                                        &out_tx,
+                                        ServerMessage::Error {
+                                            message: format!("Failed to answer question: {err}"),
+                                        },
+                                    );
+                                }
+                            }
+                            RuntimeState::Bootstrap(bootstrap) => {
+                                send_direct_server_message(
+                                    &out_tx,
+                                    bootstrap.init_required_message(),
+                                );
+                            }
                         }
                     }
                 }
@@ -1487,7 +2033,9 @@ async fn ws_session_with_timeout(
     drop(out_tx);
 
     // Best-effort: stop background tasks for this session.
-    forwarder.abort();
+    if let Some(forwarder) = forwarder {
+        forwarder.abort();
+    }
     writer.abort();
 }
 
@@ -1510,123 +2058,52 @@ async fn main() -> anyhow::Result<()> {
     // Parse CLI args.
     let args = Args::parse();
 
-    // Load config.
-    let cfg = load_config_from_file(&args.config)?;
-    let config_dir = args
-        .config
-        .parent()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-
-    // Resolve workspace paths.
-    let workspace_root = cfg.workspace.root_dir_path(&config_dir);
-    let agents_md_path = cfg.workspace.agents_md_path(&workspace_root);
-
-    tracing::info!("Workspace root: {}", workspace_root.display());
-    tracing::info!("Agents.md path: {}", agents_md_path.display());
-
-    // Best-effort load `Agents.md` once for startup logging.
-    //
-    // The worker loop reloads `Agents.md` **for every task**, so changes take
-    // effect without restarting the daemon.
-    match load_agents_md(agents_md_path.clone()).await {
-        Ok(a) if a.found => {
-            tracing::info!("Agents.md detected ({} bytes).", a.content.len());
-        }
-        Ok(_) => {
-            tracing::info!("Agents.md not found at startup (this is OK).");
-        }
-        Err(err) => {
-            tracing::warn!("Failed to read Agents.md at startup: {err}");
-        }
-    }
-
-    // Discover skills.
-    let skill_dirs = cfg.skills.dirs_as_paths();
-    let skills = Arc::new(SkillRegistry::scan(&skill_dirs)?);
-    tracing::info!("Discovered {} skill(s).", skills.list().len());
-
-    // Connect external MCP servers before freezing the tool registry.
-    let mcp_registry = if cfg.mcp.enabled && !cfg.mcp.servers.is_empty() {
-        tracing::info!(
-            "Initializing MCP client 闁?{} server(s) configured",
-            cfg.mcp.servers.len()
-        );
-        match McpRegistry::connect_all(&cfg.mcp.servers).await {
-            Ok(registry) if !registry.is_empty() => {
-                tracing::info!(
-                    "MCP: {} tool(s) registered from {} server(s)",
-                    registry.tool_count(),
-                    registry.server_count()
-                );
-                Some(Arc::new(registry))
-            }
-            Ok(_) => {
-                tracing::warn!("MCP enabled, but no MCP servers connected successfully.");
-                None
-            }
-            Err(error) => {
-                tracing::error!("MCP registry failed to initialize: {error:#}");
-                None
-            }
-        }
-    } else {
-        None
-    };
-
-    // Build tools.
-    let tool_ctx = ToolContext::new(workspace_root, Arc::clone(&skills))?;
-    let preload_ctx = tool_ctx.clone();
-    let session_store = Arc::new(SessionStore::new(preload_ctx.workspace_root.clone())?);
-
-    let tools = ToolExecutor::new(tool_ctx, mcp_registry);
-
-    // Build LLM client.
-    //
-    // IMPORTANT: compute derived string options before we move strings out of `cfg.llm`.
-    let system_role_name = cfg.llm.effective_system_role_name().to_string();
-    let reasoning_effort = cfg.llm.effective_reasoning_effort().map(str::to_string);
-    let wire_api = cfg.llm.effective_wire_api();
-    let auth_style = cfg.llm.effective_auth_style(wire_api);
-    let llm = OpenAiClient::with_wire_api_and_auth_style(
-        cfg.llm.base_url,
-        cfg.llm.api_key,
-        wire_api,
-        auth_style,
-    )?;
-
-    // Build agent runner.
-    let runner_cfg = AgentRunnerConfig {
-        model: cfg.llm.model,
-        system_role_name,
-        reasoning_effort,
-        max_steps: cfg.llm.max_steps,
-        compaction: cfg.compaction,
-    };
-    let runner = AgentRunner::new(llm, tools, Arc::clone(&skills), runner_cfg);
-
-    // Hub (spawns worker loop).
     let ws_identity = load_local_identity()?;
     tracing::info!("WS identity machine hint: {}", ws_identity.machine_hint);
-    let hub = Hub::new(
-        runner,
-        agents_md_path,
-        preload_ctx,
-        session_store,
+    let (bind, ws_path, runtime_state) = if args.config.exists() {
+        let cfg = load_config_from_file(&args.config)?;
+        let runtime = build_runtime_from_config(cfg, &args.config).await?;
+        (
+            runtime.bind,
+            runtime.ws_path,
+            RuntimeState::Ready(runtime.hub),
+        )
+    } else {
+        let bootstrap = build_bootstrap_state(&args.config)?;
+        tracing::warn!(
+            "Config file {} does not exist; starting in bootstrap initialization mode",
+            bootstrap.config_path.display()
+        );
+        tracing::info!(
+            "Bootstrap workspace root: {}",
+            bootstrap.workspace_root.display()
+        );
+        tracing::info!(
+            "Bootstrap Agents.md path: {}",
+            bootstrap.agents_md_path.display()
+        );
+        (
+            bootstrap.bind.clone(),
+            bootstrap.ws_path.clone(),
+            RuntimeState::Bootstrap(bootstrap),
+        )
+    };
+    let server_state = Arc::new(ServerState {
         ws_identity,
-    );
+        runtime: AsyncMutex::new(runtime_state),
+    });
 
     // Build HTTP router (WS only).
     let app = Router::new()
-        .route(&cfg.server.ws_path, get(ws_route))
-        .with_state(hub);
+        .route(&ws_path, get(ws_route))
+        .with_state(server_state);
 
     // Bind listener.
-    let listener = tokio::net::TcpListener::bind(&cfg.server.bind)
+    let listener = tokio::net::TcpListener::bind(&bind)
         .await
-        .with_context(|| format!("Failed to bind {}", cfg.server.bind))?;
+        .with_context(|| format!("Failed to bind {bind}"))?;
 
-    tracing::info!("WebSocket listening on {}", cfg.server.bind);
+    tracing::info!("WebSocket listening on {}", bind);
 
     // Serve with graceful shutdown.
     axum::serve(listener, app)
@@ -1699,26 +2176,45 @@ mod tests {
             workspace.path().join("AGENTS.md"),
             preload_ctx,
             session_store,
-            load_local_identity().expect("local WS identity should load"),
         )
     }
 
+    /// Build either a bootstrap or ready server state for WS tests.
+    fn build_test_server_state(workspace: &TempDir, bootstrap: bool) -> Arc<ServerState> {
+        let runtime = if bootstrap {
+            RuntimeState::Bootstrap(
+                build_bootstrap_state(&workspace.path().join("sa.toml"))
+                    .expect("bootstrap state should build for temp workspace"),
+            )
+        } else {
+            RuntimeState::Ready(build_test_hub(workspace))
+        };
+
+        Arc::new(ServerState {
+            ws_identity: load_local_identity().expect("local WS identity should load"),
+            runtime: AsyncMutex::new(runtime),
+        })
+    }
+
     /// Spawn one live WS server bound to an ephemeral local port.
-    async fn spawn_test_server(handshake_timeout: std::time::Duration) -> TestServer {
+    async fn spawn_test_server(
+        handshake_timeout: std::time::Duration,
+        bootstrap: bool,
+    ) -> TestServer {
         let workspace = TempDir::new().expect("temp workspace should be created");
-        let hub = build_test_hub(&workspace);
+        let state = build_test_server_state(&workspace, bootstrap);
         let app = Router::new()
             .route(
                 "/ws",
                 get(
-                    move |ws: WebSocketUpgrade, State(hub): State<Arc<Hub>>| async move {
+                    move |ws: WebSocketUpgrade, State(state): State<Arc<ServerState>>| async move {
                         ws.on_upgrade(move |socket| {
-                            ws_session_with_timeout(socket, hub, handshake_timeout)
+                            ws_session_with_timeout(socket, state, handshake_timeout)
                         })
                     },
                 ),
             )
-            .with_state(hub);
+            .with_state(state);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -1837,7 +2333,7 @@ mod tests {
 
     #[tokio::test]
     async fn handshake_rejects_wrong_first_message_and_closes() {
-        let server = spawn_test_server(std::time::Duration::from_millis(250)).await;
+        let server = spawn_test_server(std::time::Duration::from_millis(250), false).await;
         let mut ws = connect_test_client(&server).await;
 
         let submit = serde_json::to_string(&ClientMessage::Submit {
@@ -1865,7 +2361,7 @@ mod tests {
 
     #[tokio::test]
     async fn handshake_timeout_rejects_and_closes() {
-        let server = spawn_test_server(std::time::Duration::from_millis(75)).await;
+        let server = spawn_test_server(std::time::Duration::from_millis(75), false).await;
         let mut ws = connect_test_client(&server).await;
 
         match next_server_message(&mut ws).await {
@@ -1880,7 +2376,7 @@ mod tests {
 
     #[tokio::test]
     async fn handshake_rejects_time_bucket_skew_and_closes() {
-        let server = spawn_test_server(std::time::Duration::from_millis(250)).await;
+        let server = spawn_test_server(std::time::Duration::from_millis(250), false).await;
         let mut ws = connect_test_client(&server).await;
         let now_bucket = current_time_bucket().expect("current bucket should resolve");
         let hello =
@@ -1900,7 +2396,7 @@ mod tests {
 
     #[tokio::test]
     async fn handshake_rejects_proof_mismatch_and_closes() {
-        let server = spawn_test_server(std::time::Duration::from_millis(250)).await;
+        let server = spawn_test_server(std::time::Duration::from_millis(250), false).await;
         let mut ws = connect_test_client(&server).await;
         let mut hello = build_client_hello("test-client").expect("valid client hello should build");
         hello.proof =
@@ -1920,7 +2416,7 @@ mod tests {
 
     #[tokio::test]
     async fn handshake_accepts_valid_client_hello_before_normal_messages() {
-        let server = spawn_test_server(std::time::Duration::from_millis(250)).await;
+        let server = spawn_test_server(std::time::Duration::from_millis(250), false).await;
         let mut ws = connect_test_client(&server).await;
         let hello = build_client_hello("test-client").expect("valid client hello should build");
 
@@ -1942,6 +2438,36 @@ mod tests {
         match next_server_message(&mut ws).await {
             ServerMessage::RecentShows { files } => assert!(files.is_empty()),
             other => panic!("expected recent_shows after handshake, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn bootstrap_mode_sends_init_required_after_handshake() {
+        let server = spawn_test_server(std::time::Duration::from_millis(250), true).await;
+        let mut ws = connect_test_client(&server).await;
+        let hello = build_client_hello("test-client").expect("valid client hello should build");
+
+        send_client_hello(&mut ws, hello).await;
+
+        match next_server_message(&mut ws).await {
+            ServerMessage::ServerHello { hello } => {
+                assert_eq!(hello.server_name, "sa");
+            }
+            other => panic!("expected server_hello, got {other:?}"),
+        }
+
+        match next_server_message(&mut ws).await {
+            ServerMessage::InitRequired { request } => {
+                assert!(request.config_path.ends_with("sa.toml"));
+                assert_eq!(request.recommended_method, InitMethod::OpenAiCompatible);
+                assert!(
+                    request
+                        .methods
+                        .iter()
+                        .any(|method| method.id == InitMethod::Custom)
+                );
+            }
+            other => panic!("expected init_required after bootstrap handshake, got {other:?}"),
         }
     }
 }
