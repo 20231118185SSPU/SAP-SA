@@ -134,6 +134,14 @@ pub struct AgentState {
     pub active_work_summary: Option<String>,
     /// When the current work started.
     pub active_started_at: Option<DateTime<Utc>>,
+    /// Whether this work has already emitted a direct `Send` or `Show`.
+    pub work_has_user_output: bool,
+    /// Whether this work has explicitly messaged the parent agent.
+    pub work_has_parent_message: bool,
+    /// Whether the next quantum should inject the temporary finish reminder.
+    pub needs_finish_reminder: bool,
+    /// Persisted dependency wait, if this work is currently suspended.
+    pub waiting_on: Option<WaitingDependency>,
     /// Pending finish confirmation, if the runtime requested an extra check.
     pub pending_finish_confirmation: Option<PendingFinishConfirmation>,
     /// Last successful finish reason.
@@ -167,6 +175,10 @@ impl AgentState {
             active_work_id: None,
             active_work_summary: None,
             active_started_at: None,
+            work_has_user_output: false,
+            work_has_parent_message: false,
+            needs_finish_reminder: false,
+            waiting_on: None,
             pending_finish_confirmation: None,
             last_finish_reason: None,
             last_finish_result: None,
@@ -198,6 +210,19 @@ pub enum WaitUntil {
     Finished,
     /// Background task has exited.
     Exited,
+}
+
+/// Persisted dependency wait used to restore `Wait(...)` after a restart.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WaitingDependency {
+    /// Target kind this agent is waiting on.
+    pub kind: WaitKind,
+    /// Target id.
+    pub id: Uuid,
+    /// Desired target state.
+    pub until: WaitUntil,
+    /// Absolute timeout deadline, if the wait is bounded.
+    pub timeout_at: Option<DateTime<Utc>>,
 }
 
 /// Kind of durable runtime task.
@@ -252,6 +277,68 @@ pub struct RuntimeTaskState {
     pub metadata: BTreeMap<String, String>,
 }
 
+/// Durable mailbox entry kind.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MailboxEntryKind {
+    /// Free-form user input routed to an agent.
+    UserInput,
+    /// Direct point-to-point agent message.
+    AgentMessage,
+    /// Broadcast fan-out message.
+    BroadcastMessage,
+    /// Child work finished and reported back to its parent.
+    ChildFinished,
+    /// Background task finished and reported back to its owner.
+    TaskFinished,
+    /// System-generated runtime note.
+    SystemNotice,
+}
+
+/// One append-only mailbox entry delivered to an agent.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MailboxEntry {
+    /// Monotonic mailbox offset for one agent.
+    pub offset: u64,
+    /// Stable message id for idempotency.
+    pub entry_id: Uuid,
+    /// Creation timestamp.
+    pub created_at: DateTime<Utc>,
+    /// Entry class.
+    pub kind: MailboxEntryKind,
+    /// Sender agent id when applicable.
+    pub from_agent_id: Option<Uuid>,
+    /// Human-friendly sender label when available.
+    pub from_label: Option<String>,
+    /// Text payload.
+    pub message: String,
+    /// Associated work id when available.
+    pub work_id: Option<Uuid>,
+    /// Related entity id such as another agent/work/task.
+    pub related_id: Option<Uuid>,
+}
+
+/// Durable pending-question state written before an agent blocks on `Ask`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PendingQuestionState {
+    /// Agent waiting for the answer.
+    pub agent_id: Uuid,
+    /// Work blocked by this question.
+    pub work_id: Uuid,
+    /// Stable question id returned to the frontend.
+    pub question_id: Uuid,
+    /// Prompt text.
+    pub prompt: String,
+    /// Raw question mode string.
+    pub mode: String,
+    /// Serialized options payload.
+    pub options_json: String,
+    /// Whether free text is allowed.
+    pub allow_free_text: bool,
+    /// Creation timestamp.
+    pub created_at: DateTime<Utc>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -302,4 +389,3 @@ mod tests {
         assert_eq!(parsed.metadata.get("key").map(String::as_str), Some("value"));
     }
 }
-

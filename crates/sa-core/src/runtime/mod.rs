@@ -5,4 +5,4 @@
 //! system without coupling every caller to one concrete storage layout.
 
 pub mod state;
-
+pub mod store;

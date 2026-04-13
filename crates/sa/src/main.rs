@@ -28,6 +28,8 @@ use sa_core::dream::DreamManager;
 use sa_core::mcp_client::McpRegistry;
 use sa_core::memory::{build_prompt_block as build_memory_prompt_block, is_memory_reference};
 use sa_core::openai::{AuthStyle, OpenAiClient, WireApi};
+use sa_core::runtime::state::{AgentState, TeamState};
+use sa_core::runtime::store::{RootMarker, RuntimeStore};
 use sa_core::session::SessionStore;
 use sa_core::skills::SkillRegistry;
 use sa_core::tools::{
@@ -251,6 +253,10 @@ struct Hub {
 
     /// Durable top-level conversation store rooted at `workspace/sessions/`.
     session_store: Arc<SessionStore>,
+    /// Durable runtime metadata store rooted at `workspace/runtime/`.
+    runtime_store: RuntimeStore,
+    /// Current persisted team state snapshot.
+    team_state: AsyncMutex<TeamState>,
 }
 
 impl Hub {
@@ -260,6 +266,8 @@ impl Hub {
         agents_md_path: PathBuf,
         preload_ctx: ToolContext,
         session_store: Arc<SessionStore>,
+        runtime_store: RuntimeStore,
+        team_state: TeamState,
     ) -> Arc<Self> {
         // Task queue capacity (small but adequate for minimal agent).
         let (task_tx, task_rx) = mpsc::channel::<TaskRequest>(128);
@@ -282,6 +290,8 @@ impl Hub {
             runner,
             agents_md_path,
             session_store,
+            runtime_store,
+            team_state: AsyncMutex::new(team_state),
         });
 
         // Spawn worker loop.
@@ -1417,6 +1427,37 @@ async fn build_runtime_from_config(
     };
 
     let dream_manager = DreamManager::new(workspace_root.clone(), cfg.dream.clone())?;
+    let runtime_store = RuntimeStore::new(workspace_root.clone())?;
+
+    let root_agent_id = match runtime_store.load_root_marker()? {
+        Some(marker) => marker.root_agent_id,
+        None => {
+            let root_id = Uuid::new_v4();
+            runtime_store.save_root_marker(&RootMarker {
+                root_agent_id: root_id,
+            })?;
+            root_id
+        }
+    };
+    let team_state = match runtime_store.load_team_state()? {
+        Some(state) => state,
+        None => {
+            let state = TeamState::new(root_agent_id);
+            runtime_store.save_team_state(&state)?;
+            state
+        }
+    };
+
+    if runtime_store.load_agent_state(root_agent_id)?.is_none() {
+        let root_session_store = SessionStore::new_in_relative_dir(
+            workspace_root.clone(),
+            Path::new(&format!("sessions/agents/{root_agent_id}")),
+        )?;
+        runtime_store.save_agent_state(&AgentState::new_root(
+            root_agent_id,
+            root_session_store.current_session_path(),
+        ))?;
+    }
 
     // Build tools.
     let tool_ctx = ToolContext::new(workspace_root.clone(), Arc::clone(&skills))?;
@@ -1446,7 +1487,14 @@ async fn build_runtime_from_config(
     let runner = AgentRunner::new(llm, tools, Arc::clone(&skills), runner_cfg);
 
     // Hub (spawns worker loop).
-    let hub = Hub::new(runner, agents_md_path, preload_ctx, session_store);
+    let hub = Hub::new(
+        runner,
+        agents_md_path,
+        preload_ctx,
+        session_store,
+        runtime_store,
+        team_state,
+    );
 
     if dream_manager.config().enabled {
         let hub_for_dream = Arc::clone(&hub);
