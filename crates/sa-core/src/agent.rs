@@ -701,7 +701,14 @@ async fn run_compaction_memory_refresh(
         Some(refresh_extra_context.as_str()),
     );
 
-    let runtime = build_internal_memory_refresh_runtime(task_id, emit);
+    let runtime = build_internal_memory_refresh_runtime(
+        runner,
+        task_id,
+        agents_md,
+        merged_extra_prompt.as_deref(),
+        emit,
+        0,
+    );
     let emit_for_refresh = Arc::clone(emit);
     let refresh_emit: EmitEventFn = Arc::new(move |kind, task_id, message| {
         let kind = if matches!(kind, EventKind::Final) {
@@ -749,7 +756,8 @@ fn build_compaction_memory_refresh_task(
 \n- 必要时阅读最近的原始会话段，尤其是刚被 compact 掉的历史。\
 \n- 只提升稳定、可复用、高价值的信息。\
 \n- 如果更新了长期记忆，请同步整理相关 topic 文件。\
-\n- 不要使用 `Ask`、`Send`、`Show` 或 `SubAgent`。\
+\n- 不要使用 `Ask`、`Send` 或 `Show`。\
+\n- 必要时可以使用 `SubAgent`，但所有子代理与后代子代理同样禁止使用交互工具。\
 \n- 最后给出一段简短摘要，说明你整理了哪些记忆。\
 \n\n当前压缩后会话：`{}`",
         descriptor.current_session_path
@@ -812,11 +820,42 @@ compact 后已完成一次后台记忆整理。长期记忆文件可能已经更
 }
 
 /// Create a restricted runtime for the compact-triggered memory refresh agent.
+fn build_internal_memory_refresh_subagent_context(
+    base_extra_prompt: &str,
+    request: &crate::tools::SubAgentRequest,
+    depth: u32,
+) -> String {
+    let mut parts = Vec::<String>::new();
+    let trimmed = base_extra_prompt.trim();
+    if !trimmed.is_empty() {
+        parts.push(trimmed.to_string());
+    }
+
+    parts.push(format!(
+        "## Parent-provided Memory Refresh SubAgent Context\n\n- depth: {depth}\n- label: {}\n- 所有后代子代理都不得使用 `Ask`、`Send` 或 `Show`；如果需要拆分任务，只能继续使用同样受限的 `SubAgent`。\n\n```text\n{}\n```",
+        request.label.as_deref().unwrap_or("(none)"),
+        request.context.trim()
+    ));
+
+    parts.join("\n\n")
+}
+
 fn build_internal_memory_refresh_runtime(
+    runner: &AgentRunner,
     task_id: Uuid,
+    agents_md: &AgentsMd,
+    extra_system_prompt: Option<&str>,
     emit: &EmitEventFn,
+    depth: u32,
 ) -> ToolRuntime {
-    use crate::tools::{AskQuestionFn, RunSubAgentFn, SendMessageFn, ShowFileFn};
+    use crate::tools::{
+        AskQuestionFn, RunSubAgentFn, SendMessageFn, ShowFileFn, SubAgentRequest,
+        MAX_SUBAGENT_DEPTH,
+    };
+
+    let runner_for_subagent = runner.clone();
+    let agents_md_for_subagent = agents_md.clone();
+    let extra_prompt_for_subagent = extra_system_prompt.map(str::to_string);
 
     let emit_for_send = Arc::clone(emit);
     let send_message: SendMessageFn = Arc::new(move |message: String| {
@@ -848,8 +887,74 @@ fn build_internal_memory_refresh_runtime(
         })
     });
 
-    let run_subagent: RunSubAgentFn = Arc::new(move |_request, _cancel| {
-        Box::pin(async move { anyhow::bail!("memory refresh must not use SubAgent") })
+    let emit_for_subagent = Arc::clone(emit);
+    let run_subagent: RunSubAgentFn = Arc::new(move |request: SubAgentRequest, child_cancel| {
+        let runner = runner_for_subagent.clone();
+        let agents_md = agents_md_for_subagent.clone();
+        let extra_prompt = extra_prompt_for_subagent.clone();
+        let emit = Arc::clone(&emit_for_subagent);
+
+        Box::pin(async move {
+            let next_depth = depth.saturating_add(1);
+            if next_depth > MAX_SUBAGENT_DEPTH {
+                anyhow::bail!(
+                    "memory refresh subagent depth limit exceeded (requested depth={}, max={})",
+                    next_depth,
+                    MAX_SUBAGENT_DEPTH
+                );
+            }
+
+            let merged_extra_prompt = build_internal_memory_refresh_subagent_context(
+                extra_prompt.as_deref().unwrap_or_default(),
+                &request,
+                next_depth,
+            );
+            let nested_runtime = build_internal_memory_refresh_runtime(
+                &runner,
+                task_id,
+                &agents_md,
+                Some(merged_extra_prompt.as_str()),
+                &emit,
+                next_depth,
+            );
+            let request_task = request.task.clone();
+            let label = request
+                .label
+                .clone()
+                .unwrap_or_else(|| format!("memory-refresh-depth-{next_depth}"));
+            let emit_for_nested = Arc::clone(&emit);
+            let nested_emit: EmitEventFn = Arc::new(move |kind, task_id, message| {
+                let kind = if matches!(kind, EventKind::Final) {
+                    EventKind::Log
+                } else {
+                    kind
+                };
+                (emit_for_nested)(
+                    kind,
+                    task_id,
+                    format!(
+                        "[memory-refresh-subagent depth={} label={}] {}",
+                        next_depth, label, message
+                    ),
+                );
+            });
+
+            let final_answer = Box::pin(runner.run_task_inner(
+                task_id,
+                request_task,
+                &agents_md,
+                Some(merged_extra_prompt.as_str()),
+                None,
+                nested_runtime,
+                &child_cancel,
+                None,
+                nested_emit,
+                false,
+            ))
+            .await?;
+
+            Ok(final_answer)
+        })
     });
 
     ToolRuntime::new(send_message, ask_question, show_file, run_subagent)
@@ -1122,5 +1227,39 @@ mod tests {
         assert!(text.contains("这不是同学的新请求"));
         assert!(text.contains("MEMORY.md"));
         assert!(text.contains("memory/topics/*.md"));
+    }
+
+    /// The compact-triggered memory-refresh task should allow `SubAgent`, but
+    /// still forbid direct user interaction tools.
+    #[test]
+    fn memory_refresh_task_allows_subagent_but_forbids_interaction_tools() {
+        let descriptor = SessionDescriptor {
+            conversation_id: Uuid::nil(),
+            current_session_path: "sessions/current.jsonl".to_string(),
+            previous_session_path: Some("sessions/previous.jsonl".to_string()),
+        };
+        let task = build_compaction_memory_refresh_task(&descriptor);
+
+        assert!(task.contains("不要使用 `Ask`、`Send` 或 `Show`"));
+        assert!(!task.contains("不要使用 `Ask`、`Send`、`Show` 或 `SubAgent`"));
+        assert!(task.contains("必要时可以使用 `SubAgent`"));
+    }
+
+    /// Descendant sub-agents spawned by the memory-refresh task must inherit
+    /// the "no direct interaction" rule.
+    #[test]
+    fn memory_refresh_subagent_context_inherits_no_interaction_rule() {
+        let request = crate::tools::SubAgentRequest {
+            label: Some("memory-topics".to_string()),
+            task: "整理 testing 主题记忆".to_string(),
+            context: "聚焦 testing 偏好".to_string(),
+        };
+        let context =
+            build_internal_memory_refresh_subagent_context("## Base\n\n- compact 后上下文", &request, 2);
+
+        assert!(context.contains("Parent-provided Memory Refresh SubAgent Context"));
+        assert!(context.contains("所有后代子代理都不得使用 `Ask`、`Send` 或 `Show`"));
+        assert!(context.contains("聚焦 testing 偏好"));
+        assert!(context.contains("depth: 2"));
     }
 }
