@@ -31,9 +31,14 @@ use sa_core::openai::{AuthStyle, OpenAiClient, WireApi};
 use sa_core::session::SessionStore;
 use sa_core::skills::SkillRegistry;
 use sa_core::tools::{
-    AskQuestionFn, AskRequest, MAX_SUBAGENT_DEPTH, RunSubAgentFn, SendMessageFn, ShowFileFn,
-    SubAgentRequest, ToolContext, ToolExecutor, ToolRuntime,
+    AgentInfo, AgentMessageReceipt, AskQuestionFn, AskRequest, BroadcastAgentsFn,
+    BroadcastAgentsRequest, BroadcastReceipt, GetAgentFn, GetTaskFn, ListAgentsFn,
+    ListAgentsRequest, MAX_SUBAGENT_DEPTH, MessageAgentFn, NotifyParentFn, RunSubAgentFn,
+    SendMessageFn, ShowFileFn, StartTerminalTaskFn, SubAgentHandle, SubAgentRequest,
+    TerminalTaskHandle, TerminalTaskInfo, ToolContext, ToolExecutor, ToolRuntime,
+    TransferInputFn, TransferInputReceipt, TransferInputRequest,
 };
+use sa_core::runtime::state::AgentStatus;
 use sa_core::ws_identity::{
     LocalIdentity, WS_HANDSHAKE_TIMEOUT_SECS, build_hello_reject, build_server_hello,
     load_local_identity, verify_client_hello,
@@ -589,6 +594,8 @@ impl Hub {
 
     /// Build the per-task runtime callbacks used by the tool layer.
     fn build_tool_runtime(self: &Arc<Self>, task_id: Uuid, depth: u32) -> ToolRuntime {
+        let agent_id = task_id;
+        let parent_agent_id = (depth > 0).then_some(task_id);
         let hub_for_send = Arc::clone(self);
         let send_message: SendMessageFn = Arc::new(move |message: String| {
             let hub = Arc::clone(&hub_for_send);
@@ -635,8 +642,62 @@ impl Hub {
             let hub = Arc::clone(&hub_for_subagent);
             Box::pin(async move { hub.run_subagent(task_id, depth, request, cancel).await })
         });
+        let notify_parent: NotifyParentFn = Arc::new(move |_message: String| {
+            Box::pin(async move { anyhow::bail!("NotifyParent is not wired in the legacy hub") })
+        });
+        let message_agent: MessageAgentFn = Arc::new(move |_request| {
+            Box::pin(async move { anyhow::bail!("MessageAgent is not wired in the legacy hub") })
+        });
+        let broadcast_agents: BroadcastAgentsFn = Arc::new(move |_request| {
+            Box::pin(async move { anyhow::bail!("BroadcastAgents is not wired in the legacy hub") })
+        });
+        let list_agents: ListAgentsFn = Arc::new(move |_request| {
+            Box::pin(async move { Ok(Vec::<AgentInfo>::new()) })
+        });
+        let get_agent: GetAgentFn = Arc::new(move |_agent_id| {
+            Box::pin(async move { anyhow::bail!("GetAgent is not wired in the legacy hub") })
+        });
+        let transfer_input: TransferInputFn = Arc::new(move |_request| {
+            Box::pin(async move { anyhow::bail!("TransferInput is not wired in the legacy hub") })
+        });
+        let start_terminal_task: StartTerminalTaskFn = Arc::new(move |_request, _cancel| {
+            Box::pin(async move {
+                anyhow::bail!("Background Bash tasks are not wired in the legacy hub")
+            })
+        });
+        let get_task: GetTaskFn = Arc::new(move |_task_id| {
+            Box::pin(async move { anyhow::bail!("GetTask is not wired in the legacy hub") })
+        });
 
-        ToolRuntime::new(send_message, ask_question, show_file, run_subagent)
+        ToolRuntime::new(
+            agent_id,
+            parent_agent_id,
+            task_id,
+            if depth == 0 {
+                "root".to_string()
+            } else {
+                format!("subagent-depth-{depth}")
+            },
+            depth == 0,
+            depth == 0,
+            false,
+            true,
+            true,
+            true,
+            false,
+            send_message,
+            ask_question,
+            show_file,
+            run_subagent,
+            notify_parent,
+            message_agent,
+            broadcast_agents,
+            list_agents,
+            get_agent,
+            transfer_input,
+            start_terminal_task,
+            get_task,
+        )
     }
 
     /// Build a restricted runtime used by internal background tasks such as
@@ -653,6 +714,9 @@ impl Hub {
         task_id: Uuid,
         label: &'static str,
     ) -> ToolRuntime {
+        let notify_parent: NotifyParentFn = Arc::new(move |_message: String| {
+            Box::pin(async move { anyhow::bail!("background {label} task must not use NotifyParent") })
+        });
         let hub_for_send = Arc::clone(self);
         let send_message: SendMessageFn = Arc::new(move |message: String| {
             let hub = Arc::clone(&hub_for_send);
@@ -690,8 +754,59 @@ impl Hub {
                 anyhow::bail!("background {label} task must not use SubAgent")
             })
         });
+        let message_agent: MessageAgentFn = Arc::new(move |_request| {
+            Box::pin(async move { anyhow::bail!("background {label} task must not use MessageAgent") })
+        });
+        let broadcast_agents: BroadcastAgentsFn = Arc::new(move |_request| {
+            Box::pin(async move {
+                anyhow::bail!("background {label} task must not use BroadcastAgents")
+            })
+        });
+        let list_agents: ListAgentsFn = Arc::new(move |_request| {
+            Box::pin(async move { Ok(Vec::<AgentInfo>::new()) })
+        });
+        let get_agent: GetAgentFn = Arc::new(move |_agent_id| {
+            Box::pin(async move { anyhow::bail!("background {label} task must not use GetAgent") })
+        });
+        let transfer_input: TransferInputFn = Arc::new(move |_request| {
+            Box::pin(async move {
+                anyhow::bail!("background {label} task must not use TransferInput")
+            })
+        });
+        let start_terminal_task: StartTerminalTaskFn = Arc::new(move |_request, _cancel| {
+            Box::pin(async move {
+                anyhow::bail!("background {label} task must not use background Bash")
+            })
+        });
+        let get_task: GetTaskFn = Arc::new(move |_task_id| {
+            Box::pin(async move { anyhow::bail!("background {label} task must not use GetTask") })
+        });
 
-        ToolRuntime::new(send_message, ask_question, show_file, run_subagent)
+        ToolRuntime::new(
+            task_id,
+            None,
+            task_id,
+            label.to_string(),
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            send_message,
+            ask_question,
+            show_file,
+            run_subagent,
+            notify_parent,
+            message_agent,
+            broadcast_agents,
+            list_agents,
+            get_agent,
+            transfer_input,
+            start_terminal_task,
+            get_task,
+        )
     }
 
     /// Execute one isolated background dream run.
@@ -790,7 +905,7 @@ impl Hub {
         parent_depth: u32,
         request: SubAgentRequest,
         cancel: sa_core::cancel::CancelToken,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<SubAgentHandle> {
         let depth = parent_depth.saturating_add(1);
         if depth > MAX_SUBAGENT_DEPTH {
             anyhow::bail!(
@@ -799,6 +914,8 @@ impl Hub {
                 MAX_SUBAGENT_DEPTH
             );
         }
+        let child_agent_id = request.existing_agent_id.unwrap_or_else(Uuid::new_v4);
+        let child_work_id = Uuid::new_v4();
 
         let label = request
             .label
@@ -858,7 +975,7 @@ impl Hub {
         let result = self
             .runner
             .run_task(
-                task_id,
+                child_work_id,
                 request.task.clone(),
                 &agents_md,
                 Some(extra_prompt.as_str()),
@@ -890,7 +1007,13 @@ impl Hub {
             }
         }
 
-        result
+        result?;
+        Ok(SubAgentHandle {
+            agent_id: child_agent_id,
+            work_id: child_work_id,
+            label,
+            status: AgentStatus::Idle,
+        })
     }
 
     /// Background worker loop that executes tasks sequentially.
@@ -1318,7 +1441,6 @@ async fn build_runtime_from_config(
         model: cfg.llm.model,
         system_role_name,
         reasoning_effort,
-        max_steps: cfg.llm.max_steps,
         compaction: cfg.compaction,
     };
     let runner = AgentRunner::new(llm, tools, Arc::clone(&skills), runner_cfg);
@@ -1462,7 +1584,7 @@ fn render_initial_config_toml(
             toml_string(&reasoning_effort)
         ));
     }
-    out.push_str("max_steps = 32\n\n");
+    out.push('\n');
     out.push_str("[server]\n");
     out.push_str(&format!("bind = {}\n", toml_string(&bootstrap.bind)));
     out.push_str(&format!(
@@ -1510,6 +1632,17 @@ fn render_initial_config_toml(
     out.push_str(&format!(
         "recent_topic_files = {}\n",
         dream.recent_topic_files
+    ));
+    let team = sa_core::config::TeamConfig::default();
+    out.push_str("\n[team]\n");
+    out.push_str(&format!("auto_resume = {}\n", team.auto_resume));
+    out.push_str(&format!(
+        "max_active_agents = {}\n",
+        team.max_active_agents
+    ));
+    out.push_str(&format!(
+        "max_concurrent_model_calls = {}\n",
+        team.max_concurrent_model_calls
     ));
 
     Ok(out)
@@ -2362,7 +2495,6 @@ mod tests {
                 model: "test-model".to_string(),
                 system_role_name: "developer".to_string(),
                 reasoning_effort: None,
-                max_steps: 1,
                 compaction: sa_core::compact::CompactionConfig::default(),
             },
         );

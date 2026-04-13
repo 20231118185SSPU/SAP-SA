@@ -29,13 +29,14 @@ use crate::cancel::CancelToken;
 use crate::mcp_client::McpRegistry;
 use crate::memory::{read_markdown_memory, search_markdown_memory};
 use crate::openai::{ToolDefinition, ToolFunctionDefinition};
+use crate::runtime::state::{AgentStatus, RuntimeTaskStatus, WaitKind, WaitUntil};
 use crate::skills::SkillRegistry;
 use crate::ws_protocol::{
     QuestionMode, QuestionOption, UserQuestionAnswer, UserVisibleFile, UserVisibleFileEncoding,
 };
 use anyhow::Context as _;
 use base64::Engine as _;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::ffi::OsString;
 use std::future::Future;
@@ -43,6 +44,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
+use uuid::Uuid;
 
 /// Maximum file size accepted by `Read`.
 ///
@@ -93,10 +95,64 @@ pub type ShowFileFn =
 
 /// Callback used by `SubAgent`.
 pub type RunSubAgentFn = Arc<
-    dyn Fn(SubAgentRequest, CancelToken) -> ToolFuture<anyhow::Result<String>>
+    dyn Fn(SubAgentRequest, CancelToken) -> ToolFuture<anyhow::Result<SubAgentHandle>>
         + Send
         + Sync
         + 'static,
+>;
+
+/// Callback used by `NotifyParent`.
+pub type NotifyParentFn = Arc<
+    dyn Fn(String) -> ToolFuture<anyhow::Result<AgentMessageReceipt>> + Send + Sync + 'static,
+>;
+
+/// Callback used by `MessageAgent`.
+pub type MessageAgentFn = Arc<
+    dyn Fn(AgentMessageRequest) -> ToolFuture<anyhow::Result<AgentMessageReceipt>>
+        + Send
+        + Sync
+        + 'static,
+>;
+
+/// Callback used by `BroadcastAgents`.
+pub type BroadcastAgentsFn = Arc<
+    dyn Fn(BroadcastAgentsRequest) -> ToolFuture<anyhow::Result<BroadcastReceipt>>
+        + Send
+        + Sync
+        + 'static,
+>;
+
+/// Callback used by `ListAgents`.
+pub type ListAgentsFn = Arc<
+    dyn Fn(ListAgentsRequest) -> ToolFuture<anyhow::Result<Vec<AgentInfo>>>
+        + Send
+        + Sync
+        + 'static,
+>;
+
+/// Callback used by `GetAgent`.
+pub type GetAgentFn =
+    Arc<dyn Fn(Uuid) -> ToolFuture<anyhow::Result<AgentInfo>> + Send + Sync + 'static>;
+
+/// Callback used by `TransferInput`.
+pub type TransferInputFn = Arc<
+    dyn Fn(TransferInputRequest) -> ToolFuture<anyhow::Result<TransferInputReceipt>>
+        + Send
+        + Sync
+        + 'static,
+>;
+
+/// Callback used by background Bash execution.
+pub type StartTerminalTaskFn = Arc<
+    dyn Fn(StartTerminalTaskRequest, CancelToken) -> ToolFuture<anyhow::Result<TerminalTaskHandle>>
+        + Send
+        + Sync
+        + 'static,
+>;
+
+/// Callback used by `GetTask`.
+pub type GetTaskFn = Arc<
+    dyn Fn(Uuid) -> ToolFuture<anyhow::Result<TerminalTaskInfo>> + Send + Sync + 'static,
 >;
 
 /// Structured request emitted by the `Ask` tool.
@@ -149,6 +205,252 @@ impl AskRequest {
     }
 }
 
+/// Control signal returned by a tool instead of a plain observation payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolControl {
+    /// Explicit request to finish the current work.
+    Finish(FinishRequest),
+    /// Explicit confirmation that finishing without extra outward output is
+    /// acceptable for this work.
+    FinishWithoutOutput,
+    /// Request to suspend execution until a dependency reaches a target state.
+    Wait(WaitRequest),
+}
+
+/// Result returned from one tool execution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolExecutionResult {
+    /// Normal tool output that should be appended as a tool-result message.
+    Observation(String),
+    /// Control signal that changes the agent runtime state.
+    Control(ToolControl),
+}
+
+/// Structured finish request emitted by the `Finish` tool.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FinishRequest {
+    /// Human-readable reason explaining why the current work is complete.
+    pub reason: String,
+    /// Result summary for later audit/recovery and parent-agent coordination.
+    pub result: String,
+}
+
+impl FinishRequest {
+    /// Validate `Finish` arguments before they reach the runtime.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.reason.trim().is_empty() {
+            anyhow::bail!("Finish reason must not be empty");
+        }
+        if self.result.trim().is_empty() {
+            anyhow::bail!("Finish result must not be empty");
+        }
+        Ok(())
+    }
+}
+
+/// Supported scopes for agent discovery and broadcasts.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentScope {
+    /// Direct children only.
+    Children,
+    /// All descendants below the current agent.
+    Descendants,
+    /// Agents that share the same parent.
+    Siblings,
+    /// Every agent under the current root tree.
+    AllUnderRoot,
+}
+
+/// One spawned or reused child-agent handle returned by `SubAgent`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SubAgentHandle {
+    /// Stable child agent id.
+    pub agent_id: Uuid,
+    /// Stable work id accepted by that child.
+    pub work_id: Uuid,
+    /// Human-friendly label for logs/UI metadata.
+    pub label: String,
+    /// Best-effort runtime status snapshot.
+    pub status: AgentStatus,
+}
+
+/// One direct agent-to-agent message request.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentMessageRequest {
+    /// Target agent receiving the message.
+    pub target_agent_id: Uuid,
+    /// Plain-text message content.
+    pub message: String,
+}
+
+impl AgentMessageRequest {
+    /// Validate that the message is non-empty before dispatch.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.message.trim().is_empty() {
+            anyhow::bail!("Agent message must not be empty");
+        }
+        Ok(())
+    }
+}
+
+/// Delivery receipt returned after one agent-to-agent message is queued.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentMessageReceipt {
+    /// Target agent that accepted the message.
+    pub target_agent_id: Uuid,
+    /// Whether the runtime accepted the message for delivery.
+    pub delivered: bool,
+}
+
+/// Request emitted by `BroadcastAgents`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BroadcastAgentsRequest {
+    /// Broadcast scope under the current root tree.
+    pub scope: AgentScope,
+    /// Plain-text message content.
+    pub message: String,
+}
+
+impl BroadcastAgentsRequest {
+    /// Validate the broadcast payload.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.message.trim().is_empty() {
+            anyhow::bail!("Broadcast message must not be empty");
+        }
+        Ok(())
+    }
+}
+
+/// Receipt returned after a broadcast fan-out is queued.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BroadcastReceipt {
+    /// Scope used by the broadcast.
+    pub scope: AgentScope,
+    /// Number of recipients reached.
+    pub recipients: usize,
+}
+
+/// Query emitted by `ListAgents`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ListAgentsRequest {
+    /// Which subset of the current root tree to enumerate.
+    pub scope: AgentScope,
+}
+
+/// Runtime metadata returned by `ListAgents` and `GetAgent`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentInfo {
+    /// Stable agent id.
+    pub agent_id: Uuid,
+    /// Optional parent agent id.
+    pub parent_agent_id: Option<Uuid>,
+    /// Human-friendly label.
+    pub label: String,
+    /// Current status.
+    pub status: AgentStatus,
+    /// Current active work id, if any.
+    pub active_work_id: Option<Uuid>,
+    /// Whether the agent may directly `Send`.
+    pub allow_user_send: bool,
+    /// Whether the agent may directly `Show`.
+    pub allow_user_show: bool,
+    /// Whether the agent may directly `Ask`.
+    pub allow_user_ask: bool,
+}
+
+/// Input-ownership transfer request emitted by `TransferInput`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TransferInputRequest {
+    /// New input owner, or `None` to return ownership to the root.
+    pub target_agent_id: Option<Uuid>,
+}
+
+/// Receipt returned after input ownership changes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TransferInputReceipt {
+    /// Effective input owner after the transfer.
+    pub input_owner_agent_id: Uuid,
+}
+
+/// Background terminal-task launch request emitted by `Bash`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StartTerminalTaskRequest {
+    /// Shell command passed to `bash -lc`.
+    pub command: String,
+    /// Working directory under the workspace root.
+    pub workdir: String,
+    /// Optional timeout in seconds.
+    pub timeout_seconds: Option<u64>,
+}
+
+/// Handle returned when a background terminal task is accepted.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TerminalTaskHandle {
+    /// Stable runtime task id.
+    pub task_id: Uuid,
+    /// Initial task status.
+    pub status: RuntimeTaskStatus,
+    /// Path storing command output, if already allocated.
+    pub output_path: Option<String>,
+}
+
+/// Detailed runtime task metadata returned by `GetTask`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TerminalTaskInfo {
+    /// Stable task id.
+    pub task_id: Uuid,
+    /// Current lifecycle state.
+    pub status: RuntimeTaskStatus,
+    /// Command summary.
+    pub command: String,
+    /// Working directory.
+    pub workdir: String,
+    /// Exit code when available.
+    pub exit_code: Option<i32>,
+    /// Output file path when available.
+    pub output_path: Option<String>,
+    /// Best-effort summary of the final outcome.
+    pub summary: Option<String>,
+}
+
+/// Wait request emitted by the `Wait` tool.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WaitRequest {
+    /// Kind of wait target.
+    pub kind: WaitKind,
+    /// Agent/work/task id depending on `kind`.
+    pub id: Uuid,
+    /// Desired completion condition.
+    pub until: Option<WaitUntil>,
+    /// Optional timeout in seconds.
+    pub timeout_seconds: Option<u64>,
+}
+
+impl WaitRequest {
+    /// Validate that the wait request has a sensible target condition.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if let Some(timeout) = self.timeout_seconds
+            && timeout == 0
+        {
+            anyhow::bail!("Wait timeout_seconds must be greater than 0 when provided");
+        }
+
+        match (self.kind, self.until) {
+            (WaitKind::Agent, Some(WaitUntil::Finished | WaitUntil::Exited)) => {
+                anyhow::bail!("Wait(kind=agent) only supports until=idle");
+            }
+            (WaitKind::Work, Some(WaitUntil::Idle | WaitUntil::Exited)) => {
+                anyhow::bail!("Wait(kind=work) only supports until=finished");
+            }
+            (WaitKind::Task, Some(WaitUntil::Idle | WaitUntil::Finished)) => {
+                anyhow::bail!("Wait(kind=task) only supports until=exited");
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
 /// Request emitted by the `SubAgent` tool.
 #[derive(Debug, Clone)]
 pub struct SubAgentRequest {
@@ -158,6 +460,16 @@ pub struct SubAgentRequest {
     pub task: String,
     /// Parent-provided context that will be injected into the child prompt.
     pub context: String,
+    /// Whether the child may directly `Send`.
+    pub allow_user_send: bool,
+    /// Whether the child may directly `Show`.
+    pub allow_user_show: bool,
+    /// Whether the child may directly `Ask`.
+    pub allow_user_ask: bool,
+    /// Whether root may transfer input ownership to this child.
+    pub allow_input_transfer_target: bool,
+    /// Reuse an existing child agent instead of creating a new one.
+    pub existing_agent_id: Option<Uuid>,
 }
 
 impl SubAgentRequest {
@@ -181,6 +493,28 @@ impl SubAgentRequest {
 /// to create child agents. Those behaviors are supplied here by the backend.
 #[derive(Clone)]
 pub struct ToolRuntime {
+    /// Stable current agent id.
+    pub agent_id: Uuid,
+    /// Parent agent id, if any.
+    pub parent_agent_id: Option<Uuid>,
+    /// Stable root agent id.
+    pub root_agent_id: Uuid,
+    /// Human-friendly label for this runtime.
+    pub agent_label: String,
+    /// Whether this agent is currently the root agent.
+    pub is_root: bool,
+    /// Whether this agent currently holds user input ownership.
+    pub holds_input_ownership: bool,
+    /// Whether `FinishWithoutOutput()` is temporarily available for this turn.
+    pub allow_finish_without_output: bool,
+    /// Whether this agent may directly `Send`.
+    pub allow_user_send: bool,
+    /// Whether this agent may directly `Show`.
+    pub allow_user_show: bool,
+    /// Whether this agent may directly `Ask`.
+    pub allow_user_ask: bool,
+    /// Whether root may transfer input ownership to this agent.
+    pub allow_input_transfer_target: bool,
     /// Non-blocking "tell the user" channel.
     send_message: SendMessageFn,
     /// Blocking "ask the user" channel.
@@ -189,21 +523,76 @@ pub struct ToolRuntime {
     show_file: ShowFileFn,
     /// Nested-agent launcher.
     run_subagent: RunSubAgentFn,
+    /// Notify the current parent agent.
+    notify_parent: NotifyParentFn,
+    /// Send a direct message to one agent.
+    message_agent: MessageAgentFn,
+    /// Broadcast a message to a scoped set of agents.
+    broadcast_agents: BroadcastAgentsFn,
+    /// List visible agents under the current root tree.
+    list_agents: ListAgentsFn,
+    /// Inspect one visible agent.
+    get_agent: GetAgentFn,
+    /// Transfer input ownership (root only).
+    transfer_input: TransferInputFn,
+    /// Launch one background terminal task.
+    start_terminal_task: StartTerminalTaskFn,
+    /// Inspect one runtime task.
+    get_task: GetTaskFn,
 }
 
 impl ToolRuntime {
     /// Construct a runtime from concrete callbacks.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
+        agent_id: Uuid,
+        parent_agent_id: Option<Uuid>,
+        root_agent_id: Uuid,
+        agent_label: String,
+        is_root: bool,
+        holds_input_ownership: bool,
+        allow_finish_without_output: bool,
+        allow_user_send: bool,
+        allow_user_show: bool,
+        allow_user_ask: bool,
+        allow_input_transfer_target: bool,
         send_message: SendMessageFn,
         ask_question: AskQuestionFn,
         show_file: ShowFileFn,
         run_subagent: RunSubAgentFn,
+        notify_parent: NotifyParentFn,
+        message_agent: MessageAgentFn,
+        broadcast_agents: BroadcastAgentsFn,
+        list_agents: ListAgentsFn,
+        get_agent: GetAgentFn,
+        transfer_input: TransferInputFn,
+        start_terminal_task: StartTerminalTaskFn,
+        get_task: GetTaskFn,
     ) -> Self {
         Self {
+            agent_id,
+            parent_agent_id,
+            root_agent_id,
+            agent_label,
+            is_root,
+            holds_input_ownership,
+            allow_finish_without_output,
+            allow_user_send,
+            allow_user_show,
+            allow_user_ask,
+            allow_input_transfer_target,
             send_message,
             ask_question,
             show_file,
             run_subagent,
+            notify_parent,
+            message_agent,
+            broadcast_agents,
+            list_agents,
+            get_agent,
+            transfer_input,
+            start_terminal_task,
+            get_task,
         }
     }
 
@@ -211,6 +600,7 @@ impl ToolRuntime {
     ///
     /// Any attempt to use a runtime-only tool fails with a clear error.
     pub fn detached() -> Self {
+        let nil = Uuid::nil();
         let send_message: SendMessageFn = Arc::new(|_message| {
             Box::pin(async { anyhow::bail!("Send runtime is not configured") })
         });
@@ -222,8 +612,56 @@ impl ToolRuntime {
         let run_subagent: RunSubAgentFn = Arc::new(|_request, _cancel| {
             Box::pin(async { anyhow::bail!("SubAgent runtime is not configured") })
         });
+        let notify_parent: NotifyParentFn = Arc::new(|_message| {
+            Box::pin(async { anyhow::bail!("NotifyParent runtime is not configured") })
+        });
+        let message_agent: MessageAgentFn = Arc::new(|_request| {
+            Box::pin(async { anyhow::bail!("MessageAgent runtime is not configured") })
+        });
+        let broadcast_agents: BroadcastAgentsFn = Arc::new(|_request| {
+            Box::pin(async { anyhow::bail!("BroadcastAgents runtime is not configured") })
+        });
+        let list_agents: ListAgentsFn = Arc::new(|_request| {
+            Box::pin(async { anyhow::bail!("ListAgents runtime is not configured") })
+        });
+        let get_agent: GetAgentFn = Arc::new(|_agent_id| {
+            Box::pin(async { anyhow::bail!("GetAgent runtime is not configured") })
+        });
+        let transfer_input: TransferInputFn = Arc::new(|_request| {
+            Box::pin(async { anyhow::bail!("TransferInput runtime is not configured") })
+        });
+        let start_terminal_task: StartTerminalTaskFn = Arc::new(|_request, _cancel| {
+            Box::pin(async { anyhow::bail!("Background Bash runtime is not configured") })
+        });
+        let get_task: GetTaskFn = Arc::new(|_task_id| {
+            Box::pin(async { anyhow::bail!("GetTask runtime is not configured") })
+        });
 
-        Self::new(send_message, ask_question, show_file, run_subagent)
+        Self::new(
+            nil,
+            None,
+            nil,
+            "detached".to_string(),
+            true,
+            true,
+            false,
+            true,
+            true,
+            true,
+            false,
+            send_message,
+            ask_question,
+            show_file,
+            run_subagent,
+            notify_parent,
+            message_agent,
+            broadcast_agents,
+            list_agents,
+            get_agent,
+            transfer_input,
+            start_terminal_task,
+            get_task,
+        )
     }
 
     /// Invoke the `Send` callback.
@@ -250,8 +688,64 @@ impl ToolRuntime {
         &self,
         request: SubAgentRequest,
         cancel: CancelToken,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<SubAgentHandle> {
         (self.run_subagent)(request, cancel).await
+    }
+
+    /// Invoke the `NotifyParent` callback.
+    pub async fn notify_parent(&self, message: String) -> anyhow::Result<AgentMessageReceipt> {
+        (self.notify_parent)(message).await
+    }
+
+    /// Invoke the `MessageAgent` callback.
+    pub async fn message_agent(
+        &self,
+        request: AgentMessageRequest,
+    ) -> anyhow::Result<AgentMessageReceipt> {
+        (self.message_agent)(request).await
+    }
+
+    /// Invoke the `BroadcastAgents` callback.
+    pub async fn broadcast_agents(
+        &self,
+        request: BroadcastAgentsRequest,
+    ) -> anyhow::Result<BroadcastReceipt> {
+        (self.broadcast_agents)(request).await
+    }
+
+    /// Invoke the `ListAgents` callback.
+    pub async fn list_agents(
+        &self,
+        request: ListAgentsRequest,
+    ) -> anyhow::Result<Vec<AgentInfo>> {
+        (self.list_agents)(request).await
+    }
+
+    /// Invoke the `GetAgent` callback.
+    pub async fn get_agent(&self, agent_id: Uuid) -> anyhow::Result<AgentInfo> {
+        (self.get_agent)(agent_id).await
+    }
+
+    /// Invoke the `TransferInput` callback.
+    pub async fn transfer_input(
+        &self,
+        request: TransferInputRequest,
+    ) -> anyhow::Result<TransferInputReceipt> {
+        (self.transfer_input)(request).await
+    }
+
+    /// Start one background terminal task.
+    pub async fn start_terminal_task(
+        &self,
+        request: StartTerminalTaskRequest,
+        cancel: CancelToken,
+    ) -> anyhow::Result<TerminalTaskHandle> {
+        (self.start_terminal_task)(request, cancel).await
+    }
+
+    /// Inspect one runtime task.
+    pub async fn get_task(&self, task_id: Uuid) -> anyhow::Result<TerminalTaskInfo> {
+        (self.get_task)(task_id).await
     }
 }
 
@@ -387,7 +881,7 @@ impl ToolExecutor {
     }
 
     /// Tool definitions advertised to the model.
-    pub fn tool_definitions(&self) -> Vec<ToolDefinition> {
+    pub fn tool_definitions(&self, runtime: &ToolRuntime) -> Vec<ToolDefinition> {
         let mut definitions = vec![
             ToolDefinition {
                 kind: "function".to_string(),
@@ -478,6 +972,10 @@ impl ToolExecutor {
                             "timeout_seconds": {
                                 "type": "integer",
                                 "description": "Optional timeout in seconds. Defaults to 300 and is capped at 1800."
+                            },
+                            "run_in_background": {
+                                "type": "boolean",
+                                "description": "If true, start the command as a background runtime task and return its task_id instead of blocking for completion."
                             }
                         },
                         "required": ["command"]
@@ -677,6 +1175,59 @@ impl ToolExecutor {
             ToolDefinition {
                 kind: "function".to_string(),
                 function: ToolFunctionDefinition {
+                    name: "Finish".to_string(),
+                    description: "Explicitly finish the current work and return this agent to idle."
+                        .to_string(),
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "reason": {
+                                "type": "string",
+                                "description": "Why the current work is complete."
+                            },
+                            "result": {
+                                "type": "string",
+                                "description": "Result summary for audit/recovery and parent-agent coordination."
+                            }
+                        },
+                        "required": ["reason", "result"]
+                    }),
+                },
+            },
+            ToolDefinition {
+                kind: "function".to_string(),
+                function: ToolFunctionDefinition {
+                    name: "Wait".to_string(),
+                    description: "Suspend the current work until an agent, work item, or background task reaches the desired state."
+                        .to_string(),
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "kind": {
+                                "type": "string",
+                                "enum": ["agent", "work", "task"]
+                            },
+                            "id": {
+                                "type": "string",
+                                "description": "UUID of the target agent/work/task."
+                            },
+                            "until": {
+                                "type": "string",
+                                "enum": ["idle", "finished", "exited"],
+                                "description": "Optional target condition. Defaults depend on `kind`."
+                            },
+                            "timeout_seconds": {
+                                "type": "integer",
+                                "description": "Optional timeout in seconds."
+                            }
+                        },
+                        "required": ["kind", "id"]
+                    }),
+                },
+            },
+            ToolDefinition {
+                kind: "function".to_string(),
+                function: ToolFunctionDefinition {
                     name: "Skill".to_string(),
                     description:
                         "Read `SKILL.md` or another skill-relative text file from a named installed skill without exposing the real host path."
@@ -717,13 +1268,179 @@ impl ToolExecutor {
                             "context": {
                                 "type": "string",
                                 "description": "Parent-provided context, constraints, and findings for the child agent."
+                            },
+                            "allow_user_send": {
+                                "type": "boolean",
+                                "description": "Whether the child may directly Send."
+                            },
+                            "allow_user_show": {
+                                "type": "boolean",
+                                "description": "Whether the child may directly Show."
+                            },
+                            "allow_user_ask": {
+                                "type": "boolean",
+                                "description": "Whether the child may directly Ask."
+                            },
+                            "allow_input_transfer_target": {
+                                "type": "boolean",
+                                "description": "Whether root may transfer input ownership to this child."
+                            },
+                            "existing_agent_id": {
+                                "type": "string",
+                                "description": "Optional existing child agent id to reuse."
                             }
                         },
                         "required": ["task", "context"]
                     }),
                 },
             },
+            ToolDefinition {
+                kind: "function".to_string(),
+                function: ToolFunctionDefinition {
+                    name: "NotifyParent".to_string(),
+                    description: "Send a direct single message to the current parent agent."
+                        .to_string(),
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "message": {
+                                "type": "string",
+                                "description": "Message content delivered to the parent agent."
+                            }
+                        },
+                        "required": ["message"]
+                    }),
+                },
+            },
+            ToolDefinition {
+                kind: "function".to_string(),
+                function: ToolFunctionDefinition {
+                    name: "MessageAgent".to_string(),
+                    description: "Send a direct one-way message to another agent in the same root tree."
+                        .to_string(),
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "target_agent_id": {
+                                "type": "string",
+                                "description": "Target agent UUID."
+                            },
+                            "message": {
+                                "type": "string",
+                                "description": "Message content delivered to the target agent."
+                            }
+                        },
+                        "required": ["target_agent_id", "message"]
+                    }),
+                },
+            },
+            ToolDefinition {
+                kind: "function".to_string(),
+                function: ToolFunctionDefinition {
+                    name: "BroadcastAgents".to_string(),
+                    description: "Broadcast a one-way message to a scoped set of agents under the same root."
+                        .to_string(),
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "scope": {
+                                "type": "string",
+                                "enum": ["children", "descendants", "siblings", "all_under_root"]
+                            },
+                            "message": {
+                                "type": "string",
+                                "description": "Broadcast message content."
+                            }
+                        },
+                        "required": ["message"]
+                    }),
+                },
+            },
+            ToolDefinition {
+                kind: "function".to_string(),
+                function: ToolFunctionDefinition {
+                    name: "ListAgents".to_string(),
+                    description: "List visible agents under the current root tree."
+                        .to_string(),
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "scope": {
+                                "type": "string",
+                                "enum": ["children", "descendants", "siblings", "all_under_root"]
+                            }
+                        }
+                    }),
+                },
+            },
+            ToolDefinition {
+                kind: "function".to_string(),
+                function: ToolFunctionDefinition {
+                    name: "GetAgent".to_string(),
+                    description: "Inspect one visible agent by UUID.".to_string(),
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "agent_id": {
+                                "type": "string",
+                                "description": "Agent UUID."
+                            }
+                        },
+                        "required": ["agent_id"]
+                    }),
+                },
+            },
+            ToolDefinition {
+                kind: "function".to_string(),
+                function: ToolFunctionDefinition {
+                    name: "GetTask".to_string(),
+                    description: "Inspect one background runtime task such as a Bash task."
+                        .to_string(),
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "task_id": {
+                                "type": "string",
+                                "description": "Task UUID."
+                            }
+                        },
+                        "required": ["task_id"]
+                    }),
+                },
+            },
+            ToolDefinition {
+                kind: "function".to_string(),
+                function: ToolFunctionDefinition {
+                    name: "TransferInput".to_string(),
+                    description: "Transfer free-form user input ownership to another agent, or return it to the root."
+                        .to_string(),
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "target_agent_id": {
+                                "type": ["string", "null"],
+                                "description": "Target agent UUID, or null to return input ownership to the root."
+                            }
+                        }
+                    }),
+                },
+            },
         ];
+
+        if runtime.allow_finish_without_output {
+            definitions.push(ToolDefinition {
+                kind: "function".to_string(),
+                function: ToolFunctionDefinition {
+                    name: "FinishWithoutOutput".to_string(),
+                    description: "Confirm that the current work may finish without extra outward output or extra explicit parent messaging."
+                        .to_string(),
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "properties": {}
+                    }),
+                },
+            });
+        }
 
         if let Some(registry) = &self.mcp_registry {
             definitions.extend(registry.tool_definitions());
@@ -740,25 +1457,98 @@ impl ToolExecutor {
         name: &str,
         args: serde_json::Value,
         cancel: &CancelToken,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<ToolExecutionResult> {
         match name {
-            "Read" => self.read(session, args, cancel).await,
-            "Write" => self.write(args, cancel).await,
-            "Edit" => self.edit(session, args, cancel).await,
-            "Bash" => self.bash(args, cancel).await,
-            "Fetch" => self.fetch(args, cancel).await,
-            "Search" => self.search(args, cancel).await,
-            "MemorySearch" => self.memory_search(args, cancel).await,
-            "MemoryGet" => self.memory_get(args, cancel).await,
-            "Send" => self.send(runtime, args, cancel).await,
-            "Show" => self.show(runtime, args, cancel).await,
-            "Ask" => self.ask(runtime, args, cancel).await,
-            "Skill" => self.skill(args, cancel).await,
-            "SubAgent" => self.subagent(runtime, args, cancel).await,
+            "Read" => self
+                .read(session, args, cancel)
+                .await
+                .map(ToolExecutionResult::Observation),
+            "Write" => self
+                .write(args, cancel)
+                .await
+                .map(ToolExecutionResult::Observation),
+            "Edit" => self
+                .edit(session, args, cancel)
+                .await
+                .map(ToolExecutionResult::Observation),
+            "Bash" => self
+                .bash(runtime, args, cancel)
+                .await
+                .map(ToolExecutionResult::Observation),
+            "Fetch" => self
+                .fetch(args, cancel)
+                .await
+                .map(ToolExecutionResult::Observation),
+            "Search" => self
+                .search(args, cancel)
+                .await
+                .map(ToolExecutionResult::Observation),
+            "MemorySearch" => self
+                .memory_search(args, cancel)
+                .await
+                .map(ToolExecutionResult::Observation),
+            "MemoryGet" => self
+                .memory_get(args, cancel)
+                .await
+                .map(ToolExecutionResult::Observation),
+            "Send" => self
+                .send(runtime, args, cancel)
+                .await
+                .map(ToolExecutionResult::Observation),
+            "Show" => self
+                .show(runtime, args, cancel)
+                .await
+                .map(ToolExecutionResult::Observation),
+            "Ask" => self
+                .ask(runtime, args, cancel)
+                .await
+                .map(ToolExecutionResult::Observation),
+            "Skill" => self
+                .skill(args, cancel)
+                .await
+                .map(ToolExecutionResult::Observation),
+            "SubAgent" => self
+                .subagent(runtime, args, cancel)
+                .await
+                .map(ToolExecutionResult::Observation),
+            "Finish" => self.finish(args, cancel).await,
+            "FinishWithoutOutput" => self.finish_without_output(cancel).await,
+            "NotifyParent" => self
+                .notify_parent(runtime, args, cancel)
+                .await
+                .map(ToolExecutionResult::Observation),
+            "MessageAgent" => self
+                .message_agent(runtime, args, cancel)
+                .await
+                .map(ToolExecutionResult::Observation),
+            "BroadcastAgents" => self
+                .broadcast_agents(runtime, args, cancel)
+                .await
+                .map(ToolExecutionResult::Observation),
+            "ListAgents" => self
+                .list_agents(runtime, args, cancel)
+                .await
+                .map(ToolExecutionResult::Observation),
+            "GetAgent" => self
+                .get_agent(runtime, args, cancel)
+                .await
+                .map(ToolExecutionResult::Observation),
+            "TransferInput" => self
+                .transfer_input(runtime, args, cancel)
+                .await
+                .map(ToolExecutionResult::Observation),
+            "Wait" => self.wait(args, cancel).await,
+            "GetTask" => self
+                .get_task(runtime, args, cancel)
+                .await
+                .map(ToolExecutionResult::Observation),
             _ => {
                 if let Some(registry) = &self.mcp_registry {
                     if registry.has_tool(name) {
-                        return registry.call_tool(name, args).await;
+                        return registry
+                            .call_tool(name, args)
+                            .await
+                            .map(ToolExecutionResult::Observation);
                     }
                 }
                 anyhow::bail!("Unknown tool: {name}")
@@ -924,12 +1714,19 @@ impl ToolExecutor {
     }
 
     /// `Bash`: run a command through Git Bash.
-    async fn bash(&self, args: serde_json::Value, cancel: &CancelToken) -> anyhow::Result<String> {
+    async fn bash(
+        &self,
+        runtime: &ToolRuntime,
+        args: serde_json::Value,
+        cancel: &CancelToken,
+    ) -> anyhow::Result<String> {
         #[derive(Debug, Deserialize)]
         struct Args {
             command: String,
             workdir: Option<String>,
             timeout_seconds: Option<u64>,
+            #[serde(default)]
+            run_in_background: bool,
         }
 
         let args: Args = serde_json::from_value(args).context("Invalid arguments for Bash")?;
@@ -943,6 +1740,28 @@ impl ToolExecutor {
             .map(Duration::from_secs)
             .unwrap_or(DEFAULT_BASH_TIMEOUT)
             .min(MAX_BASH_TIMEOUT);
+
+        if args.run_in_background {
+            let handle = runtime
+                .start_terminal_task(
+                    StartTerminalTaskRequest {
+                        command: args.command.clone(),
+                        workdir: workdir.display().to_string(),
+                        timeout_seconds: args.timeout_seconds,
+                    },
+                    cancel.clone(),
+                )
+                .await?;
+
+            return Ok(serde_json::json!({
+                "started": true,
+                "task_id": handle.task_id,
+                "status": handle.status,
+                "output_path": handle.output_path,
+                "workdir": workdir.display().to_string(),
+            })
+            .to_string());
+        }
 
         let programs = candidate_bash_programs();
         let mut last_not_found: Option<anyhow::Error> = None;
@@ -1237,6 +2056,9 @@ impl ToolExecutor {
         args: serde_json::Value,
         cancel: &CancelToken,
     ) -> anyhow::Result<String> {
+        if !runtime.allow_user_send {
+            anyhow::bail!("Send is not allowed for this agent");
+        }
         if cancel.is_cancelled() {
             anyhow::bail!("Send cancelled");
         }
@@ -1267,6 +2089,9 @@ impl ToolExecutor {
         args: serde_json::Value,
         cancel: &CancelToken,
     ) -> anyhow::Result<String> {
+        if !runtime.allow_user_show {
+            anyhow::bail!("Show is not allowed for this agent");
+        }
         if cancel.is_cancelled() {
             anyhow::bail!("Show cancelled");
         }
@@ -1339,6 +2164,9 @@ impl ToolExecutor {
         args: serde_json::Value,
         cancel: &CancelToken,
     ) -> anyhow::Result<String> {
+        if !runtime.allow_user_ask {
+            anyhow::bail!("Ask is not allowed for this agent");
+        }
         if cancel.is_cancelled() {
             anyhow::bail!("Ask cancelled");
         }
@@ -1436,6 +2264,15 @@ impl ToolExecutor {
             label: Option<String>,
             task: String,
             context: String,
+            #[serde(default)]
+            allow_user_send: bool,
+            #[serde(default)]
+            allow_user_show: bool,
+            #[serde(default)]
+            allow_user_ask: bool,
+            #[serde(default)]
+            allow_input_transfer_target: bool,
+            existing_agent_id: Option<Uuid>,
         }
 
         let args: Args = serde_json::from_value(args).context("Invalid arguments for SubAgent")?;
@@ -1443,15 +2280,252 @@ impl ToolExecutor {
             label: args.label,
             task: args.task,
             context: args.context,
+            allow_user_send: args.allow_user_send,
+            allow_user_show: args.allow_user_show,
+            allow_user_ask: args.allow_user_ask,
+            allow_input_transfer_target: args.allow_input_transfer_target,
+            existing_agent_id: args.existing_agent_id,
         };
         request.validate()?;
 
-        let final_answer = runtime.run_subagent(request, cancel.clone()).await?;
+        let handle = runtime.run_subagent(request, cancel.clone()).await?;
 
         Ok(serde_json::json!({
-            "final_answer": final_answer,
+            "agent_id": handle.agent_id,
+            "work_id": handle.work_id,
+            "label": handle.label,
+            "status": handle.status,
         })
         .to_string())
+    }
+
+    /// `Finish`: explicitly mark the current work as complete.
+    async fn finish(
+        &self,
+        args: serde_json::Value,
+        cancel: &CancelToken,
+    ) -> anyhow::Result<ToolExecutionResult> {
+        if cancel.is_cancelled() {
+            anyhow::bail!("Finish cancelled");
+        }
+
+        let args: FinishRequest =
+            serde_json::from_value(args).context("Invalid arguments for Finish")?;
+        args.validate()?;
+
+        Ok(ToolExecutionResult::Control(ToolControl::Finish(args)))
+    }
+
+    /// `FinishWithoutOutput`: explicit confirmation for a temporary
+    /// no-extra-output finish path.
+    async fn finish_without_output(
+        &self,
+        cancel: &CancelToken,
+    ) -> anyhow::Result<ToolExecutionResult> {
+        if cancel.is_cancelled() {
+            anyhow::bail!("FinishWithoutOutput cancelled");
+        }
+
+        Ok(ToolExecutionResult::Control(ToolControl::FinishWithoutOutput))
+    }
+
+    /// `NotifyParent`: convenience one-way message to the current parent.
+    async fn notify_parent(
+        &self,
+        runtime: &ToolRuntime,
+        args: serde_json::Value,
+        cancel: &CancelToken,
+    ) -> anyhow::Result<String> {
+        if cancel.is_cancelled() {
+            anyhow::bail!("NotifyParent cancelled");
+        }
+        if runtime.parent_agent_id.is_none() {
+            anyhow::bail!("NotifyParent is only available for child agents");
+        }
+
+        #[derive(Debug, Deserialize)]
+        struct Args {
+            message: String,
+        }
+
+        let args: Args =
+            serde_json::from_value(args).context("Invalid arguments for NotifyParent")?;
+        if args.message.trim().is_empty() {
+            anyhow::bail!("NotifyParent message must not be empty");
+        }
+
+        let receipt = runtime.notify_parent(args.message.clone()).await?;
+        Ok(serde_json::to_string(&receipt)?)
+    }
+
+    /// `MessageAgent`: direct one-way message to another agent.
+    async fn message_agent(
+        &self,
+        runtime: &ToolRuntime,
+        args: serde_json::Value,
+        cancel: &CancelToken,
+    ) -> anyhow::Result<String> {
+        if cancel.is_cancelled() {
+            anyhow::bail!("MessageAgent cancelled");
+        }
+
+        #[derive(Debug, Deserialize)]
+        struct Args {
+            target_agent_id: Uuid,
+            message: String,
+        }
+
+        let args: Args =
+            serde_json::from_value(args).context("Invalid arguments for MessageAgent")?;
+        let request = AgentMessageRequest {
+            target_agent_id: args.target_agent_id,
+            message: args.message,
+        };
+        request.validate()?;
+        let receipt = runtime.message_agent(request).await?;
+        Ok(serde_json::to_string(&receipt)?)
+    }
+
+    /// `BroadcastAgents`: broadcast a one-way message to a scoped set of agents.
+    async fn broadcast_agents(
+        &self,
+        runtime: &ToolRuntime,
+        args: serde_json::Value,
+        cancel: &CancelToken,
+    ) -> anyhow::Result<String> {
+        if cancel.is_cancelled() {
+            anyhow::bail!("BroadcastAgents cancelled");
+        }
+
+        #[derive(Debug, Deserialize)]
+        struct Args {
+            scope: Option<AgentScope>,
+            message: String,
+        }
+
+        let args: Args =
+            serde_json::from_value(args).context("Invalid arguments for BroadcastAgents")?;
+        let request = BroadcastAgentsRequest {
+            scope: args.scope.unwrap_or(AgentScope::Descendants),
+            message: args.message,
+        };
+        request.validate()?;
+        let receipt = runtime.broadcast_agents(request).await?;
+        Ok(serde_json::to_string(&receipt)?)
+    }
+
+    /// `ListAgents`: inspect visible agents.
+    async fn list_agents(
+        &self,
+        runtime: &ToolRuntime,
+        args: serde_json::Value,
+        cancel: &CancelToken,
+    ) -> anyhow::Result<String> {
+        if cancel.is_cancelled() {
+            anyhow::bail!("ListAgents cancelled");
+        }
+
+        #[derive(Debug, Deserialize)]
+        struct Args {
+            scope: Option<AgentScope>,
+        }
+
+        let args: Args =
+            serde_json::from_value(args).context("Invalid arguments for ListAgents")?;
+        let items = runtime
+            .list_agents(ListAgentsRequest {
+                scope: args.scope.unwrap_or(AgentScope::Descendants),
+            })
+            .await?;
+        Ok(serde_json::to_string(&items)?)
+    }
+
+    /// `GetAgent`: inspect one visible agent.
+    async fn get_agent(
+        &self,
+        runtime: &ToolRuntime,
+        args: serde_json::Value,
+        cancel: &CancelToken,
+    ) -> anyhow::Result<String> {
+        if cancel.is_cancelled() {
+            anyhow::bail!("GetAgent cancelled");
+        }
+
+        #[derive(Debug, Deserialize)]
+        struct Args {
+            agent_id: Uuid,
+        }
+
+        let args: Args = serde_json::from_value(args).context("Invalid arguments for GetAgent")?;
+        let item = runtime.get_agent(args.agent_id).await?;
+        Ok(serde_json::to_string(&item)?)
+    }
+
+    /// `TransferInput`: move free-form user input ownership.
+    async fn transfer_input(
+        &self,
+        runtime: &ToolRuntime,
+        args: serde_json::Value,
+        cancel: &CancelToken,
+    ) -> anyhow::Result<String> {
+        if cancel.is_cancelled() {
+            anyhow::bail!("TransferInput cancelled");
+        }
+        if !runtime.is_root {
+            anyhow::bail!("TransferInput is only available to the root agent");
+        }
+
+        #[derive(Debug, Deserialize)]
+        struct Args {
+            target_agent_id: Option<Uuid>,
+        }
+
+        let args: Args =
+            serde_json::from_value(args).context("Invalid arguments for TransferInput")?;
+        let receipt = runtime
+            .transfer_input(TransferInputRequest {
+                target_agent_id: args.target_agent_id,
+            })
+            .await?;
+        Ok(serde_json::to_string(&receipt)?)
+    }
+
+    /// `Wait`: suspend the current work until a dependency reaches the desired
+    /// state.
+    async fn wait(
+        &self,
+        args: serde_json::Value,
+        cancel: &CancelToken,
+    ) -> anyhow::Result<ToolExecutionResult> {
+        if cancel.is_cancelled() {
+            anyhow::bail!("Wait cancelled");
+        }
+
+        let args: WaitRequest =
+            serde_json::from_value(args).context("Invalid arguments for Wait")?;
+        args.validate()?;
+        Ok(ToolExecutionResult::Control(ToolControl::Wait(args)))
+    }
+
+    /// `GetTask`: inspect one runtime task.
+    async fn get_task(
+        &self,
+        runtime: &ToolRuntime,
+        args: serde_json::Value,
+        cancel: &CancelToken,
+    ) -> anyhow::Result<String> {
+        if cancel.is_cancelled() {
+            anyhow::bail!("GetTask cancelled");
+        }
+
+        #[derive(Debug, Deserialize)]
+        struct Args {
+            task_id: Uuid,
+        }
+
+        let args: Args = serde_json::from_value(args).context("Invalid arguments for GetTask")?;
+        let task = runtime.get_task(args.task_id).await?;
+        Ok(serde_json::to_string(&task)?)
     }
 }
 

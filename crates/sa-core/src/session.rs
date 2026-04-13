@@ -252,13 +252,27 @@ impl SessionStore {
     /// If no active segment exists yet, this eagerly creates a fresh one so the
     /// first user turn can be appended immediately.
     pub fn new(workspace_root: PathBuf) -> anyhow::Result<Self> {
+        Self::new_in_relative_dir(workspace_root, Path::new(SESSIONS_DIR_NAME))
+    }
+
+    /// Create one workspace-bound session store rooted at a custom relative
+    /// directory under the workspace.
+    ///
+    /// This is used by the durable multi-agent runtime so every agent can keep
+    /// an isolated transcript under paths such as `sessions/agents/<agent_id>/`.
+    pub fn new_in_relative_dir(
+        workspace_root: PathBuf,
+        sessions_relative_dir: &Path,
+    ) -> anyhow::Result<Self> {
         let workspace_root = fs::canonicalize(&workspace_root).with_context(|| {
             format!(
                 "Failed to canonicalize workspace root for session storage: {}",
                 workspace_root.display()
             )
         })?;
-        let sessions_dir = workspace_root.join(SESSIONS_DIR_NAME);
+        let sessions_relative_dir =
+            validate_session_relative_dir(sessions_relative_dir).context("Invalid session directory override")?;
+        let sessions_dir = workspace_root.join(&sessions_relative_dir);
         fs::create_dir_all(&sessions_dir).with_context(|| {
             format!(
                 "Failed to create session directory: {}",
@@ -352,6 +366,7 @@ impl SessionStore {
             .expect("session state mutex poisoned")
             .clone();
         let next_state = create_new_segment(
+            &self.workspace_root,
             &self.sessions_dir,
             &self.pointer_path,
             current_state.conversation_id,
@@ -384,6 +399,37 @@ impl SessionStore {
     pub fn workspace_root(&self) -> &Path {
         &self.workspace_root
     }
+}
+
+/// Validate that the custom session directory is a normalized relative path
+/// that stays under the workspace root.
+fn validate_session_relative_dir(raw: &Path) -> anyhow::Result<PathBuf> {
+    if raw.as_os_str().is_empty() {
+        anyhow::bail!("Session directory override must not be empty");
+    }
+    if raw.is_absolute() {
+        anyhow::bail!("Session directory override must be workspace-relative");
+    }
+
+    let mut normalized = PathBuf::new();
+    for component in raw.components() {
+        match component {
+            Component::Normal(part) => normalized.push(part),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                anyhow::bail!("Session directory override must not contain `..`");
+            }
+            Component::Prefix(_) | Component::RootDir => {
+                anyhow::bail!("Session directory override must stay relative");
+            }
+        }
+    }
+
+    if normalized.as_os_str().is_empty() {
+        anyhow::bail!("Session directory override must not normalize to the workspace root");
+    }
+
+    Ok(normalized)
 }
 
 /// Resolve the current active segment, or create a brand-new one if this is
@@ -419,11 +465,20 @@ fn resolve_or_create_current_state(
         });
     }
 
-    create_new_segment(sessions_dir, pointer_path, Uuid::new_v4(), None, None, &[])
+    create_new_segment(
+        workspace_root,
+        sessions_dir,
+        pointer_path,
+        Uuid::new_v4(),
+        None,
+        None,
+        &[],
+    )
 }
 
 /// Create one brand-new segment file and make it the active pointer target.
 fn create_new_segment(
+    workspace_root: &Path,
     sessions_dir: &Path,
     pointer_path: &Path,
     conversation_id: Uuid,
@@ -438,7 +493,7 @@ fn create_new_segment(
         segment_id
     );
     let current_absolute_path = sessions_dir.join(&file_name);
-    let current_relative_path = format!("{SESSIONS_DIR_NAME}/{file_name}");
+    let current_relative_path = workspace_relative_path(workspace_root, &current_absolute_path)?;
     let meta = SessionMetaEntry {
         schema_version: SESSION_SCHEMA_VERSION,
         conversation_id,
@@ -1165,5 +1220,42 @@ mod tests {
             .expect_err("second live owner should be rejected");
         let message = format!("{err:#}");
         assert!(message.contains("already using session storage"));
+    }
+
+    /// Custom agent session roots should stay isolated under nested session
+    /// directories such as `sessions/agents/<agent_id>/`.
+    #[test]
+    fn session_store_supports_nested_agent_session_roots() {
+        let workspace = TempDir::new().expect("temp workspace should be created");
+        let store = SessionStore::new_in_relative_dir(
+            workspace.path().to_path_buf(),
+            Path::new("sessions/agents/agent-1"),
+        )
+        .expect("nested agent session store should build");
+
+        store
+            .append_message(&ChatMessage::text("user", "hello child"))
+            .expect("message should append");
+        let snapshot = store.load_snapshot().expect("snapshot should load");
+
+        assert!(
+            snapshot
+                .descriptor
+                .current_session_path
+                .starts_with("sessions/agents/agent-1/")
+        );
+        assert_eq!(snapshot.messages.len(), 1);
+    }
+
+    /// Custom session roots must still remain workspace-relative.
+    #[test]
+    fn session_store_rejects_invalid_nested_session_root() {
+        let workspace = TempDir::new().expect("temp workspace should be created");
+        let err = SessionStore::new_in_relative_dir(
+            workspace.path().to_path_buf(),
+            Path::new("../escape"),
+        )
+        .expect_err("escaping custom session roots must be rejected");
+        assert!(format!("{err:#}").contains("must not contain `..`"));
     }
 }

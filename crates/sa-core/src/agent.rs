@@ -5,8 +5,7 @@
 //! - We call an OpenAI-compatible Chat Completions endpoint.
 //! - We provide tool definitions so the model can request actions.
 //! - We execute those tools and feed results back to the model.
-//! - We repeat until the model produces a final answer (no tool calls) or
-//!   until `max_steps` is reached.
+//! - We repeat until the current work explicitly finishes or is cancelled.
 //!
 //! The backend daemon (`sa`) owns task queues, event IDs, and WS connections.
 //! This module is deliberately "pure core": it only needs an event callback.
@@ -20,7 +19,7 @@ use crate::openai::{ChatCompletionsRequest, ChatMessage, OpenAiClient, ToolCall}
 use crate::retry::retry_delay;
 use crate::session::SessionStore;
 use crate::skills::SkillRegistry;
-use crate::tools::{ToolExecutor, ToolRuntime, ToolSession};
+use crate::tools::{ToolControl, ToolExecutionResult, ToolExecutor, ToolRuntime, ToolSession};
 use crate::ws_protocol::EventKind;
 use anyhow::Context as _;
 use std::sync::Arc;
@@ -57,8 +56,6 @@ pub struct AgentRunnerConfig {
     pub system_role_name: String,
     /// Optional reasoning depth / effort forwarded to compatible GPT models.
     pub reasoning_effort: Option<String>,
-    /// Maximum tool-call steps per task.
-    pub max_steps: u32,
     /// History compaction behavior for long-running tasks.
     pub compaction: CompactionConfig,
 }
@@ -211,9 +208,6 @@ impl AgentRunner {
             persistent_session.as_deref(),
         )?;
 
-        // We pre-compute tool definitions once. This keeps requests stable.
-        let tool_definitions = self.tools.tool_definitions();
-
         // Each run gets its own session state.
         //
         // This is important for the `Edit` guardrail: "must `Read` before
@@ -225,7 +219,9 @@ impl AgentRunner {
         let mut model_error_count: u32 = 0;
 
         // Step loop.
-        for step in 1..=self.cfg.max_steps {
+        let mut step: u64 = 0;
+        loop {
+            step = step.saturating_add(1);
             // Cooperative cancellation check before starting the next step.
             if cancel.is_cancelled() {
                 let msg = "Task cancelled by user interrupt.".to_string();
@@ -250,7 +246,7 @@ impl AgentRunner {
                 self.cfg.reasoning_effort.as_deref(),
                 &mut compaction_state,
                 &mut messages,
-                &tool_definitions,
+                &self.tools.tool_definitions(&runtime),
                 &self.cfg.compaction,
                 cancel,
             )
@@ -351,7 +347,7 @@ impl AgentRunner {
             (emit)(
                 EventKind::Log,
                 task_id,
-                format!("Step {step}/{}: calling model...", self.cfg.max_steps),
+                format!("Step {step}: calling model..."),
             );
 
             // Build the request.
@@ -360,7 +356,7 @@ impl AgentRunner {
                 messages: build_request_messages(&system_message, &compaction_state, &messages),
                 max_tokens: None,
                 reasoning_effort: self.cfg.reasoning_effort.clone(),
-                tools: Some(tool_definitions.clone()),
+                tools: Some(self.tools.tool_definitions(&runtime)),
                 tool_choice: Some(serde_json::json!("auto")),
                 // Stream provider output by default for the main agent loop.
                 //
@@ -517,7 +513,33 @@ impl AgentRunner {
                     )
                     .await
                 {
-                    Ok(output) => output,
+                    Ok(ToolExecutionResult::Observation(output)) => output,
+                    Ok(ToolExecutionResult::Control(control)) => match control {
+                        ToolControl::Finish(request) => {
+                            let final_text = format!(
+                                "WORK_FINISH\nreason: {}\nresult: {}",
+                                request.reason.trim(),
+                                request.result.trim()
+                            );
+                            (emit)(EventKind::Final, task_id, final_text.clone());
+                            return Ok(final_text);
+                        }
+                        ToolControl::FinishWithoutOutput => {
+                            let final_text = "WORK_FINISH_WITHOUT_OUTPUT".to_string();
+                            (emit)(EventKind::Final, task_id, final_text.clone());
+                            return Ok(final_text);
+                        }
+                        ToolControl::Wait(request) => {
+                            let msg = format!(
+                                "Wait requested for {:?} {} until {:?}, but the legacy runner has not been upgraded to durable waiting yet.",
+                                request.kind,
+                                request.id,
+                                request.until
+                            );
+                            (emit)(EventKind::Error, task_id, msg.clone());
+                            format!("ERROR: {msg}")
+                        }
+                    },
                     Err(err) => {
                         // If the tool failed because the user interrupted the task, treat it as
                         // a task cancellation rather than a "normal" tool failure.
@@ -547,15 +569,6 @@ impl AgentRunner {
             }
         }
 
-        // If we exit the loop we hit the step cap.
-        let msg = format!(
-            "Reached max_steps={} without a final answer.",
-            self.cfg.max_steps
-        );
-        (emit)(EventKind::Error, task_id, msg.clone());
-        // Emit `Final` so clients can stop waiting even on failure.
-        (emit)(EventKind::Final, task_id, msg.clone());
-        Ok(msg)
     }
 
     /// Build the stable instructions block injected into the prompt.
@@ -849,9 +862,12 @@ fn build_internal_memory_refresh_runtime(
     depth: u32,
 ) -> ToolRuntime {
     use crate::tools::{
-        AskQuestionFn, RunSubAgentFn, SendMessageFn, ShowFileFn, SubAgentRequest,
+        AgentInfo, AskQuestionFn, BroadcastAgentsFn, GetAgentFn, GetTaskFn, ListAgentsFn,
+        MessageAgentFn, NotifyParentFn, RunSubAgentFn, SendMessageFn, ShowFileFn,
+        StartTerminalTaskFn, SubAgentHandle, SubAgentRequest, TransferInputFn, ToolRuntime,
         MAX_SUBAGENT_DEPTH,
     };
+    use crate::runtime::state::AgentStatus;
 
     let runner_for_subagent = runner.clone();
     let agents_md_for_subagent = agents_md.clone();
@@ -939,7 +955,7 @@ fn build_internal_memory_refresh_runtime(
                 );
             });
 
-            let final_answer = Box::pin(runner.run_task_inner(
+            Box::pin(runner.run_task_inner(
                 task_id,
                 request_task,
                 &agents_md,
@@ -953,11 +969,66 @@ fn build_internal_memory_refresh_runtime(
             ))
             .await?;
 
-            Ok(final_answer)
+            Ok(SubAgentHandle {
+                agent_id: Uuid::new_v4(),
+                work_id: Uuid::new_v4(),
+                label: request
+                    .label
+                    .unwrap_or_else(|| format!("memory-refresh-depth-{next_depth}")),
+                status: AgentStatus::Idle,
+            })
         })
     });
+    let notify_parent: NotifyParentFn = Arc::new(move |_message| {
+        Box::pin(async move { anyhow::bail!("memory refresh must not use NotifyParent") })
+    });
+    let message_agent: MessageAgentFn = Arc::new(move |_request| {
+        Box::pin(async move { anyhow::bail!("memory refresh must not use MessageAgent") })
+    });
+    let broadcast_agents: BroadcastAgentsFn = Arc::new(move |_request| {
+        Box::pin(async move { anyhow::bail!("memory refresh must not use BroadcastAgents") })
+    });
+    let list_agents: ListAgentsFn = Arc::new(move |_request| {
+        Box::pin(async move { Ok(Vec::<AgentInfo>::new()) })
+    });
+    let get_agent: GetAgentFn = Arc::new(move |_agent_id| {
+        Box::pin(async move { anyhow::bail!("memory refresh must not use GetAgent") })
+    });
+    let transfer_input: TransferInputFn = Arc::new(move |_request| {
+        Box::pin(async move { anyhow::bail!("memory refresh must not use TransferInput") })
+    });
+    let start_terminal_task: StartTerminalTaskFn = Arc::new(move |_request, _cancel| {
+        Box::pin(async move { anyhow::bail!("memory refresh must not use background Bash") })
+    });
+    let get_task: GetTaskFn = Arc::new(move |_task_id| {
+        Box::pin(async move { anyhow::bail!("memory refresh must not use GetTask") })
+    });
 
-    ToolRuntime::new(send_message, ask_question, show_file, run_subagent)
+    ToolRuntime::new(
+        task_id,
+        None,
+        task_id,
+        format!("memory-refresh-depth-{depth}"),
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        send_message,
+        ask_question,
+        show_file,
+        run_subagent,
+        notify_parent,
+        message_agent,
+        broadcast_agents,
+        list_agents,
+        get_agent,
+        transfer_input,
+        start_terminal_task,
+        get_task,
+    )
 }
 
 /// Trim a long internal runtime note so it stays useful without bloating the
@@ -1126,7 +1197,6 @@ mod tests {
                 model: "test-model".to_string(),
                 system_role_name: "developer".to_string(),
                 reasoning_effort: None,
-                max_steps: 4,
                 compaction: CompactionConfig::default(),
             },
         )
@@ -1253,6 +1323,11 @@ mod tests {
             label: Some("memory-topics".to_string()),
             task: "整理 testing 主题记忆".to_string(),
             context: "聚焦 testing 偏好".to_string(),
+            allow_user_send: false,
+            allow_user_show: false,
+            allow_user_ask: false,
+            allow_input_transfer_target: false,
+            existing_agent_id: None,
         };
         let context =
             build_internal_memory_refresh_subagent_context("## Base\n\n- compact 后上下文", &request, 2);

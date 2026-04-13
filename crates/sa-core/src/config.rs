@@ -45,6 +45,10 @@ pub struct Config {
     /// External MCP server configuration (`[mcp]`).
     #[serde(default)]
     pub mcp: McpConfig,
+
+    /// Durable multi-agent runtime configuration (`[team]`).
+    #[serde(default)]
+    pub team: TeamConfig,
 }
 
 /// LLM/provider configuration (`[llm]` section).
@@ -113,16 +117,47 @@ pub struct LlmConfig {
     #[serde(default)]
     pub reasoning_effort: Option<String>,
 
-    /// Maximum tool-calling steps per task (safety cap).
-    #[serde(default = "default_max_steps")]
-    pub max_steps: u32,
 }
 
-/// Default maximum steps.
-///
-/// We keep it reasonably small so the agent cannot "run forever" by default.
-fn default_max_steps() -> u32 {
-    32
+/// Durable multi-agent runtime configuration (`[team]` section).
+#[derive(Debug, Clone, Deserialize)]
+pub struct TeamConfig {
+    /// Whether unfinished work should be resumed automatically on boot.
+    #[serde(default = "default_team_auto_resume")]
+    pub auto_resume: bool,
+
+    /// Soft ceiling for concurrently tracked live agents.
+    #[serde(default = "default_team_max_active_agents")]
+    pub max_active_agents: usize,
+
+    /// Maximum concurrent model calls shared by all agents.
+    #[serde(default = "default_team_max_concurrent_model_calls")]
+    pub max_concurrent_model_calls: usize,
+}
+
+impl Default for TeamConfig {
+    fn default() -> Self {
+        Self {
+            auto_resume: default_team_auto_resume(),
+            max_active_agents: default_team_max_active_agents(),
+            max_concurrent_model_calls: default_team_max_concurrent_model_calls(),
+        }
+    }
+}
+
+/// Default auto-resume policy for the durable runtime.
+const fn default_team_auto_resume() -> bool {
+    true
+}
+
+/// Default maximum number of live agents.
+const fn default_team_max_active_agents() -> usize {
+    4096
+}
+
+/// Default maximum number of concurrent model calls.
+const fn default_team_max_concurrent_model_calls() -> usize {
+    8
 }
 
 impl LlmConfig {
@@ -637,8 +672,8 @@ fn validate_mcp_config(config: &McpConfig) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Config, LlmConfig, McpConfig, McpServerConfig, McpTransport, load_config_from_file,
-        validate_mcp_config,
+        Config, LlmConfig, McpConfig, McpServerConfig, McpTransport, TeamConfig,
+        load_config_from_file, validate_mcp_config,
     };
     use crate::openai::{AuthStyle, WireApi};
     use std::collections::HashMap;
@@ -654,8 +689,11 @@ mod tests {
             auth_style: None,
             system_role_name: None,
             reasoning_effort: None,
-            max_steps: 32,
         }
+    }
+
+    fn sample_team() -> TeamConfig {
+        TeamConfig::default()
     }
 
     #[test]
@@ -749,6 +787,64 @@ agents_md = "Agents.md"
         let mut cfg = sample_llm();
         cfg.reasoning_effort = Some("  xhigh  ".to_string());
         assert_eq!(cfg.effective_reasoning_effort(), Some("xhigh"));
+    }
+
+    #[test]
+    fn team_defaults_match_expected_runtime_policy() {
+        let cfg = sample_team();
+        assert!(cfg.auto_resume);
+        assert_eq!(cfg.max_active_agents, 4096);
+        assert_eq!(cfg.max_concurrent_model_calls, 8);
+    }
+
+    #[test]
+    fn team_defaults_load_when_section_is_missing() {
+        let raw = r#"
+[llm]
+base_url = "https://example.com/v1"
+api_key = "sk-test"
+model = "gpt-5.2"
+
+[server]
+bind = "127.0.0.1:8765"
+ws_path = "/ws"
+
+[workspace]
+root_dir = "."
+agents_md = "Agents.md"
+"#;
+
+        let cfg = toml::from_str::<Config>(raw).expect("config without team section should parse");
+        assert!(cfg.team.auto_resume);
+        assert_eq!(cfg.team.max_active_agents, 4096);
+        assert_eq!(cfg.team.max_concurrent_model_calls, 8);
+    }
+
+    #[test]
+    fn team_partial_override_preserves_other_defaults() {
+        let raw = r#"
+[llm]
+base_url = "https://example.com/v1"
+api_key = "sk-test"
+model = "gpt-5.2"
+
+[server]
+bind = "127.0.0.1:8765"
+ws_path = "/ws"
+
+[workspace]
+root_dir = "."
+agents_md = "Agents.md"
+
+[team]
+max_concurrent_model_calls = 3
+"#;
+
+        let cfg =
+            toml::from_str::<Config>(raw).expect("config with partial team override should parse");
+        assert!(cfg.team.auto_resume);
+        assert_eq!(cfg.team.max_active_agents, 4096);
+        assert_eq!(cfg.team.max_concurrent_model_calls, 3);
     }
 
     #[test]
