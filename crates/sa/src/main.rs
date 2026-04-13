@@ -35,12 +35,11 @@ use sa_core::runtime::store::{RootMarker, RuntimeStore};
 use sa_core::session::SessionStore;
 use sa_core::skills::SkillRegistry;
 use sa_core::tools::{
-    AgentInfo, AgentMessageReceipt, AskQuestionFn, AskRequest, BroadcastAgentsFn,
-    BroadcastAgentsRequest, BroadcastReceipt, GetAgentFn, GetTaskFn, ListAgentsFn,
-    ListAgentsRequest, MAX_SUBAGENT_DEPTH, MessageAgentFn, NotifyParentFn, RunSubAgentFn,
+    AgentInfo, AskQuestionFn, AskRequest, BroadcastAgentsFn, GetAgentFn, GetTaskFn,
+    ListAgentsFn, MAX_SUBAGENT_DEPTH, MessageAgentFn, NotifyParentFn, RunSubAgentFn,
     SendMessageFn, ShowFileFn, StartTerminalTaskFn, SubAgentHandle, SubAgentRequest,
     StartTerminalTaskRequest, TerminalTaskHandle, TerminalTaskInfo, ToolContext, ToolExecutor,
-    ToolRuntime, TransferInputFn, TransferInputReceipt, TransferInputRequest,
+    ToolRuntime, TransferInputFn,
 };
 use sa_core::runtime::state::AgentStatus;
 use sa_core::ws_identity::{
@@ -258,7 +257,7 @@ struct Hub {
     /// Durable runtime metadata store rooted at `workspace/runtime/`.
     runtime_store: RuntimeStore,
     /// Current persisted team state snapshot.
-    team_state: AsyncMutex<TeamState>,
+    _team_state: AsyncMutex<TeamState>,
 }
 
 impl Hub {
@@ -293,7 +292,7 @@ impl Hub {
             agents_md_path,
             session_store,
             runtime_store,
-            team_state: AsyncMutex::new(team_state),
+            _team_state: AsyncMutex::new(team_state),
         });
 
         // Spawn worker loop.
@@ -2729,12 +2728,24 @@ mod tests {
                 compaction: sa_core::compact::CompactionConfig::default(),
             },
         );
+        let runtime_store =
+            RuntimeStore::new(workspace.path().to_path_buf()).expect("runtime store should build");
+        let root_agent_id = Uuid::new_v4();
+        runtime_store
+            .save_root_marker(&RootMarker { root_agent_id })
+            .expect("root marker should persist");
+        let team_state = TeamState::new(root_agent_id);
+        runtime_store
+            .save_team_state(&team_state)
+            .expect("team state should persist");
 
         Hub::new(
             runner,
             workspace.path().join("AGENTS.md"),
             preload_ctx,
             session_store,
+            runtime_store,
+            team_state,
         )
     }
 
