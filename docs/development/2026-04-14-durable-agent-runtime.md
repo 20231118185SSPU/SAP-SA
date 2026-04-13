@@ -119,3 +119,55 @@
 2. 再把 `run_quantum()` 替换当前 legacy `run_task()` 路径
 3. 接着落地 mailbox 驱动的 child runtime
 4. 最后补齐 `Wait`、输入归属、pending finish confirmation
+
+## 2026-04-14 第二阶段实装结果
+
+本轮继续推进后，以下关键路径已经真正接通，不再只是类型占位：
+
+1. `main.rs` 已切换为 durable supervisor 驱动
+2. `submit` 不再进入 legacy 单 worker 队列，而是：
+   - 读取 `team_state.json`
+   - 把消息投递到当前输入所有者的 mailbox
+   - 必要时创建新的 `active_work_id`
+   - 唤醒对应 agent
+3. `run_quantum()` 已正式接入 supervisor
+   - 每次只跑一个 quantum
+   - quantum 结束后根据 `Continue / Ask / Wait / Finish` 更新 durable 状态
+4. `Ask` 已改为 durable control flow
+   - `Ask` 不再依赖进程内阻塞等待
+   - 问题会写入 `pending_question.json`
+   - 回答后会把 tool-result 直接写回该 agent 的 session JSONL
+   - 重启后可恢复 pending question
+5. `Finish` / `FinishWithoutOutput` 已接通
+   - root 持有输入且未 `Send/Show` 时，会进入 pending confirmation
+   - child 未显式通知父代理时，也会进入 pending confirmation
+   - `FinishWithoutOutput()` 只在临时提醒场景中可用
+6. `Wait(agent/work/task)` 已接通 durable 挂起/恢复
+   - wait 状态持久化到 agent state
+   - 背景任务结束、agent idle、work finish 时会唤醒 waiters
+   - timeout 也会写入 mailbox 并重新唤醒 agent
+7. durable 子代理已经落地
+   - `SubAgent` 现在会创建/复用真正的 child agent state
+   - child 拥有独立 session 目录 `sessions/agents/<agent_id>/`
+   - 父代理通过 mailbox 投递任务和上下文
+8. agent 间通信已接通
+   - `NotifyParent`
+   - `MessageAgent`
+   - `BroadcastAgents`
+   - `ListAgents`
+   - `GetAgent`
+   - `TransferInput`
+9. 后台 Bash 任务已接入 runtime wait/notify
+   - 任务结束后会写入 owner agent mailbox
+   - 同时唤醒 `Wait(task)` 的等待者
+10. 启动恢复已接通
+    - 会重建 pending questions
+    - 会恢复 timeout watcher
+    - 在 `team.auto_resume = true` 时自动唤醒可恢复的 agent
+
+## 本轮验证
+
+- `cargo test -q -j 1`
+- `cargo build --release -q -j 1`
+
+两者均已通过。

@@ -19,7 +19,9 @@ use crate::openai::{ChatCompletionsRequest, ChatMessage, OpenAiClient, ToolCall}
 use crate::retry::retry_delay;
 use crate::session::SessionStore;
 use crate::skills::SkillRegistry;
-use crate::tools::{ToolControl, ToolExecutionResult, ToolExecutor, ToolRuntime, ToolSession};
+use crate::tools::{
+    AskRequest, ToolControl, ToolExecutionResult, ToolExecutor, ToolRuntime, ToolSession,
+};
 use crate::ws_protocol::EventKind;
 use anyhow::Context as _;
 use std::sync::Arc;
@@ -85,6 +87,14 @@ pub struct AgentQuantumResult {
 /// Outcome of one model/tool quantum.
 #[derive(Debug)]
 pub enum AgentQuantumOutcome {
+    /// The work asked the runtime to persist a structured user question and
+    /// suspend until the answer is available.
+    Ask {
+        /// Assistant tool-call id that should receive the eventual tool result.
+        tool_call_id: String,
+        /// Structured question definition that should be shown to the frontend.
+        request: AskRequest,
+    },
     /// The work should continue later.
     Continue {
         /// Whether the turn ended without tools and therefore needs the
@@ -372,7 +382,7 @@ impl AgentRunner {
         let all_control_calls = tool_calls.iter().all(|call| {
             matches!(
                 call.function.name.as_str(),
-                "Finish" | "FinishWithoutOutput" | "Wait"
+                "Ask" | "Finish" | "FinishWithoutOutput" | "Wait"
             )
         });
         if all_control_calls {
@@ -408,6 +418,17 @@ impl AgentRunner {
             };
 
             let outcome = match control {
+                ToolControl::Ask(request) => {
+                    append_message_and_persist(
+                        &mut messages,
+                        assistant,
+                        persistent_session.as_deref(),
+                    )?;
+                    AgentQuantumOutcome::Ask {
+                        tool_call_id: call.id.clone(),
+                        request,
+                    }
+                }
                 ToolControl::Finish(request) => AgentQuantumOutcome::Finish {
                     reason: request.reason,
                     result: request.result,
@@ -872,6 +893,11 @@ impl AgentRunner {
                 {
                     Ok(ToolExecutionResult::Observation(output)) => output,
                     Ok(ToolExecutionResult::Control(control)) => match control {
+                        ToolControl::Ask(_request) => {
+                            let msg = "Ask requested in the legacy runner, but only the durable runtime may suspend for structured questions.".to_string();
+                            (emit)(EventKind::Error, task_id, msg.clone());
+                            format!("ERROR: {msg}")
+                        }
                         ToolControl::Finish(request) => {
                             let final_text = format!(
                                 "WORK_FINISH\nreason: {}\nresult: {}",

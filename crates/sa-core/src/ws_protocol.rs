@@ -303,7 +303,7 @@ pub struct UserQuestion {
 }
 
 /// One selectable option inside a structured question.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct QuestionOption {
     /// Stable option id used in answers.
     pub id: String,
@@ -315,7 +315,7 @@ pub struct QuestionOption {
 }
 
 /// How the user should answer the question.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum QuestionMode {
     /// Exactly one choice.

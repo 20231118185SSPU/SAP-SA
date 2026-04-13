@@ -186,6 +186,49 @@ impl AgentState {
             last_finished_at: None,
         }
     }
+
+    /// Create a new child agent state inheriting the current root tree.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_child(
+        agent_id: Uuid,
+        parent_agent_id: Uuid,
+        root_agent_id: Uuid,
+        label: String,
+        allow_user_send: bool,
+        allow_user_show: bool,
+        allow_user_ask: bool,
+        allow_input_transfer_target: bool,
+        current_session_path: String,
+    ) -> Self {
+        Self {
+            agent_id,
+            parent_agent_id: Some(parent_agent_id),
+            root_agent_id,
+            kind: AgentKind::Worker,
+            label,
+            status: AgentStatus::Idle,
+            allow_user_send,
+            allow_user_show,
+            allow_user_ask,
+            allow_input_transfer_target,
+            current_session_path,
+            previous_session_path: None,
+            tool_session_read_set: Vec::new(),
+            last_mailbox_offset: 0,
+            active_work_id: None,
+            active_work_summary: None,
+            active_started_at: None,
+            work_has_user_output: false,
+            work_has_parent_message: false,
+            needs_finish_reminder: false,
+            waiting_on: None,
+            pending_finish_confirmation: None,
+            last_finish_reason: None,
+            last_finish_result: None,
+            last_finished_work_id: None,
+            last_finished_at: None,
+        }
+    }
 }
 
 /// Kind of waitable runtime target.
@@ -327,6 +370,9 @@ pub struct PendingQuestionState {
     pub work_id: Uuid,
     /// Stable question id returned to the frontend.
     pub question_id: Uuid,
+    /// Assistant tool-call id that should receive the eventual tool-result
+    /// message once the question is answered.
+    pub tool_call_id: String,
     /// Prompt text.
     pub prompt: String,
     /// Raw question mode string.

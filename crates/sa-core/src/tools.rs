@@ -156,7 +156,7 @@ pub type GetTaskFn = Arc<
 >;
 
 /// Structured request emitted by the `Ask` tool.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AskRequest {
     /// Human-readable question prompt.
     pub prompt: String,
@@ -208,6 +208,9 @@ impl AskRequest {
 /// Control signal returned by a tool instead of a plain observation payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolControl {
+    /// Persist a structured user question and suspend until the runtime injects
+    /// the eventual answer as a tool-result message.
+    Ask(AskRequest),
     /// Explicit request to finish the current work.
     Finish(FinishRequest),
     /// Explicit confirmation that finishing without extra outward output is
@@ -1511,10 +1514,7 @@ impl ToolExecutor {
                 .show(runtime, args, cancel)
                 .await
                 .map(ToolExecutionResult::Observation),
-            "Ask" => self
-                .ask(runtime, args, cancel)
-                .await
-                .map(ToolExecutionResult::Observation),
+            "Ask" => self.ask(runtime, args, cancel).await,
             "Skill" => self
                 .skill(args, cancel)
                 .await
@@ -2175,7 +2175,7 @@ impl ToolExecutor {
         runtime: &ToolRuntime,
         args: serde_json::Value,
         cancel: &CancelToken,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<ToolExecutionResult> {
         if !runtime.allow_user_ask {
             anyhow::bail!("Ask is not allowed for this agent");
         }
@@ -2201,31 +2201,7 @@ impl ToolExecutor {
             allow_free_text: args.allow_free_text,
         };
         request.validate()?;
-
-        let answer = runtime
-            .ask_question(request.clone(), cancel.clone())
-            .await?;
-
-        let selected_labels: Vec<String> = answer
-            .selected_option_ids
-            .iter()
-            .filter_map(|id| {
-                request
-                    .options
-                    .iter()
-                    .find(|option| option.id == *id)
-                    .map(|option| option.label.clone())
-            })
-            .collect();
-
-        Ok(serde_json::json!({
-            "question_prompt": request.prompt,
-            "mode": request.mode,
-            "selected_option_ids": answer.selected_option_ids,
-            "selected_labels": selected_labels,
-            "free_text": answer.free_text,
-        })
-        .to_string())
+        Ok(ToolExecutionResult::Control(ToolControl::Ask(request)))
     }
 
     /// `Skill`: read `SKILL.md` or another skill-relative file by skill name.
