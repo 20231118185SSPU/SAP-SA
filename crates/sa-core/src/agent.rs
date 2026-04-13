@@ -107,6 +107,36 @@ impl AgentRunner {
         drain_queued_user_messages: Option<DrainQueuedUserMessagesFn>,
         emit: EmitEventFn,
     ) -> anyhow::Result<String> {
+        self.run_task_inner(
+            task_id,
+            task,
+            agents_md,
+            extra_system_prompt,
+            persistent_session,
+            runtime,
+            cancel,
+            drain_queued_user_messages,
+            emit,
+            true,
+        )
+        .await
+    }
+
+    /// Internal implementation shared by the normal task runner and the
+    /// compact-triggered memory refresh sub-agent.
+    async fn run_task_inner(
+        &self,
+        task_id: Uuid,
+        task: String,
+        agents_md: &AgentsMd,
+        extra_system_prompt: Option<&str>,
+        persistent_session: Option<Arc<SessionStore>>,
+        runtime: ToolRuntime,
+        cancel: &CancelToken,
+        drain_queued_user_messages: Option<DrainQueuedUserMessagesFn>,
+        emit: EmitEventFn,
+        enable_compaction_memory_refresh: bool,
+    ) -> anyhow::Result<String> {
         // Make it visible in the event stream whether `Agents.md` was found.
         //
         // This directly addresses the user's report:
@@ -261,6 +291,39 @@ impl AgentRunner {
                                     .unwrap_or("(none)")
                             ),
                         );
+                    }
+
+                    if enable_compaction_memory_refresh {
+                        match run_compaction_memory_refresh(
+                            self,
+                                task_id,
+                                agents_md,
+                                extra_system_prompt,
+                                persistent_session.as_ref(),
+                                cancel,
+                                &emit,
+                                compaction_state.summary().unwrap_or_default(),
+                            )
+                            .await
+                        {
+                            Ok(Some(internal_notice)) => {
+                                append_message_and_persist(
+                                    &mut messages,
+                                    internal_notice,
+                                    persistent_session.as_deref(),
+                                )?;
+                            }
+                            Ok(None) => {}
+                            Err(err) => {
+                                (emit)(
+                                    EventKind::Error,
+                                    task_id,
+                                    format!(
+                                        "Compaction-triggered memory refresh failed before step {step}: {err:#}"
+                                    ),
+                                );
+                            }
+                        }
                     }
 
                     (emit)(
@@ -603,6 +666,210 @@ fn join_extra_system_prompt(
     (!parts.is_empty()).then(|| parts.join("\n\n"))
 }
 
+/// Run one isolated memory-refresh sub-agent immediately after a successful
+/// compaction pass.
+///
+/// Why do this here instead of waiting for nightly dream?
+/// - The just-compacted history contains fresh signal that may deserve
+///   promotion into long-term memory.
+/// - Running the refresh immediately prevents that signal from sitting only in
+///   raw session logs until midnight.
+/// - We then inject an internal notice into the parent conversation so the
+///   main agent knows memory may have changed and can re-read it if needed.
+async fn run_compaction_memory_refresh(
+    runner: &AgentRunner,
+    task_id: Uuid,
+    agents_md: &AgentsMd,
+    extra_system_prompt: Option<&str>,
+    persistent_session: Option<&Arc<SessionStore>>,
+    cancel: &CancelToken,
+    emit: &EmitEventFn,
+    summary: &str,
+) -> anyhow::Result<Option<ChatMessage>> {
+    let Some(session_store) = persistent_session else {
+        return Ok(None);
+    };
+
+    let snapshot = session_store
+        .load_snapshot()
+        .context("Failed to load persisted session snapshot for memory refresh")?;
+    let descriptor = snapshot.descriptor;
+    let refresh_extra_context =
+        build_compaction_memory_refresh_context(summary, &descriptor, &snapshot.messages);
+    let merged_extra_prompt = join_extra_system_prompt(
+        extra_system_prompt,
+        Some(refresh_extra_context.as_str()),
+    );
+
+    let runtime = build_internal_memory_refresh_runtime(task_id, emit);
+    let emit_for_refresh = Arc::clone(emit);
+    let refresh_emit: EmitEventFn = Arc::new(move |kind, task_id, message| {
+        let kind = if matches!(kind, EventKind::Final) {
+            EventKind::Log
+        } else {
+            kind
+        };
+        (emit_for_refresh)(kind, task_id, format!("[memory-refresh] {message}"));
+    });
+
+    (emit)(
+        EventKind::Log,
+        task_id,
+        "Starting compaction-triggered memory refresh sub-agent.".to_string(),
+    );
+
+    let final_text = Box::pin(runner.run_task_inner(
+            task_id,
+            build_compaction_memory_refresh_task(&descriptor),
+            agents_md,
+            merged_extra_prompt.as_deref(),
+            None,
+            runtime,
+            cancel,
+            None,
+            refresh_emit,
+            false,
+        ))
+        .await
+        .context("Compaction memory refresh sub-agent failed")?;
+
+    Ok(Some(build_memory_refresh_completion_notice(
+        &descriptor, &final_text,
+    )))
+}
+
+/// Build the compact-triggered memory-refresh task text.
+fn build_compaction_memory_refresh_task(
+    descriptor: &crate::session::SessionDescriptor,
+) -> String {
+    format!(
+        "执行一次 compact 后的记忆整理。目标不是总结，而是把刚压缩掉的历史信号提炼进长期记忆。\
+\n\n工作要求：\
+\n- 优先检查 `MEMORY.md`、`memory/topics/*.md` 与最近原始记录，避免重复。\
+\n- 必要时阅读最近的原始会话段，尤其是刚被 compact 掉的历史。\
+\n- 只提升稳定、可复用、高价值的信息。\
+\n- 如果更新了长期记忆，请同步整理相关 topic 文件。\
+\n- 不要使用 `Ask`、`Send`、`Show` 或 `SubAgent`。\
+\n- 最后给出一段简短摘要，说明你整理了哪些记忆。\
+\n\n当前压缩后会话：`{}`",
+        descriptor.current_session_path
+    )
+}
+
+/// Build the extra runtime context used by the compact-triggered memory
+/// refresh sub-agent.
+fn build_compaction_memory_refresh_context(
+    summary: &str,
+    descriptor: &crate::session::SessionDescriptor,
+    kept_messages: &[ChatMessage],
+) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::from("## Compact-triggered Memory Refresh Context\n\n");
+    out.push_str("这是一次在 compact 成功后立即触发的后台记忆整理任务。");
+    out.push_str("目标是把刚压缩掉的高价值信息提炼进长期记忆，并减少它只停留在原始会话文件中的时间。\n\n");
+    let _ = writeln!(out, "- 当前压缩后会话文件：`{}`", descriptor.current_session_path);
+    let _ = writeln!(
+        out,
+        "- 上一段原始会话文件：`{}`",
+        descriptor
+            .previous_session_path
+            .as_deref()
+            .unwrap_or("(none)")
+    );
+    let _ = writeln!(out, "- compact 后当前会话中保留的真实消息数：{}", kept_messages.len());
+    out.push_str("- 这是内部运行时任务，不是同学的新请求。\n");
+    out.push_str("- 你完成后，主 Agent 会收到一条内部提示消息，提醒它长期记忆可能已更新。\n\n");
+    out.push_str("### 当前 compact 摘要\n\n<summary>\n");
+    out.push_str(summary.trim());
+    out.push_str("\n</summary>\n");
+    out
+}
+
+/// Build one internal user-role message that informs the main agent that a
+/// memory refresh finished after compaction.
+fn build_memory_refresh_completion_notice(
+    descriptor: &crate::session::SessionDescriptor,
+    final_text: &str,
+) -> ChatMessage {
+    let summary = trim_internal_notice_text(final_text, 800);
+    ChatMessage::text(
+        "user",
+        format!(
+            "[系统记忆更新通知]\n\
+compact 后已完成一次后台记忆整理。长期记忆文件可能已经更新（如 `MEMORY.md`、`memory/topics/*.md`）。\
+\n这不是同学的新请求，也不是需要对外汇报的内容；它只是提醒你：如果后续推理依赖长期偏好、历史决定或稳定约束，请优先重新检查相关记忆文件。\
+\n最近一次压缩后的当前会话文件：`{}`\
+\n最近一次被压缩掉的原始会话文件：`{}`\
+\n整理摘要：\n{summary}",
+            descriptor.current_session_path,
+            descriptor
+                .previous_session_path
+                .as_deref()
+                .unwrap_or("(none)")
+        ),
+    )
+}
+
+/// Create a restricted runtime for the compact-triggered memory refresh agent.
+fn build_internal_memory_refresh_runtime(
+    task_id: Uuid,
+    emit: &EmitEventFn,
+) -> ToolRuntime {
+    use crate::tools::{AskQuestionFn, RunSubAgentFn, SendMessageFn, ShowFileFn};
+
+    let emit_for_send = Arc::clone(emit);
+    let send_message: SendMessageFn = Arc::new(move |message: String| {
+        let emit = Arc::clone(&emit_for_send);
+        Box::pin(async move {
+            (emit)(
+                EventKind::Log,
+                task_id,
+                format!("[memory-refresh] suppressed Send: {message}"),
+            );
+            Ok(())
+        })
+    });
+
+    let ask_question: AskQuestionFn = Arc::new(move |_request, _cancel| {
+        Box::pin(async move { anyhow::bail!("memory refresh must not use Ask") })
+    });
+
+    let emit_for_show = Arc::clone(emit);
+    let show_file: ShowFileFn = Arc::new(move |file| {
+        let emit = Arc::clone(&emit_for_show);
+        Box::pin(async move {
+            (emit)(
+                EventKind::Log,
+                task_id,
+                format!("[memory-refresh] suppressed Show: {}", file.path),
+            );
+            Ok(())
+        })
+    });
+
+    let run_subagent: RunSubAgentFn = Arc::new(move |_request, _cancel| {
+        Box::pin(async move { anyhow::bail!("memory refresh must not use SubAgent") })
+    });
+
+    ToolRuntime::new(send_message, ask_question, show_file, run_subagent)
+}
+
+/// Trim a long internal runtime note so it stays useful without bloating the
+/// next request.
+fn trim_internal_notice_text(text: &str, max_chars: usize) -> String {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return "（无）".to_string();
+    }
+    if trimmed.chars().count() <= max_chars {
+        return trimmed.to_string();
+    }
+    let mut out: String = trimmed.chars().take(max_chars).collect();
+    out.push('…');
+    out
+}
+
 /// Append one real message to the in-memory conversation and, when enabled,
 /// mirror it into the durable JSONL session segment.
 fn append_message_and_persist(
@@ -811,5 +1078,49 @@ mod tests {
         assert!(prompt.contains("## 运行时"));
         assert!(prompt.contains("## 附加运行时上下文"));
         assert!(prompt.contains("dream 状态：idle"));
+    }
+
+    /// Compact-triggered memory refresh context should include the summary and
+    /// the rotated session paths so the refresh sub-agent knows where to look.
+    #[test]
+    fn compaction_memory_refresh_context_includes_summary_and_paths() {
+        let descriptor = SessionDescriptor {
+            conversation_id: Uuid::nil(),
+            current_session_path: "sessions/current.jsonl".to_string(),
+            previous_session_path: Some("sessions/previous.jsonl".to_string()),
+        };
+        let context = build_compaction_memory_refresh_context(
+            "## 关键决策\n- 已选择新的记忆结构",
+            &descriptor,
+            &[ChatMessage::text("assistant", "保留尾部消息")],
+        );
+
+        assert!(context.contains("Compact-triggered Memory Refresh Context"));
+        assert!(context.contains("sessions/current.jsonl"));
+        assert!(context.contains("sessions/previous.jsonl"));
+        assert!(context.contains("已选择新的记忆结构"));
+        assert!(context.contains("不是同学的新请求"));
+    }
+
+    /// The completion notice injected back into the parent session must stay an
+    /// internal runtime reminder rather than looking like a new user request.
+    #[test]
+    fn memory_refresh_completion_notice_is_internal_runtime_note() {
+        let descriptor = SessionDescriptor {
+            conversation_id: Uuid::nil(),
+            current_session_path: "sessions/current.jsonl".to_string(),
+            previous_session_path: Some("sessions/previous.jsonl".to_string()),
+        };
+        let notice = build_memory_refresh_completion_notice(
+            &descriptor,
+            "已更新 MEMORY.md，并合并了 testing 偏好专题。",
+        );
+
+        assert_eq!(notice.role, "user");
+        let text = notice.content.as_deref().unwrap_or_default();
+        assert!(text.contains("[系统记忆更新通知]"));
+        assert!(text.contains("这不是同学的新请求"));
+        assert!(text.contains("MEMORY.md"));
+        assert!(text.contains("memory/topics/*.md"));
     }
 }
