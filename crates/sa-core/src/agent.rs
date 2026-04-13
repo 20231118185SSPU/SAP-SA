@@ -73,6 +73,40 @@ pub struct AgentRunner {
     cfg: AgentRunnerConfig,
 }
 
+/// One single-turn execution result produced by `run_quantum`.
+#[derive(Debug)]
+pub struct AgentQuantumResult {
+    /// Updated per-agent tool session state.
+    pub tool_session: ToolSession,
+    /// Outcome of the turn.
+    pub outcome: AgentQuantumOutcome,
+}
+
+/// Outcome of one model/tool quantum.
+#[derive(Debug)]
+pub enum AgentQuantumOutcome {
+    /// The work should continue later.
+    Continue {
+        /// Whether the turn ended without tools and therefore needs the
+        /// temporary "remember to Finish" runtime reminder.
+        needs_finish_reminder: bool,
+        /// Best-effort assistant text emitted during this turn.
+        assistant_text: Option<String>,
+    },
+    /// The current work explicitly finished.
+    Finish {
+        /// Human-readable finish reason.
+        reason: String,
+        /// Human-readable finish result summary.
+        result: String,
+        /// Whether this finish came from the temporary
+        /// `FinishWithoutOutput()` tool.
+        without_output_confirmation: bool,
+    },
+    /// The work should wait on another dependency.
+    Wait(crate::tools::WaitRequest),
+}
+
 impl AgentRunner {
     /// Create a new runner.
     pub fn new(
@@ -117,6 +151,329 @@ impl AgentRunner {
             true,
         )
         .await
+    }
+
+    /// Run exactly one model/tool quantum for one already-active work item.
+    ///
+    /// This is the primitive used by the durable multi-agent supervisor:
+    /// - append any new mailbox-derived messages
+    /// - optionally compact before the request
+    /// - call the model once
+    /// - execute the tool calls from that one assistant turn
+    /// - return a structured outcome instead of looping forever in-core
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_quantum(
+        &self,
+        task_id: Uuid,
+        incoming_messages: Vec<ChatMessage>,
+        agents_md: &AgentsMd,
+        extra_system_prompt: Option<&str>,
+        persistent_session: Option<Arc<SessionStore>>,
+        runtime: ToolRuntime,
+        cancel: &CancelToken,
+        emit: EmitEventFn,
+        mut tool_session: ToolSession,
+    ) -> anyhow::Result<AgentQuantumResult> {
+        if agents_md.found {
+            (emit)(
+                EventKind::Log,
+                task_id,
+                format!(
+                    "Agents.md loaded ({} bytes) from {}",
+                    agents_md.content.len(),
+                    agents_md.path.display()
+                ),
+            );
+        } else {
+            (emit)(
+                EventKind::Error,
+                task_id,
+                format!("Agents.md NOT FOUND at {}", agents_md.path.display()),
+            );
+        }
+
+        let mut session_compaction_context = None::<String>;
+        let mut messages = Vec::<ChatMessage>::new();
+        let mut compaction_state = CompactionState::default();
+
+        if let Some(session_store) = persistent_session.as_ref() {
+            let snapshot = session_store
+                .load_snapshot()
+                .context("Failed to load persisted session snapshot")?;
+            compaction_state.restore_summary(snapshot.compaction_summary.clone());
+            session_compaction_context = Some(build_session_compaction_context_block(&snapshot));
+            messages = snapshot.messages;
+
+            (emit)(
+                EventKind::Log,
+                task_id,
+                format!(
+                    "Loaded persisted session {} (conversation_id={}, messages={}, compacted={}, truncated_incomplete={}).",
+                    snapshot.descriptor.current_session_path,
+                    snapshot.descriptor.conversation_id,
+                    messages.len(),
+                    snapshot.compaction_summary.is_some(),
+                    snapshot.truncated_incomplete_messages,
+                ),
+            );
+        }
+
+        let mut system_message = ChatMessage::text(
+            self.cfg.system_role_name.clone(),
+            self.build_system_prompt(
+                agents_md,
+                join_extra_system_prompt(
+                    extra_system_prompt,
+                    session_compaction_context.as_deref(),
+                )
+                .as_deref(),
+            ),
+        );
+
+        for message in incoming_messages {
+            append_message_and_persist(&mut messages, message, persistent_session.as_deref())?;
+        }
+
+        match maybe_compact_history(
+            &self.llm,
+            &self.cfg.model,
+            &system_message.role,
+            &system_message,
+            self.cfg.reasoning_effort.as_deref(),
+            &mut compaction_state,
+            &mut messages,
+            &self.tools.tool_definitions(&runtime),
+            &self.cfg.compaction,
+            cancel,
+        )
+        .await
+        {
+            Ok(Some(report)) => {
+                if let Some(session_store) = persistent_session.as_ref() {
+                    let summary = compaction_state.summary().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Compaction succeeded but no checkpoint summary remained in state"
+                        )
+                    })?;
+                    let descriptor = session_store
+                        .rollover_after_compaction(summary, &messages)
+                        .context("Failed to rotate persisted session after compaction")?;
+                    session_compaction_context = Some(descriptor.compaction_prompt_block());
+                    system_message = ChatMessage::text(
+                        self.cfg.system_role_name.clone(),
+                        self.build_system_prompt(
+                            agents_md,
+                            join_extra_system_prompt(
+                                extra_system_prompt,
+                                session_compaction_context.as_deref(),
+                            )
+                            .as_deref(),
+                        ),
+                    );
+                }
+
+                (emit)(
+                    EventKind::Log,
+                    task_id,
+                    format!(
+                        "Compacted history before quantum: tokens {} -> {}, summarized {} message(s), kept {}, split_turn={}",
+                        report.tokens_before,
+                        report.tokens_after,
+                        report.summarized_messages,
+                        report.kept_messages,
+                        report.split_turn,
+                    ),
+                );
+            }
+            Ok(None) => {}
+            Err(err) => {
+                let msg = format!("History compaction failed before quantum: {err}");
+                (emit)(EventKind::Error, task_id, msg.clone());
+                return Err(anyhow::anyhow!(msg));
+            }
+        }
+
+        let req = ChatCompletionsRequest {
+            model: self.cfg.model.clone(),
+            messages: build_request_messages(&system_message, &compaction_state, &messages),
+            max_tokens: None,
+            reasoning_effort: self.cfg.reasoning_effort.clone(),
+            tools: Some(self.tools.tool_definitions(&runtime)),
+            tool_choice: Some(serde_json::json!("auto")),
+            stream: Some(true),
+        };
+
+        let mut model_error_count: u32 = 0;
+        let resp = loop {
+            if cancel.is_cancelled() {
+                anyhow::bail!("Task cancelled by user interrupt.");
+            }
+
+            let call = self.llm.chat_completions(&req);
+            let result = tokio::select! {
+                _ = cancel.cancelled() => {
+                    anyhow::bail!("Task cancelled by user interrupt.");
+                }
+                r = call => r,
+            };
+
+            match result {
+                Ok(resp) => break resp,
+                Err(err) if err.is_retriable() => {
+                    model_error_count = model_error_count.saturating_add(1);
+                    let delay = retry_delay(model_error_count);
+                    (emit)(
+                        EventKind::Error,
+                        task_id,
+                        format!(
+                            "Model call failed (retryable; count={model_error_count}; next_retry_in={:?}): {err}",
+                            delay
+                        ),
+                    );
+                    tokio::select! {
+                        _ = cancel.cancelled() => {
+                            anyhow::bail!("Task cancelled by user interrupt.");
+                        }
+                        _ = tokio::time::sleep(delay) => {}
+                    }
+                }
+                Err(err) => {
+                    return Err(anyhow::Error::new(err))
+                        .context("Non-retryable model call error");
+                }
+            }
+        };
+
+        let response_usage = resp.usage.clone();
+        let choice = resp.first_choice()?;
+        let mut assistant = choice.message.clone();
+        assistant.request_usage = response_usage;
+
+        let assistant_text = assistant.content.clone().and_then(|text| {
+            let trimmed = text.trim().to_string();
+            (!trimmed.is_empty()).then_some(trimmed)
+        });
+        if let Some(text) = assistant_text.as_deref() {
+            (emit)(EventKind::Log, task_id, text.to_string());
+        }
+
+        let tool_calls: Vec<ToolCall> = assistant.tool_calls.clone().unwrap_or_default();
+        if tool_calls.is_empty() {
+            append_message_and_persist(&mut messages, assistant, persistent_session.as_deref())?;
+            return Ok(AgentQuantumResult {
+                tool_session,
+                outcome: AgentQuantumOutcome::Continue {
+                    needs_finish_reminder: true,
+                    assistant_text,
+                },
+            });
+        }
+
+        let all_control_calls = tool_calls.iter().all(|call| {
+            matches!(
+                call.function.name.as_str(),
+                "Finish" | "FinishWithoutOutput" | "Wait"
+            )
+        });
+        if all_control_calls {
+            if tool_calls.len() != 1 {
+                anyhow::bail!("Control tools must not be batched in one assistant turn");
+            }
+            let call = &tool_calls[0];
+            let args_json: serde_json::Value = serde_json::from_str(&call.function.arguments)
+                .with_context(|| {
+                    format!(
+                        "Failed to parse tool arguments JSON for {}",
+                        call.function.name
+                    )
+                })?;
+            let control = match self
+                .tools
+                .execute(
+                    &mut tool_session,
+                    &runtime,
+                    &call.function.name,
+                    args_json,
+                    cancel,
+                )
+                .await?
+            {
+                ToolExecutionResult::Control(control) => control,
+                ToolExecutionResult::Observation(_) => {
+                    anyhow::bail!(
+                        "Control tool {} unexpectedly returned a normal observation",
+                        call.function.name
+                    );
+                }
+            };
+
+            let outcome = match control {
+                ToolControl::Finish(request) => AgentQuantumOutcome::Finish {
+                    reason: request.reason,
+                    result: request.result,
+                    without_output_confirmation: false,
+                },
+                ToolControl::FinishWithoutOutput => AgentQuantumOutcome::Finish {
+                    reason: "finish_without_output".to_string(),
+                    result: String::new(),
+                    without_output_confirmation: true,
+                },
+                ToolControl::Wait(request) => AgentQuantumOutcome::Wait(request),
+            };
+            return Ok(AgentQuantumResult {
+                tool_session,
+                outcome,
+            });
+        }
+
+        append_message_and_persist(&mut messages, assistant, persistent_session.as_deref())?;
+        for call in tool_calls {
+            let args_json: serde_json::Value = serde_json::from_str(&call.function.arguments)
+                .with_context(|| {
+                    format!(
+                        "Failed to parse tool arguments JSON for {}",
+                        call.function.name
+                    )
+                })?;
+            let tool_result = match self
+                .tools
+                .execute(
+                    &mut tool_session,
+                    &runtime,
+                    &call.function.name,
+                    args_json,
+                    cancel,
+                )
+                .await
+            {
+                Ok(ToolExecutionResult::Observation(output)) => output,
+                Ok(ToolExecutionResult::Control(_)) => {
+                    anyhow::bail!(
+                        "Control tools must be emitted in their own assistant turn"
+                    );
+                }
+                Err(err) => {
+                    let msg = format!("Tool `{}` failed: {err}", call.function.name);
+                    (emit)(EventKind::Error, task_id, msg.clone());
+                    format!("ERROR: {msg}")
+                }
+            };
+
+            (emit)(EventKind::Tool, task_id, tool_result.clone());
+            append_message_and_persist(
+                &mut messages,
+                ChatMessage::tool_result(call.id, tool_result),
+                persistent_session.as_deref(),
+            )?;
+        }
+
+        Ok(AgentQuantumResult {
+            tool_session,
+            outcome: AgentQuantumOutcome::Continue {
+                needs_finish_reminder: false,
+                assistant_text,
+            },
+        })
     }
 
     /// Internal implementation shared by the normal task runner and the

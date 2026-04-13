@@ -28,7 +28,9 @@ use sa_core::dream::DreamManager;
 use sa_core::mcp_client::McpRegistry;
 use sa_core::memory::{build_prompt_block as build_memory_prompt_block, is_memory_reference};
 use sa_core::openai::{AuthStyle, OpenAiClient, WireApi};
-use sa_core::runtime::state::{AgentState, TeamState};
+use sa_core::runtime::state::{
+    AgentState, RuntimeTaskKind, RuntimeTaskState, RuntimeTaskStatus, TeamState,
+};
 use sa_core::runtime::store::{RootMarker, RuntimeStore};
 use sa_core::session::SessionStore;
 use sa_core::skills::SkillRegistry;
@@ -37,8 +39,8 @@ use sa_core::tools::{
     BroadcastAgentsRequest, BroadcastReceipt, GetAgentFn, GetTaskFn, ListAgentsFn,
     ListAgentsRequest, MAX_SUBAGENT_DEPTH, MessageAgentFn, NotifyParentFn, RunSubAgentFn,
     SendMessageFn, ShowFileFn, StartTerminalTaskFn, SubAgentHandle, SubAgentRequest,
-    TerminalTaskHandle, TerminalTaskInfo, ToolContext, ToolExecutor, ToolRuntime,
-    TransferInputFn, TransferInputReceipt, TransferInputRequest,
+    StartTerminalTaskRequest, TerminalTaskHandle, TerminalTaskInfo, ToolContext, ToolExecutor,
+    ToolRuntime, TransferInputFn, TransferInputReceipt, TransferInputRequest,
 };
 use sa_core::runtime::state::AgentStatus;
 use sa_core::ws_identity::{
@@ -433,6 +435,92 @@ impl Hub {
         self.broadcast_server_message(ServerMessage::Show { file });
     }
 
+    /// Start one background Git-Bash task and persist its runtime task state.
+    async fn start_terminal_task(
+        self: &Arc<Self>,
+        owner_agent_id: Uuid,
+        request: StartTerminalTaskRequest,
+    ) -> anyhow::Result<TerminalTaskHandle> {
+        let task_id = Uuid::new_v4();
+        let output_path = self
+            .runtime_store
+            .runtime_dir()
+            .join("tasks")
+            .join(format!("{task_id}.log"));
+        let output_path_string = output_path.display().to_string();
+        let initial = RuntimeTaskState {
+            task_id,
+            owner_agent_id,
+            kind: RuntimeTaskKind::Terminal,
+            status: RuntimeTaskStatus::Running,
+            command: request.command.clone(),
+            workdir: request.workdir.clone(),
+            started_at: chrono::Utc::now(),
+            finished_at: None,
+            exit_code: None,
+            output_path: Some(output_path_string.clone()),
+            summary: None,
+            metadata: Default::default(),
+        };
+        self.runtime_store.save_task_state(&initial)?;
+
+        let store = self.runtime_store.clone();
+        let hub = Arc::clone(self);
+        tokio::spawn(async move {
+            let result = run_background_bash_command(&request, &output_path).await;
+            let mut state = initial.clone();
+            state.finished_at = Some(chrono::Utc::now());
+
+            match result {
+                Ok(exit_code) => {
+                    state.status = RuntimeTaskStatus::Exited;
+                    state.exit_code = Some(exit_code);
+                    state.summary = Some(format!("Task exited with code {exit_code}."));
+                }
+                Err(err) => {
+                    state.status = RuntimeTaskStatus::Failed;
+                    state.summary = Some(format!("{err:#}"));
+                }
+            }
+
+            if let Err(err) = store.save_task_state(&state) {
+                tracing::error!("Failed to persist finished runtime task state: {err:#}");
+            }
+
+            hub.publish(
+                EventKind::Log,
+                owner_agent_id,
+                format!(
+                    "Background Bash task {task_id} completed with status {:?}.",
+                    state.status
+                ),
+            );
+        });
+
+        Ok(TerminalTaskHandle {
+            task_id,
+            status: RuntimeTaskStatus::Running,
+            output_path: Some(output_path_string),
+        })
+    }
+
+    /// Load one background runtime task snapshot.
+    fn get_task_info(&self, task_id: Uuid) -> anyhow::Result<TerminalTaskInfo> {
+        let Some(task) = self.runtime_store.load_task_state(task_id)? else {
+            anyhow::bail!("Runtime task not found: {task_id}");
+        };
+
+        Ok(TerminalTaskInfo {
+            task_id: task.task_id,
+            status: task.status,
+            command: task.command,
+            workdir: task.workdir,
+            exit_code: task.exit_code,
+            output_path: task.output_path,
+            summary: task.summary,
+        })
+    }
+
     /// Build the OpenClaw-style root memory prompt block.
     ///
     /// We only inject stable root memory files (`MEMORY.md` / `memory.md`) for
@@ -670,13 +758,15 @@ impl Hub {
         let transfer_input: TransferInputFn = Arc::new(move |_request| {
             Box::pin(async move { anyhow::bail!("TransferInput is not wired in the legacy hub") })
         });
-        let start_terminal_task: StartTerminalTaskFn = Arc::new(move |_request, _cancel| {
-            Box::pin(async move {
-                anyhow::bail!("Background Bash tasks are not wired in the legacy hub")
-            })
+        let hub_for_terminal_task = Arc::clone(self);
+        let start_terminal_task: StartTerminalTaskFn = Arc::new(move |request, _cancel| {
+            let hub = Arc::clone(&hub_for_terminal_task);
+            Box::pin(async move { hub.start_terminal_task(agent_id, request).await })
         });
-        let get_task: GetTaskFn = Arc::new(move |_task_id| {
-            Box::pin(async move { anyhow::bail!("GetTask is not wired in the legacy hub") })
+        let hub_for_get_task = Arc::clone(self);
+        let get_task: GetTaskFn = Arc::new(move |task_id| {
+            let hub = Arc::clone(&hub_for_get_task);
+            Box::pin(async move { hub.get_task_info(task_id) })
         });
 
         ToolRuntime::new(
@@ -783,13 +873,15 @@ impl Hub {
                 anyhow::bail!("background {label} task must not use TransferInput")
             })
         });
-        let start_terminal_task: StartTerminalTaskFn = Arc::new(move |_request, _cancel| {
-            Box::pin(async move {
-                anyhow::bail!("background {label} task must not use background Bash")
-            })
+        let hub_for_terminal_task = Arc::clone(self);
+        let start_terminal_task: StartTerminalTaskFn = Arc::new(move |request, _cancel| {
+            let hub = Arc::clone(&hub_for_terminal_task);
+            Box::pin(async move { hub.start_terminal_task(task_id, request).await })
         });
-        let get_task: GetTaskFn = Arc::new(move |_task_id| {
-            Box::pin(async move { anyhow::bail!("background {label} task must not use GetTask") })
+        let hub_for_get_task = Arc::clone(self);
+        let get_task: GetTaskFn = Arc::new(move |task_id| {
+            let hub = Arc::clone(&hub_for_get_task);
+            Box::pin(async move { hub.get_task_info(task_id) })
         });
 
         ToolRuntime::new(
@@ -1767,6 +1859,97 @@ fn expand_date_placeholders(mut refs: Vec<String>) -> Vec<String> {
     // De-duplicate while preserving order.
     let mut seen = HashSet::<String>::new();
     out.into_iter().filter(|r| seen.insert(r.clone())).collect()
+}
+
+/// Candidate `bash` programs to try when starting a background task.
+fn candidate_bash_programs() -> Vec<PathBuf> {
+    let mut out = vec![PathBuf::from("bash")];
+
+    for env_name in ["ProgramFiles", "ProgramFiles(x86)"] {
+        if let Ok(root) = std::env::var(env_name) {
+            let root = PathBuf::from(root);
+            out.push(root.join("Git").join("bin").join("bash.exe"));
+            out.push(root.join("Git").join("usr").join("bin").join("bash.exe"));
+        }
+    }
+
+    out
+}
+
+/// Run one background Bash command and tee stdout/stderr into one log file.
+async fn run_background_bash_command(
+    request: &StartTerminalTaskRequest,
+    output_path: &Path,
+) -> anyhow::Result<i32> {
+    use tokio::io::AsyncWriteExt as _;
+    use tokio::process::Command;
+
+    if let Some(parent) = output_path.parent() {
+        tokio::fs::create_dir_all(parent).await.with_context(|| {
+            format!(
+                "Failed to create runtime task output directory: {}",
+                parent.display()
+            )
+        })?;
+    }
+
+    let timeout = request
+        .timeout_seconds
+        .map(std::time::Duration::from_secs)
+        .unwrap_or(std::time::Duration::from_secs(300))
+        .min(std::time::Duration::from_secs(1800));
+
+    let mut last_not_found: Option<anyhow::Error> = None;
+    for program in candidate_bash_programs() {
+        let mut cmd = Command::new(&program);
+        cmd.arg("-lc");
+        cmd.arg(&request.command);
+        cmd.current_dir(&request.workdir);
+        cmd.kill_on_drop(false);
+
+        match tokio::time::timeout(timeout, cmd.output()).await {
+            Ok(Ok(output)) => {
+                let mut file = tokio::fs::File::create(output_path).await.with_context(|| {
+                    format!("Failed to create background task log: {}", output_path.display())
+                })?;
+                file.write_all(&output.stdout).await.with_context(|| {
+                    format!("Failed to write stdout log: {}", output_path.display())
+                })?;
+                if !output.stdout.is_empty() && !output.stderr.is_empty() {
+                    file.write_all(b"\n").await.with_context(|| {
+                        format!("Failed to write log separator: {}", output_path.display())
+                    })?;
+                }
+                file.write_all(&output.stderr).await.with_context(|| {
+                    format!("Failed to write stderr log: {}", output_path.display())
+                })?;
+                file.flush().await.with_context(|| {
+                    format!("Failed to flush background task log: {}", output_path.display())
+                })?;
+                return Ok(output.status.code().unwrap_or(-1));
+            }
+            Ok(Err(err)) if err.kind() == std::io::ErrorKind::NotFound => {
+                last_not_found = Some(anyhow::Error::new(err).context(format!(
+                    "Bash executable not found at {}",
+                    program.display()
+                )));
+            }
+            Ok(Err(err)) => {
+                return Err(anyhow::Error::new(err))
+                    .with_context(|| format!("Failed to execute Bash via {}", program.display()));
+            }
+            Err(_) => {
+                return Err(anyhow::anyhow!(
+                    "Background Bash command timed out after {:?}",
+                    timeout
+                ));
+            }
+        }
+    }
+
+    Err(last_not_found.unwrap_or_else(|| {
+        anyhow::anyhow!("No usable bash executable was found for background task execution.")
+    }))
 }
 
 /// Decorate nested agent text so user-visible messages stay traceable.

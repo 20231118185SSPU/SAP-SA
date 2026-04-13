@@ -826,13 +826,25 @@ impl ToolContext {
 /// - a file must be `Read` before it is `Edit`ed
 /// - after a successful `Edit`, the "fresh read" marker is cleared again
 ///   because the file content has changed
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct ToolSession {
     /// Canonical file paths that are currently eligible for `Edit`.
     readable_for_edit: HashSet<PathBuf>,
 }
 
 impl ToolSession {
+    /// Restore one tool session from a persisted list of canonical paths.
+    pub fn from_readable_paths(paths: impl IntoIterator<Item = PathBuf>) -> Self {
+        Self {
+            readable_for_edit: paths.into_iter().collect(),
+        }
+    }
+
+    /// Export the current "freshly read" set for persistence.
+    pub fn readable_paths(&self) -> Vec<PathBuf> {
+        self.readable_for_edit.iter().cloned().collect()
+    }
+
     /// Mark that a file has just been read in this session.
     fn note_read(&mut self, path: PathBuf) {
         self.readable_for_edit.insert(path);
