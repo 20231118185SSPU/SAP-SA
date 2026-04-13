@@ -3,23 +3,27 @@
 //! The user asked that memory should work more like OpenClaw:
 //! - Stable memory files live in the workspace (`MEMORY.md` / `memory.md`).
 //! - Daily memory lives under `memory/*.md`.
+//! - Topic memory lives under `memory/topics/**/*.md`.
+//! - Dream audit files may exist under `memory/dreams/**/*.md`, but they should
+//!   not pollute ordinary memory search results.
 //! - The model should not receive a synthetic JSONL summary blob each turn.
 //! - Instead, it should use dedicated tools to search and read memory on demand.
 //!
 //! This module therefore provides three pieces:
 //! 1. A small prompt block that injects only root memory files (`MEMORY.md`
 //!    and/or `memory.md`) when they exist.
-//! 2. `MemorySearch`: lexical search over `MEMORY.md`, `memory.md`, and
-//!    `memory/**/*.md`.
+//! 2. `MemorySearch`: lexical search over `MEMORY.md`, `memory.md`,
+//!    `memory/*.md`, and `memory/topics/**/*.md`.
 //! 3. `MemoryGet`: bounded file/line reads restricted to those same memory
-//!    files.
+//!    files, plus optional audit reads under `memory/dreams/**/*.md`.
 //!
 //! Important design notes:
 //! - We intentionally keep the search implementation simple and inspectable.
 //!   It is not embedding-based semantic search.
 //! - Security matters more than convenience:
 //!   - only files inside the workspace are allowed
-//!   - only `MEMORY.md`, `memory.md`, and `memory/**/*.md` are readable
+//!   - only `MEMORY.md`, `memory.md`, `memory/*.md`, `memory/topics/**/*.md`,
+//!     and `memory/dreams/**/*.md` are readable
 //!   - path traversal and symlink escapes are rejected
 
 use anyhow::Context as _;
@@ -35,6 +39,12 @@ pub const ALT_MEMORY_FILE: &str = "memory.md";
 
 /// Directory that stores daily / rolling Markdown memory notes.
 pub const MEMORY_DIR: &str = "memory";
+
+/// Directory prefix that stores curated topic memories.
+pub const MEMORY_TOPICS_DIR: &str = "memory/topics";
+
+/// Directory prefix that stores dream audit records.
+pub const MEMORY_DREAMS_DIR: &str = "memory/dreams";
 
 /// Per-file prompt injection cap for root memory files.
 const MAX_PROMPT_MEMORY_CHARS_PER_FILE: usize = 20_000;
@@ -140,7 +150,10 @@ pub fn is_memory_reference(raw: &str) -> bool {
     let normalized = normalize_rel_path(raw);
     let lower = normalized.to_ascii_lowercase();
 
-    lower == "memory.md" || (lower.starts_with("memory/") && lower.ends_with(".md"))
+    lower == "memory.md"
+        || is_daily_memory_path(&lower)
+        || is_topics_memory_path(&lower)
+        || is_dream_audit_path(&lower)
 }
 
 /// Search workspace memory files and return the most relevant snippets.
@@ -303,6 +316,12 @@ fn indexed_memory_files(workspace_root: &Path) -> anyhow::Result<Vec<PathBuf>> {
                 );
             }
 
+            let display = workspace_relative_display(workspace_root, &canonical);
+            let display_lower = display.to_ascii_lowercase();
+            if !(is_daily_memory_path(&display_lower) || is_topics_memory_path(&display_lower)) {
+                continue;
+            }
+
             files.push(canonical);
         }
     }
@@ -318,7 +337,7 @@ fn resolve_allowed_memory_path(workspace_root: &Path, rel_path: &str) -> anyhow:
     let normalized = normalize_rel_path(rel_path);
     if !is_memory_reference(&normalized) {
         anyhow::bail!(
-            "MemoryGet only allows `MEMORY.md`, `memory.md`, or `memory/*.md`: {}",
+            "MemoryGet only allows `MEMORY.md`, `memory.md`, `memory/*.md`, `memory/topics/**/*.md`, or `memory/dreams/**/*.md`: {}",
             rel_path
         );
     }
@@ -365,6 +384,24 @@ fn normalize_rel_path(raw: &str) -> String {
         .replace('\\', "/")
         .trim_start_matches('/')
         .to_string()
+}
+
+/// Return `true` when the path points at a flat daily note under `memory/`.
+fn is_daily_memory_path(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix("memory/") else {
+        return false;
+    };
+    rest.ends_with(".md") && !rest.contains('/')
+}
+
+/// Return `true` when the path points at a curated topic memory.
+fn is_topics_memory_path(path: &str) -> bool {
+    path.starts_with("memory/topics/") && path.ends_with(".md")
+}
+
+/// Return `true` when the path points at a dream audit file.
+fn is_dream_audit_path(path: &str) -> bool {
+    path.starts_with("memory/dreams/") && path.ends_with(".md")
 }
 
 /// Split a search query into lowercase lexical tokens.
@@ -456,7 +493,11 @@ mod tests {
         assert!(is_memory_reference("MEMORY.md"));
         assert!(is_memory_reference("memory.md"));
         assert!(is_memory_reference("memory/2026-03-06.md"));
+        assert!(is_memory_reference("memory/topics/preferences.md"));
+        assert!(is_memory_reference("memory/topics/rust/testing.md"));
+        assert!(is_memory_reference("memory/dreams/2026-04-13.md"));
         assert!(!is_memory_reference("notes/memory.md"));
+        assert!(!is_memory_reference("memory/misc/note.md"));
         assert!(!is_memory_reference("memory/2026-03-06.txt"));
     }
 
@@ -478,7 +519,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn memory_search_reads_memory_md_and_daily_files() {
+    async fn memory_search_reads_memory_md_daily_files_and_topics_but_skips_dream_audits() {
         let workspace = unique_workspace();
         fs::write(
             workspace.join("MEMORY.md"),
@@ -486,17 +527,39 @@ mod tests {
         )
         .expect("write MEMORY.md");
         fs::create_dir_all(workspace.join("memory")).expect("create memory dir");
+        fs::create_dir_all(workspace.join("memory").join("topics")).expect("create topics dir");
+        fs::create_dir_all(workspace.join("memory").join("dreams")).expect("create dreams dir");
         fs::write(
             workspace.join("memory").join("2026-03-06.md"),
             "2026-03-06\nDecision: use skill sandbox instead of exposing host paths.",
         )
         .expect("write daily memory");
+        fs::write(
+            workspace.join("memory").join("topics").join("preferences.md"),
+            "User prefers concise progress updates and clear boundaries.",
+        )
+        .expect("write topic memory");
+        fs::write(
+            workspace.join("memory").join("dreams").join("2026-03-06.md"),
+            "Dream audit: remove stale sandbox note after policy change.",
+        )
+        .expect("write dream audit");
 
         let hits = search_markdown_memory(&workspace, "skill sandbox host paths", Some(5), None)
             .await
             .expect("memory search");
         assert!(!hits.is_empty());
         assert!(hits.iter().any(|hit| hit.path == "memory/2026-03-06.md"));
+        assert!(!hits.iter().any(|hit| hit.path == "memory/dreams/2026-03-06.md"));
+
+        let topic_hits = search_markdown_memory(&workspace, "concise progress updates", Some(5), None)
+            .await
+            .expect("topic memory search");
+        assert!(
+            topic_hits
+                .iter()
+                .any(|hit| hit.path == "memory/topics/preferences.md")
+        );
     }
 
     #[tokio::test]
@@ -506,5 +569,22 @@ mod tests {
             .await
             .expect_err("outside path must fail");
         assert!(err.to_string().contains("only allows"));
+    }
+
+    #[tokio::test]
+    async fn memory_get_allows_dream_audit_reads_for_explicit_auditing() {
+        let workspace = unique_workspace();
+        fs::create_dir_all(workspace.join("memory").join("dreams")).expect("create dreams dir");
+        fs::write(
+            workspace.join("memory").join("dreams").join("2026-04-13.md"),
+            "Dream audit line 1\nDream audit line 2",
+        )
+        .expect("write dream audit");
+
+        let result = read_markdown_memory(&workspace, "memory/dreams/2026-04-13.md", Some(1), Some(2))
+            .await
+            .expect("dream audit read should succeed");
+        assert_eq!(result.path, "memory/dreams/2026-04-13.md");
+        assert!(result.text.contains("Dream audit line 1"));
     }
 }

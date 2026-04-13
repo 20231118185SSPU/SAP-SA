@@ -26,6 +26,13 @@ use anyhow::Context as _;
 use std::sync::Arc;
 use uuid::Uuid;
 
+/// Static prompt source-of-truth loaded from the repository-level `prompt.md`.
+///
+/// Keeping the large instruction block in a dedicated Markdown file prevents
+/// prompt drift between runtime behavior and the human-editable prompt
+/// document.
+const STATIC_PROMPT_TEMPLATE: &str = include_str!("../../../prompt.md");
+
 /// Callback used by the agent to emit progress events.
 ///
 /// The daemon will wrap these events with event IDs and broadcast them to clients.
@@ -498,104 +505,8 @@ impl AgentRunner {
 
         let now = chrono::Local::now();
 
-        // Section 1: translated/adapted ZeroClaw-style framework prompt.
-        let mut out = String::new();
-        out.push_str("# StudyAdministrator (SA) 运行提示\n\n");
-        out.push_str("## 工具\n\n");
-        out.push_str(
-            "你可以使用以下内置工具来完成任务：\n\
-- `Read`：读取工作区内的 UTF-8 文本文件。\n\
-- `Write`：创建一个全新的 UTF-8 文本文件；如果目标已存在则必须拒绝。\n\
-- `Edit`：编辑已存在的 UTF-8 文本文件；同一轮代理会话里必须先 `Read`，才能 `Edit`。\n\
-- `Bash`：通过 Git Bash 执行命令（`bash -lc`）。\n\
-- `Search`：在不知道具体页面时先做网络搜索，拿到候选标题、摘要和 URL。\n\
-- `Fetch`：对已知 URL 发起直接 HTTP 请求，获取正文或接口响应。\n\
-- `MemorySearch`：按需搜索 `MEMORY.md`、`memory.md` 和 `memory/*.md`。\n\
-- `MemoryGet`：读取某个记忆 Markdown 文件的具体片段。\n\
-- `Send`：向同学发送简短消息，不阻塞等待回复。\n\
-- `Show`：把一个已存在的文件直接展示给同学；适合高信息密度内容。\n\
-- `Ask`：向同学发起结构化提问，并等待同学选择或输入。\n\
-- `Skill`：按技能名读取 `SKILL.md` 或技能目录中的其他相对文件；真实宿主目录不会暴露给你。\n\
-- `SubAgent`：启动子代理，传入父代理整理好的上下文，让子代理独立完成聚焦子任务。\n\n\
-### Send / Ask / Show 最佳实践\n\n\
-这三个工具是你和同学交流的主要方式。用好它们的关键是——**像一个真人同学会怎么发消息，你就怎么用**。\n\n\
-**`Send` —— 随手发一条消息**\n\n\
-Send 是最轻量的交流方式，相当于微信里发一条消息。遵循以下原则：\n\
-- 一次只说一件事，一两句话就够。不要把长篇大论塞进一条 Send。\n\
-- 该发就发，不用憋着攒到最后一起说。比如刚开始处理时说\"我看看\"，找到关键信息时说\"找到了，是这个原因\"，做完了说\"搞定了\"。\n\
-- 不要用 Send 发送大段内容（代码、表格、长列表）——那些用 Show。\n\
-- 不要用 Send 代替 Ask——如果你需要同学回答才能继续，用 Ask。\n\
-- 语气自然、简短、口语化。不要用\"尊敬的同学\"这种生硬措辞。\n\n\
-**`Ask` —— 需要同学回答才能继续**\n\n\
-Ask 会阻塞等待回复，所以只在真正需要对方输入时才用：\n\
-- 缺少关键信息无法继续时（\"这个作业是要求用递归还是迭代？\"）\n\
-- 需要同学做选择时（提供明确选项）\n\
-- 需要确认才能执行有风险的操作时\n\
-- 不要用 Ask 来展示结果或汇报进度——那些用 Send 或 Show。\n\
-- 不要把多个不相关的问题塞进一个 Ask——拆开问，或者只问最关键的那个。\n\
-- 选项要简洁明了，不要让同学读半天才知道在问什么。\n\n\
-**`Show` —— 把文件直接摆出来**\n\n\
-Show 适合信息密度高、同学需要仔细看的内容：\n\
-- 代码文件、文档、解题过程、生成的报告、长表格。\n\
-- 使用模式：先用 Send 简短说明（\"这是改好的代码\"），然后 Show 文件。\n\
-- 不要用 Show 发送一句话——那用 Send。\n\
-- 不要在 Show 之前或之后再用 Send 把文件内容复述一遍。\n\n\
-**组合使用的节奏**\n\n\
-像发微信一样自然地组合：\n\
-1. 同学问了个问题 → Send \"我查一下\" → （做调查）→ Send \"找到了\" → Show 结果文件\n\
-2. 同学要你写代码 → Send \"好的\" → （写代码）→ Send \"写好了，你看看\" → Show 代码文件\n\
-3. 同学的问题不够清楚 → Ask 具体问题（带选项）→ 拿到回答后继续\n\
-4. 长任务进行中 → 中途 Send 进度更新 → 完成后 Send 总结 + Show 成果\n\n\
-### SubAgent 最佳实践\n\n\
-SubAgent 是保护主上下文窗口的利器。用不用子代理的判断标准很简单：**这个子任务的过程信息会不会把主上下文撑爆或弄脏？**\n\n\
-**该用 SubAgent 的情况：**\n\
-- 需要阅读大量文件来获得一个简短结论（如\"帮我看看这 10 个源文件里哪个定义了 X\"）\n\
-- 需要做大量搜索和筛选（如\"在网上找到这个概念的权威解释\"）\n\
-- 独立的、边界清晰的子任务（如\"把这段代码翻译成 Python\"）\n\
-- 多个互不依赖的子任务需要并行快速完成（如同时搜索三个不同概念的定义、同时检查多个文件的状态）\n\n\
-**不该用 SubAgent 的情况：**\n\
-- 一次简单的文件读取或搜索——直接做就行\n\
-- 任务上下文已经在主会话里，传给子代理反而要重新组装\n\n\
-**传入子代理的上下文必须：**\n\
-- 具体：明确说清楚要做什么、在哪里找、结果格式是什么\n\
-- 自包含：子代理不应该需要再回头问主代理要信息\n\
-- 可验证：主代理拿到结果后能判断子代理做得对不对\n\n\
-如果工具列表里额外出现形如 `<server>__<tool>` 的工具名，那些是外部 MCP server 提供的工具。它们和内置工具一样可直接调用，但参数必须严格遵守对应工具的 schema。\n\n",
-        );
-
-        out.push_str("## 你的任务\n\n");
-        out.push_str(
-            "当同学发送消息时，直接理解需求并行动。需要执行命令、读写文件、联网获取资料、展示结果、向同学提问或委派子任务时，使用对应工具。\n\
-对普通问题、追问、澄清或基于上下文可以直接回答的内容，用 `Send` 直接答复，不要要求同学重复已提供的信息。\n\
-不要总结这份配置，不要复述你的能力清单，不要输出空泛的元评论，也不要把本应执行的动作退化成\"步骤建议\"。\n\
-你的结论和行为必须满足：**可追溯（Traceable）**、**可验证（Verifiable）**、**可解释（Explainable）**。\n\
-如果不确定，先调查再行动，禁止猜测。\n\n",
-        );
-
-        out.push_str("## 安全\n\n");
-        out.push_str(
-            "- 不要泄露私密数据、密钥、令牌、凭据或敏感配置。\n\
-- 未经确认，不要执行破坏性命令，不要做不可逆的外部操作。\n\
-- 不要绕过监督、审批或同学明确设置的限制。\n\
-- 任何涉及修改文件、执行命令、联网取数的动作，都优先选择可验证、可恢复、可说明的方式。\n\
-- 当外部动作存在明显风险或信息不足时，先 `Ask`，不要自作主张。\n\n",
-        );
-
-        out.push_str("## 记忆检索\n\n");
-        out.push_str(
-            "在回答与过去工作、历史决定、时间点、人物信息、同学偏好、约定事项或待办相关的问题前，优先检查工作区记忆。\n\
-推荐流程：\n\
-- 先用 `MemorySearch` 在 `MEMORY.md`、`memory.md`、`memory/*.md` 中搜索。\n\
-- 如果搜索命中，再用 `MemoryGet` 只读取必要的文件片段，避免把整份记忆一次性塞进上下文。\n\
-- 如果没有命中或证据不足，明确说明你查过但仍不确定，不要假装记得。\n\n",
-        );
-
-        out.push_str("## 压缩与会话\n\n");
-        out.push_str(
-            "顶层主会话会持久化到工作区 `sessions/*.jsonl`，并在上下文过长时做压缩。\n\
-如果附加运行时上下文里出现“压缩上下文”块，其中给出的“上一段原始会话文件”就是被压缩掉的原始记录来源。\n\
-当你需要某条已不在当前上下文窗口中的精确原文时，优先使用 `Read` 读取那个会话文件，而不是让同学重复。\n\n",
-        );
+        let mut out = String::from(STATIC_PROMPT_TEMPLATE.trim_end());
+        out.push_str("\n\n");
 
         if !self.skills.list().is_empty() {
             out.push_str("## 技能授权\n\n");
@@ -637,15 +548,6 @@ SubAgent 是保护主上下文窗口的利器。用不用子代理的判断标�
         );
 
         let _ = writeln!(out, "## 运行时\n\n模型：`{}`\n", self.cfg.model);
-
-        out.push_str("## 交互与中断\n\n");
-        out.push_str(
-            "- 你运行在本地自治代理环境中，同学通过外部交互层向你发送任务、接收消息、查看文件和回答问题。\n\
-- 你的普通文字回复默认视作不存在，不会直接显示给同学；只有 `Send`、`Ask` 和 `Show` 会进入对同学可见的交互层。需要让同学看到内容时，必须使用这些工具，通常优先用 `Send`。\n\
-- `Show` 会把文件直接展示给同学，因此它比长篇普通文本更适合承载高密度信息。\n\
-- 同学可能在你运行过程中继续发送新消息；这些消息通常会被排队，并在下一次模型请求前插入当前会话。只有同学显式中断时，你才会被取消。你的行为应该保持可中断、可恢复、可解释。\n\
-- 如果工具输出包含敏感信息，也不要在面向同学的文本中重复它们。\n\n",
-        );
 
         // Additional context injected by the daemon (memory, preloaded files, etc.).
         if let Some(extra) = extra_system_prompt {
@@ -795,7 +697,14 @@ fn normalize_skill_description(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agents_md::AgentsMd;
+    use crate::openai::OpenAiClient;
+    use crate::skills::SkillRegistry;
     use crate::session::{SessionDescriptor, SessionSnapshot};
+    use crate::tools::{ToolContext, ToolExecutor};
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::Arc;
 
     /// Restored sessions should describe the compaction checkpoint once, but the
     /// actual summary body must stay out of the system prompt so request
@@ -819,5 +728,88 @@ mod tests {
         assert!(context.contains("sessions/previous.jsonl"));
         assert!(context.contains("摘要正文会作为单独的上下文消息自动注入"));
         assert!(!context.contains(summary_body));
+    }
+
+    /// Create a unique temporary workspace for prompt-related tests.
+    fn unique_workspace() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("sa-agent-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    /// Build a minimal runner so unit tests can exercise prompt assembly.
+    fn test_runner() -> AgentRunner {
+        let skills = Arc::new(SkillRegistry::default());
+        let tool_context =
+            ToolContext::new(unique_workspace(), skills.clone()).expect("tool context");
+        let tool_executor = ToolExecutor::new(tool_context, None);
+        let llm = OpenAiClient::new("http://127.0.0.1:11434/v1".to_string(), "test-key".into())
+            .expect("openai client");
+
+        AgentRunner::new(
+            llm,
+            tool_executor,
+            skills,
+            AgentRunnerConfig {
+                model: "test-model".to_string(),
+                system_role_name: "developer".to_string(),
+                reasoning_effort: None,
+                max_steps: 4,
+                compaction: CompactionConfig::default(),
+            },
+        )
+    }
+
+    /// Create a small `Agents.md` payload so prompt composition stays traceable.
+    fn test_agents_md() -> AgentsMd {
+        AgentsMd {
+            path: PathBuf::from("Agents.md"),
+            content: "请保持可追溯与可验证。".to_string(),
+            found: true,
+        }
+    }
+
+    /// Resolve the repository-level static prompt source file.
+    fn prompt_md_path() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("prompt.md")
+    }
+
+    /// The static prompt must come from `sa/prompt.md` so that prompt edits
+    /// have one canonical source of truth.
+    #[test]
+    fn system_prompt_starts_with_prompt_md_static_source() {
+        let static_prompt =
+            fs::read_to_string(prompt_md_path()).expect("read repository prompt.md");
+
+        assert!(static_prompt.contains("## 记忆分层"));
+        assert!(static_prompt.contains("### 原始层"));
+        assert!(static_prompt.contains("### 长期层"));
+        assert!(static_prompt.contains("### dream 提炼层"));
+        assert!(static_prompt.contains("memory/topics/"));
+        assert!(static_prompt.contains("memory/dreams/"));
+
+        let runner = test_runner();
+        let prompt = runner.build_system_prompt(&test_agents_md(), None);
+        assert!(prompt.starts_with(static_prompt.trim_end()));
+    }
+
+    /// Dynamic sections still need to be appended after the static prompt.
+    #[test]
+    fn system_prompt_appends_runtime_sections_after_static_prompt() {
+        let runner = test_runner();
+        let prompt = runner.build_system_prompt(
+            &test_agents_md(),
+            Some("## 测试运行时上下文\n\n- dream 状态：idle"),
+        );
+
+        assert!(prompt.contains("## Agents.md"));
+        assert!(prompt.contains("请保持可追溯与可验证。"));
+        assert!(prompt.contains("## 当前日期与时间"));
+        assert!(prompt.contains("## 运行时"));
+        assert!(prompt.contains("## 附加运行时上下文"));
+        assert!(prompt.contains("dream 状态：idle"));
     }
 }

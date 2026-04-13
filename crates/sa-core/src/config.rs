@@ -10,6 +10,7 @@
 //!     `role: "developer"`; the config makes this adjustable.
 
 use crate::compact::CompactionConfig;
+use crate::dream::DreamConfig;
 use crate::openai::{AuthStyle, WireApi};
 use anyhow::Context as _;
 use serde::de::Error as SerdeError;
@@ -36,6 +37,10 @@ pub struct Config {
     /// Long-session history compaction configuration (`[compaction]`).
     #[serde(default)]
     pub compaction: CompactionConfig,
+
+    /// Nightly dream-memory distillation configuration (`[dream]`).
+    #[serde(default)]
+    pub dream: DreamConfig,
 
     /// External MCP server configuration (`[mcp]`).
     #[serde(default)]
@@ -770,6 +775,10 @@ agents_md = "Agents.md"
         assert_eq!(cfg.compaction.keep_recent_tokens, 8_000);
         assert_eq!(cfg.compaction.reserve_summary_tokens, 4_096);
         assert_eq!(cfg.compaction.min_messages_to_compact, 8);
+        assert!(cfg.dream.enabled);
+        assert_eq!(cfg.dream.daily_note_lookback_days, 3);
+        assert_eq!(cfg.dream.recent_session_segments, 6);
+        assert_eq!(cfg.dream.recent_topic_files, 24);
     }
 
     #[test]
@@ -800,6 +809,35 @@ keep_recent_tokens = 6789
         assert_eq!(cfg.compaction.keep_recent_tokens, 6_789);
         assert_eq!(cfg.compaction.reserve_summary_tokens, 4_096);
         assert_eq!(cfg.compaction.min_messages_to_compact, 8);
+    }
+
+    #[test]
+    fn dream_partial_override_preserves_other_defaults() {
+        let raw = r#"
+[llm]
+base_url = "https://example.com/v1"
+api_key = "sk-test"
+model = "gpt-5.2"
+
+[server]
+bind = "127.0.0.1:8765"
+ws_path = "/ws"
+
+[workspace]
+root_dir = "."
+agents_md = "Agents.md"
+
+[dream]
+enabled = true
+recent_session_segments = 9
+"#;
+
+        let cfg = toml::from_str::<Config>(raw)
+            .expect("config with partial dream override should parse");
+        assert!(cfg.dream.enabled);
+        assert_eq!(cfg.dream.daily_note_lookback_days, 3);
+        assert_eq!(cfg.dream.recent_session_segments, 9);
+        assert_eq!(cfg.dream.recent_topic_files, 24);
     }
 
     #[test]

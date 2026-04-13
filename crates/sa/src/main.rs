@@ -23,8 +23,8 @@ use futures_util::{SinkExt as _, StreamExt as _};
 use sa_core::agent::{AgentRunner, AgentRunnerConfig, DrainQueuedUserMessagesFn, EmitEventFn};
 use sa_core::agents_md::{extract_markdown_file_references, load_agents_md};
 use sa_core::cancel::{CancelHandle, cancel_pair};
-use sa_core::compact::CompactionConfig;
 use sa_core::config::{Config, load_config_from_file};
+use sa_core::dream::DreamManager;
 use sa_core::mcp_client::McpRegistry;
 use sa_core::memory::{build_prompt_block as build_memory_prompt_block, is_memory_reference};
 use sa_core::openai::{AuthStyle, OpenAiClient, WireApi};
@@ -639,6 +639,149 @@ impl Hub {
         ToolRuntime::new(send_message, ask_question, show_file, run_subagent)
     }
 
+    /// Build a restricted runtime used by internal background tasks such as
+    /// nightly dream consolidation.
+    ///
+    /// Background tasks must not talk to the user directly or block on `Ask`.
+    /// Instead:
+    /// - `Send` becomes a trace log entry
+    /// - `Show` becomes a trace log entry
+    /// - `Ask` is rejected
+    /// - `SubAgent` is rejected to keep the background control surface small
+    fn build_background_tool_runtime(
+        self: &Arc<Self>,
+        task_id: Uuid,
+        label: &'static str,
+    ) -> ToolRuntime {
+        let hub_for_send = Arc::clone(self);
+        let send_message: SendMessageFn = Arc::new(move |message: String| {
+            let hub = Arc::clone(&hub_for_send);
+            Box::pin(async move {
+                hub.publish(
+                    EventKind::Log,
+                    task_id,
+                    format!("[{label}] background Send suppressed: {message}"),
+                );
+                Ok(())
+            })
+        });
+
+        let ask_question: AskQuestionFn = Arc::new(move |_request: AskRequest, _cancel| {
+            Box::pin(async move {
+                anyhow::bail!("background {label} task must not use Ask")
+            })
+        });
+
+        let hub_for_show = Arc::clone(self);
+        let show_file: ShowFileFn = Arc::new(move |file: UserVisibleFile| {
+            let hub = Arc::clone(&hub_for_show);
+            Box::pin(async move {
+                hub.publish(
+                    EventKind::Log,
+                    task_id,
+                    format!("[{label}] background Show suppressed: {}", file.path),
+                );
+                Ok(())
+            })
+        });
+
+        let run_subagent: RunSubAgentFn = Arc::new(move |_request: SubAgentRequest, _cancel| {
+            Box::pin(async move {
+                anyhow::bail!("background {label} task must not use SubAgent")
+            })
+        });
+
+        ToolRuntime::new(send_message, ask_question, show_file, run_subagent)
+    }
+
+    /// Execute one isolated background dream run.
+    async fn run_background_dream(self: &Arc<Self>, dream: &DreamManager) -> anyhow::Result<()> {
+        let started_at = chrono::Local::now();
+        if !dream.should_run_now(started_at)? {
+            return Ok(());
+        }
+
+        let Some(_lock) = dream.try_acquire_lock()? else {
+            self.publish(
+                EventKind::Log,
+                Uuid::nil(),
+                "[dream] skipped because another dream run already holds the lock.".to_string(),
+            );
+            return Ok(());
+        };
+
+        let prepared = dream.prepare_run(started_at)?;
+        dream.mark_started(started_at)?;
+
+        let task_id = Uuid::new_v4();
+        self.publish(
+            EventKind::Log,
+            task_id,
+            format!(
+                "[dream] starting nightly memory distillation; report={}",
+                prepared.report_relative_path
+            ),
+        );
+
+        let agents_md = load_agents_md(self.agents_md_path.clone())
+            .await
+            .context("Failed to load Agents.md for dream run")?;
+
+        let hub_for_emit = Arc::clone(self);
+        let emit: EmitEventFn = Arc::new(move |kind, task_id, message| {
+            let kind = if matches!(kind, EventKind::Final) {
+                EventKind::Log
+            } else {
+                kind
+            };
+            hub_for_emit.publish(kind, task_id, format!("[dream] {message}"));
+        });
+
+        let runtime = self.build_background_tool_runtime(task_id, "dream");
+        let (_cancel_handle, cancel_token) = cancel_pair();
+
+        match self
+            .runner
+            .run_task(
+                task_id,
+                prepared.task,
+                &agents_md,
+                Some(prepared.extra_system_prompt.as_str()),
+                None,
+                runtime,
+                &cancel_token,
+                None,
+                emit,
+            )
+            .await
+        {
+            Ok(_final_text) => {
+                dream.mark_completed(
+                    started_at.date_naive(),
+                    chrono::Local::now(),
+                    &prepared.report_relative_path,
+                )?;
+                self.publish(
+                    EventKind::Log,
+                    task_id,
+                    format!(
+                        "[dream] completed successfully; report={}",
+                        prepared.report_relative_path
+                    ),
+                );
+                Ok(())
+            }
+            Err(err) => {
+                self.publish(
+                    EventKind::Error,
+                    task_id,
+                    format!("[dream] failed: {err:#}"),
+                );
+                Err(err)
+            }
+        }
+    }
+
     /// Run a nested sub-agent while keeping all output attached to the
     /// top-level task event stream.
     async fn run_subagent(
@@ -1150,6 +1293,8 @@ async fn build_runtime_from_config(
         None
     };
 
+    let dream_manager = DreamManager::new(workspace_root.clone(), cfg.dream.clone())?;
+
     // Build tools.
     let tool_ctx = ToolContext::new(workspace_root.clone(), Arc::clone(&skills))?;
     let preload_ctx = tool_ctx.clone();
@@ -1181,12 +1326,48 @@ async fn build_runtime_from_config(
     // Hub (spawns worker loop).
     let hub = Hub::new(runner, agents_md_path, preload_ctx, session_store);
 
+    if dream_manager.config().enabled {
+        let hub_for_dream = Arc::clone(&hub);
+        tokio::spawn(async move {
+            run_dream_scheduler(hub_for_dream, dream_manager).await;
+        });
+    } else {
+        tracing::info!("Dream scheduler disabled by config.");
+    }
+
     Ok(LoadedRuntime {
         hub,
         bind,
         ws_path,
         workspace_root,
     })
+}
+
+/// Run the background dream scheduler for one ready runtime.
+///
+/// Policy:
+/// - immediately attempt a catch-up run when today has not been processed yet
+/// - afterwards sleep until the next local midnight and re-check
+async fn run_dream_scheduler(hub: Arc<Hub>, dream: DreamManager) {
+    tracing::info!("Dream scheduler started.");
+
+    loop {
+        if let Err(err) = hub.run_background_dream(&dream).await {
+            tracing::warn!("Dream run failed: {err:#}");
+        }
+
+        let now = chrono::Local::now();
+        let next = dream.next_run_after(now);
+        let sleep_for = (next - now)
+            .to_std()
+            .unwrap_or_else(|_| std::time::Duration::from_secs(1));
+        tracing::info!(
+            "Next dream run scheduled for {} (sleep {:?}).",
+            next.to_rfc3339(),
+            sleep_for
+        );
+        tokio::time::sleep(sleep_for).await;
+    }
 }
 
 /// Normalize optional free-form config values.
@@ -1314,6 +1495,21 @@ fn render_initial_config_toml(
                 .and_then(Path::to_str)
                 .unwrap_or("Agents.md")
         )
+    ));
+    let dream = sa_core::dream::DreamConfig::default();
+    out.push_str("\n[dream]\n");
+    out.push_str(&format!("enabled = {}\n", dream.enabled));
+    out.push_str(&format!(
+        "daily_note_lookback_days = {}\n",
+        dream.daily_note_lookback_days
+    ));
+    out.push_str(&format!(
+        "recent_session_segments = {}\n",
+        dream.recent_session_segments
+    ));
+    out.push_str(&format!(
+        "recent_topic_files = {}\n",
+        dream.recent_topic_files
     ));
 
     Ok(out)
@@ -2167,7 +2363,7 @@ mod tests {
                 system_role_name: "developer".to_string(),
                 reasoning_effort: None,
                 max_steps: 1,
-                compaction: CompactionConfig::default(),
+                compaction: sa_core::compact::CompactionConfig::default(),
             },
         );
 
@@ -2469,5 +2665,29 @@ mod tests {
             }
             other => panic!("expected init_required after bootstrap handshake, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn generated_bootstrap_config_includes_dream_defaults() {
+        let config_path = PathBuf::from("G:/AgentProjects/Claw/sa/sa.toml");
+        let bootstrap = build_bootstrap_state(&config_path).expect("bootstrap should build");
+        let request = InitializeConfigRequest {
+            method: InitMethod::OpenAiCompatible,
+            base_url: "https://example.com/v1".to_string(),
+            api_key: "sk-test".to_string(),
+            model: "gpt-5.2".to_string(),
+            wire_api: None,
+            auth_style: None,
+            system_role_name: Some("developer".to_string()),
+            reasoning_effort: Some("high".to_string()),
+        };
+
+        let rendered =
+            render_initial_config_toml(&bootstrap, &request).expect("config should render");
+        assert!(rendered.contains("[dream]"));
+        assert!(rendered.contains("enabled = true"));
+        assert!(rendered.contains("daily_note_lookback_days = 3"));
+        assert!(rendered.contains("recent_session_segments = 6"));
+        assert!(rendered.contains("recent_topic_files = 24"));
     }
 }

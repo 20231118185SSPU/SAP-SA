@@ -12,6 +12,7 @@
 专题文档：
 
 - `anthropic-wire-api.md`：`/v1/messages` 兼容层如何对齐 Anthropic/Claude 协议
+- `dream-memory.md`：分层记忆、nightly dream 提炼、审计层与长期层边界
 - `session-persistence.md`：`workspace/sessions/*.jsonl` 会话持久化、恢复与 compaction 切段
 - `token-accounting.md`：SA 当前的 token 统计、usage 回填与 compact 估算策略
 - `responses-wire-api.md`：`/v1/responses` 兼容层如何对齐 `codex` 官方实现
@@ -41,7 +42,8 @@
    - 动态工具注册名格式为 `<server>__<tool>`
 4. 在工作区根目录准备 `AGENTS.md` 以及它引用的上下文文件
 5. 顶层主会话会自动持久化到工作区 `sessions/` 目录
-6. 启动后端：
+6. 默认启用 nightly dream，后端会在本地 0 点自动执行长期记忆提炼；如需关闭可在 `[dream]` 中设置
+7. 启动后端：
 
 ```bash
 cargo run -p sa --release
@@ -124,8 +126,8 @@ cargo build --release
 - `Bash`：通过 Git Bash 执行命令（`bash -lc`）
 - `Fetch`：向指定 URL 发起网络请求
 - `Search`：执行网络搜索并返回候选结果
-- `MemorySearch`：检索 `MEMORY.md`、`memory.md`、`memory/*.md`
-- `MemoryGet`：按路径与可选行范围读取单个 memory Markdown 文件
+- `MemorySearch`：检索 `MEMORY.md`、`memory.md`、`memory/*.md`、`memory/topics/**/*.md`
+- `MemoryGet`：按路径与可选行范围读取单个 memory Markdown 文件；也允许显式读取 `memory/dreams/**/*.md` 审计文件
 - `Send`：发送简洁消息给同学
 - `Show`：读取一个已存在文件并通过 WS 发送给前端展示
 - `Ask`：发起结构化提问并等待同学回答
@@ -158,6 +160,7 @@ cargo build --release
 - `Search` 依赖轻量网页搜索解析，若上游页面结构变化，解析逻辑可能需要维护
 - MCP 目前主要覆盖 tools，尚未扩展到更完整的协议面
 - 当前只有顶层主会话会持久化到 `sessions/*.jsonl`，子代理仍然是一次性临时会话
+- dream 当前仍依赖词法搜索与文件级提炼，不是 embedding / 向量记忆系统
 
 ## 更新日志
 
@@ -170,6 +173,7 @@ cargo build --release
 - `0.7.0`：记忆加载改为 OpenClaw 风格 Markdown 记忆文件，`Skill` 改为路径隔离读取
 - `0.7.1`：加入前端先发起的 WS 双向身份握手，新增 `client_hello` / `server_hello` / `hello_reject`
 - `0.7.2`：加入 `workspace/sessions/*.jsonl` 会话持久化、重启恢复与 compact 分段切换
+- `0.8.0`：加入分层记忆与 nightly dream，新增 `memory/topics/*.md`、`memory/dreams/*.md` 与 `[dream]` 配置
 
 ## 可追溯性
 

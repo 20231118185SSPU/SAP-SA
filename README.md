@@ -10,9 +10,10 @@
 - 加载 `SKILL.md` 形式的技能
 - 运行带工具调用的自治 Agent 循环
 - 将顶层主会话持久化为 `workspace/sessions/*.jsonl`
+- 以 nightly dream 机制持续提炼长期记忆
 - 通过 WebSocket 暴露后端服务
 - 支持 `Send` / `Ask` / `Show` / `SubAgent`
-- 按 OpenClaw 风格处理记忆文件（`MEMORY.md`、`memory/*.md`）
+- 按分层结构处理记忆文件（`MEMORY.md`、`memory/topics/*.md`、`memory/*.md`、`memory/dreams/*.md`）
 
 这个仓库只包含后端 Agent。
 
@@ -160,15 +161,19 @@
 
 ### 5. 记忆系统
 
-记忆系统采用 OpenClaw 风格：
+记忆系统采用“原始层 -> 长期层 -> dream 审计层”的分层结构：
 
-- 根级长期记忆：`MEMORY.md` / `memory.md`
-- 日常记忆：`memory/*.md`
+- 长期总纲：`MEMORY.md` / `memory.md`
+- 专题长期记忆：`memory/topics/*.md`
+- 日常原始记忆：`memory/*.md`
+- dream 审计：`memory/dreams/*.md`
 
 使用方式：
 
 - 根级长期记忆可在运行时注入 prompt
-- 每日记忆不自动全文注入
+- 每日记忆与最近会话保留为原始材料
+- nightly dream 会在本地 0 点自动触发，负责去噪、去重、冲突修正与经验抽象
+- `memory/dreams/*.md` 只用于审计 dream 过程，不作为普通记忆搜索主来源
 - Agent 需要回忆时，优先调用：
   - `MemorySearch`
   - `MemoryGet`
@@ -226,9 +231,9 @@
 - `Search`
   - 网络搜索，返回候选标题、摘要和 URL
 - `MemorySearch`
-  - 搜索 `MEMORY.md`、`memory.md`、`memory/*.md`
+  - 搜索 `MEMORY.md`、`memory.md`、`memory/*.md`、`memory/topics/**/*.md`
 - `MemoryGet`
-  - 读取某个记忆文件的指定片段
+  - 读取某个记忆文件的指定片段；也允许显式读取 `memory/dreams/**/*.md`
 - `Send`
   - 向用户发送简短消息
 - `Show`
@@ -328,6 +333,16 @@ cwd = "."
 tool_timeout_secs = 180
 ```
 
+nightly dream 默认启用；如需手动调整可继续配置：
+
+```toml
+[dream]
+enabled = true
+daily_note_lookback_days = 3
+recent_session_segments = 6
+recent_topic_files = 24
+```
+
 如果当前目录还没有 `sa.toml`，现在也可以直接先启动后端：
 
 - 后端会使用默认地址 `127.0.0.1:8765/ws` 进入“首次初始化模式”
@@ -347,6 +362,7 @@ cargo run -p sa --release
 - WS 路径：`/ws`
 
 启动后，顶层主会话会自动落盘到工作区 `sessions/` 目录，不需要额外配置 session 路径。
+如果当天还没有成功 dream，后端启动后也会补跑一次长期记忆提炼。
 
 ### 3. 启动测试前端
 
@@ -394,17 +410,26 @@ cargo build --release
 
 - `prompt.md`
 
+如果你要看分层记忆与 nightly dream 设计，可参考：
+
+- `docs/development/dream-memory.md`
+
 ## 已知限制
 
 - 这是一个最小后端实现，WebSocket 暂未做鉴权
 - `Search` 当前使用 DuckDuckGo 轻量 HTML 页面解析，若上游结构变化需要维护
 - `MemorySearch` 当前是 Markdown 词法检索，不是向量语义检索
+- dream 当前仍基于文件搜索与提炼，不是 embedding / 向量记忆系统
 - `SubAgent` 有递归深度上限，避免无限递归
 - CLI 只是过渡性的测试前端，不是最终产品形态
 - 当前只接入了 MCP 的 tool 能力，还没有接入 MCP resources / prompts
 
 ## 版本节点
 
+- `v0.8.0`
+  - 新增分层记忆结构：`MEMORY.md`、`memory/topics/*.md`、`memory/*.md`、`memory/dreams/*.md`
+  - 新增 nightly dream 与 `[dream]` 配置
+  - dream 以隔离运行态在本地 0 点执行长期记忆提炼
 - `v0.7.2`
   - 新增 `workspace/sessions/*.jsonl` 顶层会话持久化
   - 当前模型请求历史改为可从 session 文件恢复

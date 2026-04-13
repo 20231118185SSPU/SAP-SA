@@ -563,7 +563,7 @@ impl ToolExecutor {
                 function: ToolFunctionDefinition {
                     name: "MemorySearch".to_string(),
                     description:
-                        "Search `MEMORY.md`, `memory.md`, and `memory/*.md` for prior decisions, dates, preferences, or todos."
+                        "Search `MEMORY.md`, `memory.md`, `memory/*.md`, and `memory/topics/**/*.md` for prior decisions, dates, preferences, or long-term context. Dream audit files are excluded from normal search."
                             .to_string(),
                     parameters: serde_json::json!({
                         "type": "object",
@@ -590,14 +590,14 @@ impl ToolExecutor {
                 function: ToolFunctionDefinition {
                     name: "MemoryGet".to_string(),
                     description:
-                        "Read one allowed memory Markdown file (`MEMORY.md`, `memory.md`, or `memory/*.md`) with an optional line range."
+                        "Read one allowed memory Markdown file (`MEMORY.md`, `memory.md`, `memory/*.md`, `memory/topics/**/*.md`, or explicit dream audit files under `memory/dreams/**/*.md`) with an optional line range."
                             .to_string(),
                     parameters: serde_json::json!({
                         "type": "object",
                         "properties": {
                             "path": {
                                 "type": "string",
-                                "description": "Memory file path. Must be `MEMORY.md`, `memory.md`, or a file under `memory/`."
+                                "description": "Memory file path. Must be `MEMORY.md`, `memory.md`, a daily note under `memory/`, a topic file under `memory/topics/`, or an audit file under `memory/dreams/`."
                             },
                             "from": {
                                 "type": "integer",

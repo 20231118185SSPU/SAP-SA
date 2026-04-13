@@ -98,6 +98,19 @@ reserve_summary_tokens = 4096
 # Refuse to compact very short conversations.
 min_messages_to_compact = 8
 
+[dream]
+# Whether SA should run nightly dream-based memory distillation.
+enabled = true
+
+# How many recent daily notes (`memory/YYYY-MM-DD.md`) should be reviewed per run.
+daily_note_lookback_days = 3
+
+# How many recent raw session segments (`sessions/*.jsonl`) should be offered to dream.
+recent_session_segments = 6
+
+# Maximum number of topic memory files (`memory/topics/*.md`) listed in dream context.
+recent_topic_files = 24
+
 [server]
 # Where the daemon listens.
 bind = "127.0.0.1:8765"
