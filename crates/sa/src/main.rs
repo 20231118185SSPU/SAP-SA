@@ -1408,7 +1408,11 @@ impl Hub {
             .unwrap_or("(empty work)");
         let mut summary = first_line.trim().to_string();
         if summary.len() > 120 {
-            summary.truncate(120);
+            let mut safe_boundary = 120usize;
+            while safe_boundary > 0 && !summary.is_char_boundary(safe_boundary) {
+                safe_boundary -= 1;
+            }
+            summary.truncate(safe_boundary);
             summary.push_str("...");
         }
         summary
@@ -6735,6 +6739,17 @@ description: Teaches patiently
         assert_eq!(identity.agent_label, "root");
         assert_eq!(identity.display_name, "学习委员");
         assert!(identity.is_root);
+    }
+
+    #[test]
+    fn summarize_work_text_handles_multibyte_utf8_without_panicking() {
+        let input = format!("{}中文摘要边界测试", "a".repeat(119));
+
+        let result = std::panic::catch_unwind(|| Hub::summarize_work_text(&input));
+
+        let summary = result.expect("multibyte summary truncation must not panic");
+        assert!(summary.ends_with("..."));
+        assert!(summary.len() <= 123);
     }
 
     #[tokio::test]
