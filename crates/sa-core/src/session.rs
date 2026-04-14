@@ -353,6 +353,29 @@ impl SessionStore {
         append_jsonl_entry(&state.current_absolute_path, &entry)
     }
 
+    /// Check whether the active segment already contains a concrete `tool`
+    /// result line for one tool-call id, without triggering replay repair.
+    ///
+    /// Why this exists:
+    /// - a pending `Ask` legitimately leaves an assistant tool-call turn
+    ///   without its `tool` result until the classmate answers
+    /// - `load_snapshot()` intentionally repairs such incomplete tails for
+    ///   replay safety, which would be incorrect while that answer is still
+    ///   pending
+    /// - the durable runtime therefore needs one raw existence check when it
+    ///   is about to append the eventual answer payload
+    pub fn has_raw_tool_result(&self, tool_call_id: &str) -> anyhow::Result<bool> {
+        let state = self
+            .state
+            .lock()
+            .expect("session state mutex poisoned")
+            .clone();
+        let parsed = parse_session_file(&state.current_absolute_path)?;
+        Ok(parsed.messages.iter().any(|message| {
+            message.role == "tool" && message.tool_call_id.as_deref() == Some(tool_call_id)
+        }))
+    }
+
     /// Rotate to a fresh segment after compaction and carry forward the compact
     /// summary plus retained real messages.
     pub fn rollover_after_compaction(

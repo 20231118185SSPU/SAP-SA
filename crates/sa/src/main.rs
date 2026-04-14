@@ -3309,10 +3309,7 @@ impl Hub {
         .to_string();
 
         let session_store = self.session_store_for_agent(agent_id).await?;
-        let snapshot = session_store.load_snapshot()?;
-        let already_applied = snapshot.messages.iter().any(|message| {
-            message.role == "tool" && message.tool_call_id.as_deref() == Some(tool_call_id.as_str())
-        });
+        let already_applied = session_store.has_raw_tool_result(&tool_call_id)?;
         if !already_applied {
             session_store.append_message(&ChatMessage::tool_result(tool_call_id, payload))?;
         }
@@ -5781,6 +5778,7 @@ mod tests {
     use super::*;
     use hex::encode as hex_encode;
     use sa_core::interaction_history::{InteractionEntry, InteractionStore};
+    use sa_core::openai::{ToolCall, ToolFunctionCall};
     use sa_core::ws_identity::{
         EXPECTED_CLIENT_NAME, WS_ALLOWED_SKEW_BUCKETS, WS_HASH_ALGO, WS_PROTOCOL_ID,
         WS_TIME_STEP_SECS, build_client_hello, current_time_bucket,
@@ -6559,6 +6557,27 @@ description: Teaches patiently
                 answer_tx: None,
             });
         }
+        let session_store = hub
+            .session_store_for_agent(root_agent_id)
+            .await
+            .expect("root session store should build");
+        session_store
+            .append_message(&ChatMessage {
+                role: "assistant".to_string(),
+                content: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_answer".to_string(),
+                    kind: "function".to_string(),
+                    function: ToolFunctionCall {
+                        name: "Ask".to_string(),
+                        arguments: "{\"prompt\":\"请选择\"}".to_string(),
+                    },
+                }]),
+                tool_call_id: None,
+                request_usage: None,
+                responses_input_items: None,
+            })
+            .expect("assistant Ask turn should persist before the answer arrives");
 
         hub.answer_question(UserQuestionAnswer {
             question_id,
@@ -6574,13 +6593,19 @@ description: Teaches patiently
                 .expect("pending question should load")
                 .is_none()
         );
-        let session_store = hub
-            .session_store_for_agent(root_agent_id)
-            .await
-            .expect("root session store should build");
         let snapshot = session_store
             .load_snapshot()
             .expect("session snapshot should load");
+        assert_eq!(snapshot.messages.len(), 2);
+        assert_eq!(snapshot.messages[0].role, "assistant");
+        assert_eq!(
+            snapshot.messages[0]
+                .tool_calls
+                .as_ref()
+                .and_then(|calls| calls.first())
+                .map(|call| call.id.as_str()),
+            Some("call_answer")
+        );
         let last = snapshot.messages.last().expect("tool result should exist");
         assert_eq!(last.role, "tool");
         assert_eq!(last.tool_call_id.as_deref(), Some("call_answer"));
