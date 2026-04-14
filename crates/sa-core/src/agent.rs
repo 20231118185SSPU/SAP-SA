@@ -90,6 +90,8 @@ pub enum AgentQuantumOutcome {
     /// The work asked the runtime to persist a structured user question and
     /// suspend until the answer is available.
     Ask {
+        /// Assistant tool-call message that triggered this ask.
+        assistant_message: ChatMessage,
         /// Assistant tool-call id that should receive the eventual tool result.
         tool_call_id: String,
         /// Structured question definition that should be shown to the frontend.
@@ -105,6 +107,8 @@ pub enum AgentQuantumOutcome {
     },
     /// The current work explicitly finished.
     Finish {
+        /// Assistant control-tool message that triggered this finish.
+        assistant_message: ChatMessage,
         /// Human-readable finish reason.
         reason: String,
         /// Human-readable finish result summary.
@@ -114,7 +118,12 @@ pub enum AgentQuantumOutcome {
         without_output_confirmation: bool,
     },
     /// The work should wait on another dependency.
-    Wait(crate::tools::WaitRequest),
+    Wait {
+        /// Assistant control-tool message that triggered this wait.
+        assistant_message: ChatMessage,
+        /// Requested dependency wait.
+        request: crate::tools::WaitRequest,
+    },
 }
 
 impl AgentRunner {
@@ -419,27 +428,28 @@ impl AgentRunner {
 
             let outcome = match control {
                 ToolControl::Ask(request) => {
-                    append_message_and_persist(
-                        &mut messages,
-                        assistant,
-                        persistent_session.as_deref(),
-                    )?;
                     AgentQuantumOutcome::Ask {
+                        assistant_message: assistant,
                         tool_call_id: call.id.clone(),
                         request,
                     }
                 }
                 ToolControl::Finish(request) => AgentQuantumOutcome::Finish {
+                    assistant_message: assistant,
                     reason: request.reason,
                     result: request.result,
                     without_output_confirmation: false,
                 },
                 ToolControl::FinishWithoutOutput => AgentQuantumOutcome::Finish {
+                    assistant_message: assistant,
                     reason: "finish_without_output".to_string(),
                     result: String::new(),
                     without_output_confirmation: true,
                 },
-                ToolControl::Wait(request) => AgentQuantumOutcome::Wait(request),
+                ToolControl::Wait(request) => AgentQuantumOutcome::Wait {
+                    assistant_message: assistant,
+                    request,
+                },
             };
             return Ok(AgentQuantumResult {
                 tool_session,

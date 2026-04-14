@@ -6,6 +6,7 @@
 //! - background terminal jobs also become first-class runtime tasks
 //! - restart recovery is driven from these persisted records
 
+use crate::openai::{ChatMessage, ToolCall};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -97,6 +98,77 @@ pub enum PendingFinishMode {
     ChildNeedsParentAckOrConfirmation,
 }
 
+/// Assistant message data that must survive a crash before the runtime fully
+/// applies one control decision.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PendingAssistantMessage {
+    /// Assistant role name.
+    pub role: String,
+    /// Optional text content.
+    pub content: Option<String>,
+    /// Optional tool calls emitted by the assistant.
+    pub tool_calls: Option<Vec<ToolCall>>,
+    /// Optional tool-call id for tool-result messages.
+    pub tool_call_id: Option<String>,
+}
+
+impl From<&ChatMessage> for PendingAssistantMessage {
+    fn from(value: &ChatMessage) -> Self {
+        Self {
+            role: value.role.clone(),
+            content: value.content.clone(),
+            tool_calls: value.tool_calls.clone(),
+            tool_call_id: value.tool_call_id.clone(),
+        }
+    }
+}
+
+impl From<&PendingAssistantMessage> for ChatMessage {
+    fn from(value: &PendingAssistantMessage) -> Self {
+        ChatMessage {
+            role: value.role.clone(),
+            content: value.content.clone(),
+            tool_calls: value.tool_calls.clone(),
+            tool_call_id: value.tool_call_id.clone(),
+            request_usage: None,
+            responses_input_items: None,
+        }
+    }
+}
+
+/// One durable control checkpoint captured between `run_quantum()` returning a
+/// control decision and the daemon fully applying the corresponding runtime
+/// transition.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PendingControlAction {
+    /// An `Ask` tool-call is waiting to be durably materialized into
+    /// `pending_question.json`.
+    Ask {
+        assistant_message: PendingAssistantMessage,
+        tool_call_id: String,
+        prompt: String,
+        mode: String,
+        options_json: String,
+        allow_free_text: bool,
+    },
+    /// A `Wait(...)` tool-call must be durably turned into `waiting_on`.
+    Wait {
+        assistant_message: PendingAssistantMessage,
+        target_kind: WaitKind,
+        target_id: Uuid,
+        until: Option<WaitUntil>,
+        timeout_seconds: Option<u64>,
+    },
+    /// A `Finish(...)` or `FinishWithoutOutput()` call must be durably applied.
+    Finish {
+        assistant_message: PendingAssistantMessage,
+        reason: String,
+        result: String,
+        without_output_confirmation: bool,
+    },
+}
+
 /// Durable state for one agent.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AgentState {
@@ -138,12 +210,18 @@ pub struct AgentState {
     pub work_has_user_output: bool,
     /// Whether this work has explicitly messaged the parent agent.
     pub work_has_parent_message: bool,
+    /// Parent work that created the current active work, when this is a child
+    /// agent. This keeps parent-child routing stable even if the parent later
+    /// switches to another active work.
+    pub parent_work_id: Option<Uuid>,
     /// Whether the next quantum should inject the temporary finish reminder.
     pub needs_finish_reminder: bool,
     /// Persisted dependency wait, if this work is currently suspended.
     pub waiting_on: Option<WaitingDependency>,
     /// Pending finish confirmation, if the runtime requested an extra check.
     pub pending_finish_confirmation: Option<PendingFinishConfirmation>,
+    /// Pending control decision captured before the runtime fully applied it.
+    pub pending_control: Option<PendingControlAction>,
     /// Last successful finish reason.
     pub last_finish_reason: Option<String>,
     /// Last successful finish result summary.
@@ -177,9 +255,11 @@ impl AgentState {
             active_started_at: None,
             work_has_user_output: false,
             work_has_parent_message: false,
+            parent_work_id: None,
             needs_finish_reminder: false,
             waiting_on: None,
             pending_finish_confirmation: None,
+            pending_control: None,
             last_finish_reason: None,
             last_finish_result: None,
             last_finished_work_id: None,
@@ -220,9 +300,11 @@ impl AgentState {
             active_started_at: None,
             work_has_user_output: false,
             work_has_parent_message: false,
+            parent_work_id: None,
             needs_finish_reminder: false,
             waiting_on: None,
             pending_finish_confirmation: None,
+            pending_control: None,
             last_finish_reason: None,
             last_finish_result: None,
             last_finished_work_id: None,

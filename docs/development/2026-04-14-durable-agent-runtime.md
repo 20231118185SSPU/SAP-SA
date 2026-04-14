@@ -171,3 +171,42 @@
 - `cargo build --release -q -j 1`
 
 两者均已通过。
+
+## 2026-04-14 审查后修复
+
+在多 agent 并行代码审查后，本轮继续修复了几类高风险问题：
+
+1. `submit` / `Accepted` / `interrupt` 的 work id 对齐
+   - `submit` 现在返回稳定的 effective work id
+   - 重试同一个 submit id 会返回同一个 work id
+   - `Accepted.task_id` 已改为真实 work id，而不是 submit id
+2. `interrupt` 不再只是把 agent 设回 idle
+   - 现在会把当前 active work 显式终结为 cancelled
+   - 清理 active work 元数据
+   - 唤醒等待该 work / agent 的等待者
+3. `Wait(...)` 不再被任意 mailbox 消息打断
+   - 只有真正满足 dependency 的路径才会解除等待
+4. `SubAgent(existing_agent_id=...)` 权限边界已收紧
+   - 只能复用直属 child
+   - 只能复用 idle 的 `Worker`
+   - 不能跨树、不能复用 root / sibling / busy agent
+   - 复用时要求 capability 配置一致
+5. durable 子代理增加稳定的 parent work 绑定
+   - `NotifyParent` / `ChildFinished` 不再依赖“父代理此刻的 active_work_id”
+   - 改为绑定到创建该 child work 时的 `parent_work_id`
+6. mailbox 消息追加做了进程内串行化
+   - 避免并发写入生成重复 offset
+   - 新增并发测试覆盖
+7. `last_mailbox_offset` 的提交时机后移
+   - 不再在量子执行前就标记为已消费
+   - 避免崩溃后永久跳过尚未入 session 的 mailbox 消息
+8. 启动恢复会重整遗留的 `Running` 后台任务
+   - 统一标记为失败
+   - 向 owner mailbox 投递通知
+   - 唤醒 `Wait(task)` 等待者
+9. `answer_question` 调整为更可恢复的顺序
+   - 先完成 durable 写入，再移除内存 pending
+   - 对同一 `tool_call_id` 增加幂等写回检查，避免重复 tool result
+10. 增加 control checkpoint
+    - `Ask` / `Wait` / `Finish` 的控制决策会先进入 durable checkpoint
+    - 重启后可以补写 assistant control message，并继续完成对应 runtime 过渡

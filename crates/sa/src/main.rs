@@ -29,9 +29,10 @@ use sa_core::mcp_client::McpRegistry;
 use sa_core::memory::{build_prompt_block as build_memory_prompt_block, is_memory_reference};
 use sa_core::openai::{AuthStyle, ChatMessage, OpenAiClient, WireApi};
 use sa_core::runtime::state::{
-    AgentKind, AgentState, MailboxEntry, MailboxEntryKind, PendingFinishConfirmation,
-    PendingFinishMode, PendingQuestionState, RuntimeTaskKind, RuntimeTaskState,
-    RuntimeTaskStatus, TeamState, WaitKind, WaitUntil, WaitingDependency,
+    AgentKind, AgentState, MailboxEntry, MailboxEntryKind, PendingAssistantMessage,
+    PendingControlAction, PendingFinishConfirmation, PendingFinishMode, PendingQuestionState,
+    RuntimeTaskKind, RuntimeTaskState, RuntimeTaskStatus, TeamState, WaitKind, WaitUntil,
+    WaitingDependency,
 };
 use sa_core::runtime::store::{RootMarker, RuntimeStore};
 use sa_core::session::SessionStore;
@@ -256,12 +257,12 @@ struct Hub {
     /// Monotonic event id generator.
     next_event_id: AtomicU64,
 
-    /// Set of submit ids already accepted (idempotency for retries).
+    /// Mapping from submit ids to effective durable work ids (idempotency for retries).
     ///
     /// This now covers both:
     /// - top-level tasks
     /// - queued follow-up messages sent while a task is still running
-    seen_tasks: Mutex<HashSet<Uuid>>,
+    seen_tasks: Mutex<HashMap<Uuid, Uuid>>,
 
     /// Currently running task (if any), so we can cancel it.
     #[allow(dead_code)]
@@ -343,7 +344,7 @@ impl Hub {
             events_tx,
             events_buf: Mutex::new(VecDeque::new()),
             next_event_id: AtomicU64::new(0),
-            seen_tasks: Mutex::new(HashSet::new()),
+            seen_tasks: Mutex::new(HashMap::new()),
             current_task: Mutex::new(None),
             wake_tx,
             wake_state: AsyncMutex::new(HashMap::new()),
@@ -447,10 +448,13 @@ impl Hub {
                 .as_ref()
                 .and_then(|state| state.active_work_id)
                 == Some(task_id);
-            if child_holds_task || root_holds_task {
+            if root_holds_task {
                 target_agent_ids.insert(team_state.root_agent_id);
+            }
+            if child_holds_task {
                 target_agent_ids.insert(input_owner_agent_id);
-                self.set_input_owner(team_state.root_agent_id, "interrupt").await?;
+                self.set_input_owner(team_state.root_agent_id, Some(task_id), "interrupt")
+                    .await?;
             }
         }
 
@@ -508,16 +512,9 @@ impl Hub {
                 }
             }
 
-            state.status = AgentStatus::Idle;
-            state.waiting_on = None;
-            state.needs_finish_reminder = false;
-            self.runtime_store.save_agent_state(&state)?;
-            self.wake_waiters_for_dependency(
-                WaitKind::Agent,
-                agent_id,
-                format!("Agent {agent_id} became idle after interrupt."),
-            )
-            .await?;
+            let _ = self
+                .cancel_active_work(&mut state, "user interrupt")
+                .await?;
         }
 
         Ok(())
@@ -669,6 +666,7 @@ impl Hub {
     async fn set_input_owner(
         self: &Arc<Self>,
         input_owner_agent_id: Uuid,
+        event_task_id: Option<Uuid>,
         reason: &str,
     ) -> anyhow::Result<()> {
         let mut team_state = self.team_state.lock().await;
@@ -679,7 +677,15 @@ impl Hub {
         team_state.input_owner_agent_id = Some(input_owner_agent_id);
         team_state.updated_at = chrono::Utc::now();
         self.runtime_store.save_team_state(&team_state)?;
-        let task_id = team_state.root_agent_id;
+        let task_id = event_task_id
+            .or_else(|| {
+                self.runtime_store
+                    .load_agent_state(team_state.root_agent_id)
+                    .ok()
+                    .flatten()
+                    .and_then(|state| state.active_work_id)
+            })
+            .unwrap_or(team_state.root_agent_id);
         drop(team_state);
 
         self.publish(
@@ -690,6 +696,61 @@ impl Hub {
             ),
         );
         Ok(())
+    }
+
+    /// Return whether an agent is currently a valid free-form input owner.
+    fn agent_can_hold_input(&self, state: &AgentState) -> bool {
+        state.root_agent_id
+            == self
+                .runtime_store
+                .load_root_marker()
+                .ok()
+                .flatten()
+                .map(|marker| marker.root_agent_id)
+                .unwrap_or(state.root_agent_id)
+            && !matches!(
+                state.status,
+                AgentStatus::Deleted | AgentStatus::Deleting | AgentStatus::Failed
+            )
+            && (state.parent_agent_id.is_none() || state.allow_input_transfer_target)
+    }
+
+    /// Resolve the effective current input owner, falling back to root if the
+    /// persisted owner is no longer valid.
+    async fn effective_input_owner(self: &Arc<Self>) -> anyhow::Result<Uuid> {
+        let mut team_state = self.team_state.lock().await;
+        let root_agent_id = team_state.root_agent_id;
+        let candidate = team_state.input_owner_agent_id.unwrap_or(root_agent_id);
+        let Some(candidate_state) = self.runtime_store.load_agent_state(candidate)? else {
+            team_state.input_owner_agent_id = Some(root_agent_id);
+            team_state.updated_at = chrono::Utc::now();
+            self.runtime_store.save_team_state(&team_state)?;
+            return Ok(root_agent_id);
+        };
+        if !self.agent_can_hold_input(&candidate_state) {
+            team_state.input_owner_agent_id = Some(root_agent_id);
+            team_state.updated_at = chrono::Utc::now();
+            self.runtime_store.save_team_state(&team_state)?;
+            return Ok(root_agent_id);
+        }
+        Ok(candidate)
+    }
+
+    /// Compute the durable depth of one agent within its current root tree.
+    fn agent_depth(&self, agent_id: Uuid) -> anyhow::Result<u32> {
+        let mut depth = 0u32;
+        let mut cursor = self
+            .runtime_store
+            .load_agent_state(agent_id)?
+            .and_then(|state| state.parent_agent_id);
+        while let Some(parent_id) = cursor {
+            depth = depth.saturating_add(1);
+            cursor = self
+                .runtime_store
+                .load_agent_state(parent_id)?
+                .and_then(|state| state.parent_agent_id);
+        }
+        Ok(depth)
     }
 
     /// Mark that one work emitted direct user-visible output.
@@ -748,14 +809,11 @@ impl Hub {
             },
         )?;
 
-        if let Some(mut state) = self.runtime_store.load_agent_state(target_agent_id)? {
-            if matches!(state.status, AgentStatus::WaitingDependency) {
-                state.status = AgentStatus::Idle;
-                state.waiting_on = None;
-                self.runtime_store.save_agent_state(&state)?;
-            }
-
-            if !matches!(state.status, AgentStatus::WaitingUser | AgentStatus::Deleted) {
+        if let Some(state) = self.runtime_store.load_agent_state(target_agent_id)? {
+            if !matches!(
+                state.status,
+                AgentStatus::WaitingUser | AgentStatus::WaitingDependency | AgentStatus::Deleted
+            ) {
                 self.wake_agent(target_agent_id).await?;
             }
         }
@@ -993,6 +1051,55 @@ impl Hub {
         Ok(())
     }
 
+    /// Finalize one active work as cancelled and wake any dependent waiters.
+    async fn cancel_active_work(
+        self: &Arc<Self>,
+        state: &mut AgentState,
+        reason: &str,
+    ) -> anyhow::Result<Option<Uuid>> {
+        let Some(work_id) = state.active_work_id else {
+            state.status = AgentStatus::Idle;
+            state.waiting_on = None;
+            state.needs_finish_reminder = false;
+            self.runtime_store.save_agent_state(state)?;
+            return Ok(None);
+        };
+
+        state.status = AgentStatus::Idle;
+        state.active_work_id = None;
+        state.active_work_summary = None;
+        state.active_started_at = None;
+        state.work_has_user_output = false;
+        state.work_has_parent_message = false;
+        state.parent_work_id = None;
+        state.needs_finish_reminder = false;
+        state.waiting_on = None;
+        state.pending_finish_confirmation = None;
+        state.pending_control = None;
+        self.runtime_store.clear_pending_question(state.agent_id)?;
+        self.runtime_store.save_agent_state(state)?;
+
+        self.publish(
+            EventKind::Final,
+            work_id,
+            format!("WORK_CANCELLED\nreason: {}", reason.trim()),
+        );
+        self.wake_waiters_for_dependency(
+            WaitKind::Agent,
+            state.agent_id,
+            format!("Agent {} became idle after cancellation.", state.agent_id),
+        )
+        .await?;
+        self.wake_waiters_for_dependency(
+            WaitKind::Work,
+            work_id,
+            format!("Work {work_id} was cancelled: {}.", reason.trim()),
+        )
+        .await?;
+
+        Ok(Some(work_id))
+    }
+
     /// Build a short human-readable work summary from free-form text.
     fn summarize_work_text(text: &str) -> String {
         let first_line = text
@@ -1073,6 +1180,144 @@ impl Hub {
         }
 
         blocks.join("\n\n")
+    }
+
+    /// Append one assistant control message into the durable session only when
+    /// it is not already present.
+    fn append_control_message_if_missing(
+        &self,
+        session_store: &SessionStore,
+        message: &PendingAssistantMessage,
+    ) -> anyhow::Result<()> {
+        let snapshot = session_store.load_snapshot()?;
+        let already_present = snapshot.messages.last().is_some_and(|last| {
+            last.role == message.role
+                && last.content == message.content
+                && last.tool_calls == message.tool_calls
+                && last.tool_call_id == message.tool_call_id
+        });
+        if !already_present {
+            let chat_message = ChatMessage::from(message);
+            session_store.append_message(&chat_message)?;
+        }
+        Ok(())
+    }
+
+    /// Apply one durable pending control checkpoint, including recovery after a
+    /// crash that happened between model decision and runtime transition.
+    async fn apply_pending_control(
+        self: &Arc<Self>,
+        state: &mut AgentState,
+        session_store: &SessionStore,
+    ) -> anyhow::Result<Option<bool>> {
+        let Some(pending_control) = state.pending_control.clone() else {
+            return Ok(None);
+        };
+
+        match pending_control {
+            PendingControlAction::Ask {
+                assistant_message,
+                tool_call_id,
+                prompt,
+                mode,
+                options_json,
+                allow_free_text,
+            } => {
+                self.append_control_message_if_missing(session_store, &assistant_message)?;
+
+                if self
+                    .runtime_store
+                    .load_pending_question(state.agent_id)?
+                    .is_some()
+                {
+                    state.pending_control = None;
+                    self.runtime_store.save_agent_state(state)?;
+                    return Ok(Some(false));
+                }
+
+                let request = AskRequest {
+                    prompt,
+                    mode: serde_json::from_str(&mode)?,
+                    options: serde_json::from_str(&options_json)?,
+                    allow_free_text,
+                };
+                self.persist_pending_question(state, state.active_work_id.unwrap_or(state.agent_id), tool_call_id, request)
+                    .await?;
+                let mut refreshed = self.load_agent_state_required(state.agent_id)?;
+                refreshed.pending_control = None;
+                self.runtime_store.save_agent_state(&refreshed)?;
+                *state = refreshed;
+                Ok(Some(false))
+            }
+            PendingControlAction::Wait {
+                assistant_message,
+                target_kind,
+                target_id,
+                until,
+                timeout_seconds,
+            } => {
+                self.append_control_message_if_missing(session_store, &assistant_message)?;
+                let waiting_on = WaitingDependency {
+                    kind: target_kind,
+                    id: target_id,
+                    until: until.unwrap_or(match target_kind {
+                        WaitKind::Agent => WaitUntil::Idle,
+                        WaitKind::Work => WaitUntil::Finished,
+                        WaitKind::Task => WaitUntil::Exited,
+                    }),
+                    timeout_at: timeout_seconds
+                        .map(|seconds| chrono::Utc::now() + chrono::Duration::seconds(seconds as i64)),
+                };
+
+                if let Some(notice) = self.wait_satisfied_notice(&waiting_on)? {
+                    state.status = AgentStatus::Idle;
+                    state.waiting_on = None;
+                    state.pending_control = None;
+                    self.runtime_store.save_agent_state(state)?;
+                    self.append_mailbox_message(
+                        state.agent_id,
+                        MailboxEntryKind::SystemNotice,
+                        None,
+                        Some("runtime".to_string()),
+                        notice,
+                        state.active_work_id,
+                        Some(waiting_on.id),
+                    )
+                    .await?;
+                    return Ok(Some(true));
+                }
+
+                state.status = AgentStatus::WaitingDependency;
+                state.waiting_on = Some(waiting_on.clone());
+                state.pending_control = None;
+                state.needs_finish_reminder = false;
+                self.runtime_store.save_agent_state(state)?;
+                self.schedule_wait_timeout(state.agent_id, waiting_on);
+                Ok(Some(false))
+            }
+            PendingControlAction::Finish {
+                assistant_message,
+                reason,
+                result,
+                without_output_confirmation,
+            } => {
+                self.append_control_message_if_missing(session_store, &assistant_message)?;
+                if state.active_work_id.is_none() {
+                    state.pending_control = None;
+                    self.runtime_store.save_agent_state(state)?;
+                    return Ok(Some(false));
+                }
+                let had_pending_finish_confirmation = state.pending_finish_confirmation.is_some();
+                let rerun = self
+                    .handle_finish_outcome(state, reason, result, without_output_confirmation)
+                    .await?;
+                let mut refreshed = self.load_agent_state_required(state.agent_id)?;
+                refreshed.pending_control = None;
+                self.runtime_store.save_agent_state(&refreshed)?;
+                *state = refreshed;
+                Ok(Some(rerun && !had_pending_finish_confirmation))
+            }
+        }
     }
 
     /// Persist one runtime-level structured question and surface it to all
@@ -1176,6 +1421,7 @@ impl Hub {
         }
 
         let parent_agent_id = state.parent_agent_id;
+        let parent_work_id = state.parent_work_id;
         let agent_id = state.agent_id;
         let agent_label = state.label.clone();
         let root_agent_id = state.root_agent_id;
@@ -1187,9 +1433,11 @@ impl Hub {
         state.active_started_at = None;
         state.work_has_user_output = false;
         state.work_has_parent_message = false;
+        state.parent_work_id = None;
         state.needs_finish_reminder = false;
         state.waiting_on = None;
         state.pending_finish_confirmation = None;
+        state.pending_control = None;
         state.last_finish_reason = Some(effective_reason.clone());
         state.last_finish_result = Some(effective_result.clone());
         state.last_finished_work_id = Some(work_id);
@@ -1208,10 +1456,6 @@ impl Hub {
         );
 
         if let Some(parent_agent_id) = parent_agent_id {
-            let parent_work_id = self
-                .runtime_store
-                .load_agent_state(parent_agent_id)?
-                .and_then(|parent| parent.active_work_id);
             self.append_mailbox_message(
                 parent_agent_id,
                 MailboxEntryKind::ChildFinished,
@@ -1231,7 +1475,8 @@ impl Hub {
         if self.team_state.lock().await.input_owner_agent_id == Some(agent_id)
             && agent_id != root_agent_id
         {
-            self.set_input_owner(root_agent_id, "finished child work").await?;
+            self.set_input_owner(root_agent_id, Some(work_id), "finished child work")
+                .await?;
         }
 
         self.wake_waiters_for_dependency(
@@ -1290,6 +1535,45 @@ impl Hub {
         let mut restored_questions = Vec::<PendingQuestionEntry>::new();
         let mut resumed_agents = 0usize;
         let mut waiting_agents = 0usize;
+
+        for mut task in self.runtime_store.list_task_states()? {
+            if !matches!(task.status, RuntimeTaskStatus::Running) {
+                continue;
+            }
+            task.status = RuntimeTaskStatus::Failed;
+            task.finished_at = Some(chrono::Utc::now());
+            task.summary = Some(
+                "Task was still marked running when SA restarted; it has been reconciled as failed."
+                    .to_string(),
+            );
+            self.runtime_store.save_task_state(&task)?;
+            let owner_work_id = self
+                .runtime_store
+                .load_agent_state(task.owner_agent_id)?
+                .and_then(|owner| owner.active_work_id);
+            self.append_mailbox_message(
+                task.owner_agent_id,
+                MailboxEntryKind::TaskFinished,
+                None,
+                Some("runtime".to_string()),
+                format!(
+                    "后台任务 `{}` 在重启恢复时被标记为失败，因为进程重启前它仍处于 Running 状态。",
+                    task.task_id
+                ),
+                owner_work_id,
+                Some(task.task_id),
+            )
+            .await?;
+            self.wake_waiters_for_dependency(
+                WaitKind::Task,
+                task.task_id,
+                format!(
+                    "Runtime task {} was reconciled as failed during recovery.",
+                    task.task_id
+                ),
+            )
+            .await?;
+        }
 
         for mut state in self.runtime_store.list_agent_states()? {
             let _ = self.session_store_for_agent(state.agent_id).await?;
@@ -1352,6 +1636,7 @@ impl Hub {
                 )
                 && (state.active_work_id.is_some()
                     || !unread_mailbox.is_empty()
+                    || state.pending_control.is_some()
                     || state.pending_finish_confirmation.is_some()
                     || state.needs_finish_reminder);
 
@@ -1396,6 +1681,14 @@ impl Hub {
             AgentStatus::Deleted | AgentStatus::Deleting | AgentStatus::Failed
         ) {
             return Ok(false);
+        }
+
+        let session_store = self.session_store_for_agent(agent_id).await?;
+        self.sync_agent_session_paths(&mut state, &session_store)?;
+        self.runtime_store.save_agent_state(&state)?;
+
+        if let Some(rerun) = self.apply_pending_control(&mut state, &session_store).await? {
+            return Ok(rerun);
         }
 
         if let Some(waiting_on) = state.waiting_on.clone() {
@@ -1448,6 +1741,7 @@ impl Hub {
             state.active_started_at = Some(chrono::Utc::now());
             state.work_has_user_output = false;
             state.work_has_parent_message = false;
+            state.parent_work_id = None;
             state.pending_finish_confirmation = None;
             state.needs_finish_reminder = false;
         }
@@ -1460,15 +1754,10 @@ impl Hub {
             .iter()
             .map(Self::mailbox_entry_to_message)
             .collect::<Vec<_>>();
+        let had_finish_reminder = state.needs_finish_reminder;
+        let had_pending_finish_confirmation = state.pending_finish_confirmation.is_some();
 
         state.status = AgentStatus::Running;
-        if let Some(offset) = max_offset {
-            state.last_mailbox_offset = offset;
-        }
-        self.runtime_store.save_agent_state(&state)?;
-
-        let session_store = self.session_store_for_agent(agent_id).await?;
-        self.sync_agent_session_paths(&mut state, &session_store)?;
         self.runtime_store.save_agent_state(&state)?;
 
         let agents_md = match load_agents_md(self.agents_md_path.clone()).await {
@@ -1527,6 +1816,9 @@ impl Hub {
         self.running_agents.lock().await.remove(&agent_id);
         let mut state = self.load_agent_state_required(agent_id)?;
         self.sync_agent_session_paths(&mut state, &session_store)?;
+        if let Some(offset) = max_offset {
+            state.last_mailbox_offset = offset;
+        }
 
         match quantum {
             Ok(quantum) => {
@@ -1539,12 +1831,22 @@ impl Hub {
 
                 match quantum.outcome {
                     AgentQuantumOutcome::Ask {
+                        assistant_message,
                         tool_call_id,
                         request,
                     } => {
-                        self.persist_pending_question(&mut state, work_id, tool_call_id, request)
-                            .await?;
-                        Ok(false)
+                        state.pending_control = Some(PendingControlAction::Ask {
+                            assistant_message: PendingAssistantMessage::from(&assistant_message),
+                            tool_call_id,
+                            prompt: request.prompt.clone(),
+                            mode: serde_json::to_string(&request.mode)?,
+                            options_json: serde_json::to_string(&request.options)?,
+                            allow_free_text: request.allow_free_text,
+                        });
+                        self.runtime_store.save_agent_state(&state)?;
+                        self.apply_pending_control(&mut state, &session_store)
+                            .await?
+                            .ok_or_else(|| anyhow::anyhow!("Pending Ask control was not applied"))
                     }
                     AgentQuantumOutcome::Continue {
                         needs_finish_reminder,
@@ -1554,61 +1856,43 @@ impl Hub {
                         state.needs_finish_reminder = needs_finish_reminder;
                         state.pending_finish_confirmation = None;
                         self.runtime_store.save_agent_state(&state)?;
-                        Ok(true)
+                        Ok(!needs_finish_reminder || !had_finish_reminder)
                     }
-                    AgentQuantumOutcome::Wait(request) => {
-                        let timeout_at = request
-                            .timeout_seconds
-                            .map(|seconds| chrono::Utc::now() + chrono::Duration::seconds(seconds as i64));
-                        let waiting_on = WaitingDependency {
-                            kind: request.kind,
-                            id: request.id,
-                            until: request.until.unwrap_or(match request.kind {
-                                WaitKind::Agent => WaitUntil::Idle,
-                                WaitKind::Work => WaitUntil::Finished,
-                                WaitKind::Task => WaitUntil::Exited,
-                            }),
-                            timeout_at,
-                        };
-
-                        if let Some(notice) = self.wait_satisfied_notice(&waiting_on)? {
-                            state.status = AgentStatus::Idle;
-                            state.waiting_on = None;
-                            state.needs_finish_reminder = false;
-                            self.runtime_store.save_agent_state(&state)?;
-                            self.append_mailbox_message(
-                                agent_id,
-                                MailboxEntryKind::SystemNotice,
-                                None,
-                                Some("runtime".to_string()),
-                                notice,
-                                Some(work_id),
-                                Some(waiting_on.id),
-                            )
-                            .await?;
-                            Ok(true)
-                        } else {
-                            state.status = AgentStatus::WaitingDependency;
-                            state.waiting_on = Some(waiting_on.clone());
-                            state.needs_finish_reminder = false;
-                            state.pending_finish_confirmation = None;
-                            self.runtime_store.save_agent_state(&state)?;
-                            self.schedule_wait_timeout(agent_id, waiting_on);
-                            Ok(false)
-                        }
+                    AgentQuantumOutcome::Wait {
+                        assistant_message,
+                        request,
+                    } => {
+                        state.pending_control = Some(PendingControlAction::Wait {
+                            assistant_message: PendingAssistantMessage::from(&assistant_message),
+                            target_kind: request.kind,
+                            target_id: request.id,
+                            until: request.until,
+                            timeout_seconds: request.timeout_seconds,
+                        });
+                        self.runtime_store.save_agent_state(&state)?;
+                        self.apply_pending_control(&mut state, &session_store)
+                            .await?
+                            .ok_or_else(|| anyhow::anyhow!("Pending Wait control was not applied"))
                     }
                     AgentQuantumOutcome::Finish {
+                        assistant_message,
                         reason,
                         result,
                         without_output_confirmation,
-                    } => self
-                        .handle_finish_outcome(
-                            &mut state,
+                    } => {
+                        state.pending_control = Some(PendingControlAction::Finish {
+                            assistant_message: PendingAssistantMessage::from(&assistant_message),
                             reason,
                             result,
                             without_output_confirmation,
-                        )
-                        .await,
+                        });
+                        self.runtime_store.save_agent_state(&state)?;
+                        let rerun = self
+                            .apply_pending_control(&mut state, &session_store)
+                            .await?
+                            .ok_or_else(|| anyhow::anyhow!("Pending Finish control was not applied"))?;
+                        Ok(rerun && !had_pending_finish_confirmation)
+                    }
                 }
             }
             Err(err) => {
@@ -1789,6 +2073,7 @@ impl Hub {
         let notify_parent_label = state.label.clone();
         let message_agent_label = state.label.clone();
         let broadcast_agent_label = state.label.clone();
+        let parent_work_id = state.parent_work_id;
 
         let hub_for_send = Arc::clone(self);
         let send_message: SendMessageFn = Arc::new(move |message: String| {
@@ -1850,9 +2135,7 @@ impl Hub {
                     Some(agent_id),
                     Some(agent_label),
                     message,
-                    hub.runtime_store
-                        .load_agent_state(parent_agent_id)?
-                        .and_then(|parent| parent.active_work_id),
+                    parent_work_id,
                     Some(work_id),
                 )
                 .await?;
@@ -1880,7 +2163,11 @@ impl Hub {
                     Some(agent_id),
                     Some(agent_label),
                     request.message,
-                    target.active_work_id,
+                    if requester.parent_agent_id == Some(target.agent_id) {
+                        requester.parent_work_id
+                    } else {
+                        target.active_work_id
+                    },
                     Some(work_id),
                 )
                 .await?;
@@ -1966,6 +2253,15 @@ impl Hub {
                     let target_agent_id = match request.target_agent_id {
                         Some(target_agent_id) => {
                             let target = hub.load_agent_state_required(target_agent_id)?;
+                            if target.root_agent_id != requester.root_agent_id {
+                                anyhow::bail!("TransferInput target is outside the current root tree");
+                            }
+                            if !hub.agent_can_hold_input(&target) {
+                                anyhow::bail!(
+                                    "Target agent is not currently eligible to hold input: {}",
+                                    target.agent_id
+                                );
+                            }
                             if !target.allow_input_transfer_target {
                                 anyhow::bail!(
                                     "Target agent is not allowed to hold free-form input: {}",
@@ -1976,7 +2272,8 @@ impl Hub {
                         }
                         None => requester.agent_id,
                     };
-                    hub.set_input_owner(target_agent_id, "TransferInput tool").await?;
+                    hub.set_input_owner(target_agent_id, Some(work_id), "TransferInput tool")
+                        .await?;
                     Ok(TransferInputReceipt {
                         input_owner_agent_id: target_agent_id,
                     })
@@ -2033,6 +2330,14 @@ impl Hub {
         request.validate()?;
 
         let parent_state = self.load_agent_state_required(parent_agent_id)?;
+        let child_depth = self.agent_depth(parent_agent_id)?.saturating_add(1);
+        if child_depth > MAX_SUBAGENT_DEPTH {
+            anyhow::bail!(
+                "SubAgent depth limit exceeded (requested depth={}, max={})",
+                child_depth,
+                MAX_SUBAGENT_DEPTH
+            );
+        }
         let child_agent_id = request.existing_agent_id.unwrap_or_else(Uuid::new_v4);
 
         if request.existing_agent_id.is_none()
@@ -2049,6 +2354,34 @@ impl Hub {
             Some(existing) => {
                 if existing.root_agent_id != parent_state.root_agent_id {
                     anyhow::bail!("SubAgent target belongs to a different root tree");
+                }
+                if existing.parent_agent_id != Some(parent_agent_id) {
+                    anyhow::bail!("SubAgent may only reuse a direct child agent owned by the caller");
+                }
+                if !matches!(existing.kind, AgentKind::Worker) {
+                    anyhow::bail!("SubAgent may only reuse normal worker agents");
+                }
+                if !matches!(existing.status, AgentStatus::Idle) {
+                    anyhow::bail!("SubAgent may only reuse idle agents");
+                }
+                if existing.active_work_id.is_some()
+                    || existing.waiting_on.is_some()
+                    || existing.pending_finish_confirmation.is_some()
+                    || self.runtime_store.load_pending_question(existing.agent_id)?.is_some()
+                {
+                    anyhow::bail!("SubAgent may not reuse a busy or suspended agent");
+                }
+                if existing.allow_user_send != request.allow_user_send
+                    || existing.allow_user_show != request.allow_user_show
+                    || existing.allow_user_ask != request.allow_user_ask
+                    || existing.allow_input_transfer_target != request.allow_input_transfer_target
+                {
+                    anyhow::bail!("SubAgent may not reuse an agent with different capability settings");
+                }
+                if let Some(label) = request.label.as_deref()
+                    && existing.label != label
+                {
+                    anyhow::bail!("SubAgent may not reuse an agent with a different label");
                 }
                 existing
             }
@@ -2069,22 +2402,19 @@ impl Hub {
         };
 
         self.sync_agent_session_paths(&mut child_state, &child_session_store)?;
+        let child_work_id = Uuid::new_v4();
+        child_state.active_work_id = Some(child_work_id);
+        child_state.active_work_summary = Some(Self::summarize_work_text(&request.task));
+        child_state.active_started_at = Some(chrono::Utc::now());
+        child_state.work_has_user_output = false;
+        child_state.work_has_parent_message = false;
+        child_state.parent_work_id = Some(parent_work_id);
+        child_state.needs_finish_reminder = false;
+        child_state.pending_finish_confirmation = None;
+        child_state.pending_control = None;
+        child_state.waiting_on = None;
+        child_state.status = AgentStatus::Idle;
 
-        if child_state.active_work_id.is_none() {
-            child_state.active_work_id = Some(Uuid::new_v4());
-            child_state.active_work_summary = Some(Self::summarize_work_text(&request.task));
-            child_state.active_started_at = Some(chrono::Utc::now());
-            child_state.work_has_user_output = false;
-            child_state.work_has_parent_message = false;
-            child_state.needs_finish_reminder = false;
-            child_state.pending_finish_confirmation = None;
-            child_state.waiting_on = None;
-            child_state.status = AgentStatus::Idle;
-        }
-
-        let child_work_id = child_state
-            .active_work_id
-            .ok_or_else(|| anyhow::anyhow!("Child agent work id disappeared unexpectedly"))?;
         self.runtime_store.save_agent_state(&child_state)?;
 
         self.append_mailbox_message(
@@ -2132,7 +2462,7 @@ impl Hub {
 
     /// Validate and deliver an answer coming from a client.
     async fn answer_question(self: &Arc<Self>, answer: UserQuestionAnswer) -> anyhow::Result<()> {
-        let entry = {
+        let durable_entry = {
             let mut pending = self
                 .pending_questions
                 .lock()
@@ -2149,25 +2479,37 @@ impl Hub {
             };
 
             validate_user_answer(&pending[index].question, &answer)?;
-            pending.remove(index)
+
+            if pending[index].answer_tx.is_some() {
+                let entry = pending.remove(index);
+                drop(pending);
+                let Some(answer_tx) = entry.answer_tx else {
+                    anyhow::bail!("Legacy Ask waiter disappeared unexpectedly");
+                };
+                if answer_tx.send(answer.clone()).is_err() {
+                    anyhow::bail!("Question waiter dropped before receiving the answer");
+                }
+                self.broadcast_server_message(ServerMessage::QuestionResolved {
+                    question_id: answer.question_id,
+                });
+                return Ok(());
+            }
+
+            (
+                pending[index].agent_id,
+                pending[index].work_id,
+                pending[index].tool_call_id.clone(),
+                pending[index].question.clone(),
+            )
         };
 
-        if let Some(answer_tx) = entry.answer_tx {
-            if answer_tx.send(answer.clone()).is_err() {
-                anyhow::bail!("Question waiter dropped before receiving the answer");
-            }
-            self.broadcast_server_message(ServerMessage::QuestionResolved {
-                question_id: answer.question_id,
-            });
-            return Ok(());
-        }
+        let (agent_id, work_id, tool_call_id, question) = durable_entry;
 
         let selected_labels: Vec<String> = answer
             .selected_option_ids
             .iter()
             .filter_map(|id| {
-                entry
-                    .question
+                question
                     .options
                     .iter()
                     .find(|option| option.id == *id)
@@ -2175,26 +2517,44 @@ impl Hub {
             })
             .collect();
         let payload = serde_json::json!({
-            "question_prompt": entry.question.prompt,
-            "mode": entry.question.mode,
+            "question_prompt": question.prompt,
+            "mode": question.mode,
             "selected_option_ids": answer.selected_option_ids,
             "selected_labels": selected_labels,
             "free_text": answer.free_text,
         })
         .to_string();
 
-        let session_store = self.session_store_for_agent(entry.agent_id).await?;
-        session_store.append_message(&ChatMessage::tool_result(entry.tool_call_id, payload))?;
-        self.runtime_store.clear_pending_question(entry.agent_id)?;
+        let session_store = self.session_store_for_agent(agent_id).await?;
+        let snapshot = session_store.load_snapshot()?;
+        let already_applied = snapshot.messages.iter().any(|message| {
+            message.role == "tool" && message.tool_call_id.as_deref() == Some(tool_call_id.as_str())
+        });
+        if !already_applied {
+            session_store.append_message(&ChatMessage::tool_result(tool_call_id, payload))?;
+        }
+        self.runtime_store.clear_pending_question(agent_id)?;
 
-        if let Some(mut state) = self.runtime_store.load_agent_state(entry.agent_id)? {
-            if state.active_work_id == Some(entry.work_id) {
+        if let Some(mut state) = self.runtime_store.load_agent_state(agent_id)? {
+            if state.active_work_id == Some(work_id) {
                 state.status = AgentStatus::Idle;
                 state.needs_finish_reminder = false;
                 self.runtime_store.save_agent_state(&state)?;
-                self.wake_agent(entry.agent_id).await?;
+                self.wake_agent(agent_id).await?;
             }
         }
+
+        let mut pending = self
+            .pending_questions
+            .lock()
+            .expect("pending_questions mutex poisoned");
+        if let Some(index) = pending
+            .iter()
+            .position(|entry| entry.question.question_id == answer.question_id)
+        {
+            pending.remove(index);
+        }
+        drop(pending);
 
         self.broadcast_server_message(ServerMessage::QuestionResolved {
             question_id: answer.question_id,
@@ -2211,19 +2571,16 @@ impl Hub {
     ///   turn for that same session
     /// - if the current task is already being cancelled, the message is queued
     ///   as the next top-level task instead of being attached to the doomed run
-    async fn submit_task(self: &Arc<Self>, task_id: Uuid, task: String) -> anyhow::Result<()> {
+    async fn submit_task(self: &Arc<Self>, task_id: Uuid, task: String) -> anyhow::Result<Uuid> {
         // Ensure idempotency: if we have already seen this submit id, do not process it again.
         {
-            let mut seen = self.seen_tasks.lock().expect("seen_tasks mutex poisoned");
-            if !seen.insert(task_id) {
-                return Ok(());
+            let seen = self.seen_tasks.lock().expect("seen_tasks mutex poisoned");
+            if let Some(existing_work_id) = seen.get(&task_id).copied() {
+                return Ok(existing_work_id);
             }
         }
 
-        let team_state = self.team_state.lock().await.clone();
-        let owner_agent_id = team_state
-            .input_owner_agent_id
-            .unwrap_or(team_state.root_agent_id);
+        let owner_agent_id = self.effective_input_owner().await?;
         let mut owner_state = self.load_agent_state_required(owner_agent_id)?;
         let is_new_work = owner_state.active_work_id.is_none();
         let effective_work_id = owner_state.active_work_id.unwrap_or(task_id);
@@ -2234,12 +2591,18 @@ impl Hub {
             owner_state.active_started_at = Some(chrono::Utc::now());
             owner_state.work_has_user_output = false;
             owner_state.work_has_parent_message = false;
+            owner_state.parent_work_id = None;
             owner_state.needs_finish_reminder = false;
             owner_state.pending_finish_confirmation = None;
+            owner_state.pending_control = None;
             owner_state.waiting_on = None;
             owner_state.status = AgentStatus::Idle;
         }
         self.runtime_store.save_agent_state(&owner_state)?;
+        {
+            let mut seen = self.seen_tasks.lock().expect("seen_tasks mutex poisoned");
+            seen.insert(task_id, effective_work_id);
+        }
 
         self.append_mailbox_message(
             owner_agent_id,
@@ -2264,7 +2627,7 @@ impl Hub {
             },
         );
 
-        Ok(())
+        Ok(effective_work_id)
     }
 
     /// Ask the user a structured question and wait until an answer arrives.
@@ -4092,8 +4455,11 @@ async fn ws_session_with_timeout(
     let mut forwarder: Option<tokio::task::JoinHandle<()>> = None;
     match state.runtime_snapshot().await {
         RuntimeState::Ready(hub) => {
+            forwarder = Some(spawn_event_forwarder_for_connection(
+                Arc::clone(&hub),
+                out_tx.clone(),
+            ));
             send_ready_runtime_snapshot(&hub, &out_tx);
-            forwarder = Some(spawn_event_forwarder_for_connection(hub, out_tx.clone()));
         }
         RuntimeState::Bootstrap(bootstrap) => {
             send_direct_server_message(&out_tx, bootstrap.init_required_message());
@@ -4164,18 +4530,21 @@ async fn ws_session_with_timeout(
                             RuntimeState::Ready(hub) => {
                                 let task_id = task_id.unwrap_or_else(Uuid::new_v4);
 
-                                send_direct_server_message(
-                                    &out_tx,
-                                    ServerMessage::Accepted { task_id },
-                                );
-
-                                if let Err(err) = hub.submit_task(task_id, task).await {
-                                    send_direct_server_message(
-                                        &out_tx,
-                                        ServerMessage::Error {
-                                            message: format!("Failed to submit task: {err}"),
-                                        },
-                                    );
+                                match hub.submit_task(task_id, task).await {
+                                    Ok(work_id) => {
+                                        send_direct_server_message(
+                                            &out_tx,
+                                            ServerMessage::Accepted { task_id: work_id },
+                                        );
+                                    }
+                                    Err(err) => {
+                                        send_direct_server_message(
+                                            &out_tx,
+                                            ServerMessage::Error {
+                                                message: format!("Failed to submit task: {err}"),
+                                            },
+                                        );
+                                    }
                                 }
                             }
                             RuntimeState::Bootstrap(bootstrap) => {
@@ -4846,6 +5215,45 @@ mod tests {
         let content = last.content.as_deref().expect("tool result should contain text");
         assert!(content.contains("\"selected_option_ids\":[\"a\"]"));
         assert!(content.contains("\"selected_labels\":[\"选项A\"]"));
+    }
+
+    #[tokio::test]
+    async fn submit_task_returns_stable_effective_work_id_for_retries_and_followups() {
+        let workspace = TempDir::new().expect("temp workspace should build");
+        let hub = build_test_hub(&workspace);
+        let root_agent_id = hub
+            .runtime_store
+            .load_root_marker()
+            .expect("root marker should load")
+            .expect("root marker should exist")
+            .root_agent_id;
+
+        let first_submit_id = Uuid::new_v4();
+        let second_submit_id = Uuid::new_v4();
+
+        let work_id = hub
+            .submit_task(first_submit_id, "first".to_string())
+            .await
+            .expect("first submit should succeed");
+        let followup_work_id = hub
+            .submit_task(second_submit_id, "followup".to_string())
+            .await
+            .expect("follow-up submit should succeed");
+        let retried_followup_work_id = hub
+            .submit_task(second_submit_id, "followup retry".to_string())
+            .await
+            .expect("retried follow-up submit should be idempotent");
+
+        assert_eq!(followup_work_id, work_id);
+        assert_eq!(retried_followup_work_id, work_id);
+
+        let mailbox = hub
+            .runtime_store
+            .read_mailbox(root_agent_id)
+            .expect("root mailbox should load");
+        assert_eq!(mailbox.len(), 2);
+        assert_eq!(mailbox[0].work_id, Some(work_id));
+        assert_eq!(mailbox[1].work_id, Some(work_id));
     }
 
     #[test]

@@ -1060,7 +1060,7 @@ pub struct ToolFunctionDefinition {
 }
 
 /// Tool call emitted by the assistant.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ToolCall {
     /// Provider-generated identifier.
     pub id: String,
@@ -1072,7 +1072,7 @@ pub struct ToolCall {
 }
 
 /// Function call payload.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ToolFunctionCall {
     /// Name of the tool to call.
     pub name: String,

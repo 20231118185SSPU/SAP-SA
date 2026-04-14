@@ -12,8 +12,12 @@ use crate::runtime::state::{
     AgentState, MailboxEntry, PendingQuestionState, RuntimeTaskState, TeamState,
 };
 use anyhow::Context as _;
+use std::collections::HashMap;
 use std::fs;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use tempfile::NamedTempFile;
 use uuid::Uuid;
 
 /// Runtime directory under the workspace root.
@@ -49,6 +53,7 @@ pub struct RuntimeStore {
     tasks_dir: PathBuf,
     root_marker_path: PathBuf,
     team_state_path: PathBuf,
+    mailbox_locks: Arc<Mutex<HashMap<Uuid, Arc<Mutex<()>>>>>,
 }
 
 impl RuntimeStore {
@@ -76,7 +81,20 @@ impl RuntimeStore {
             runtime_dir,
             agents_dir,
             tasks_dir,
+            mailbox_locks: Arc::new(Mutex::new(HashMap::new())),
         })
+    }
+
+    /// Return the in-process append lock for one agent mailbox.
+    fn mailbox_lock(&self, agent_id: Uuid) -> Arc<Mutex<()>> {
+        let mut locks = self
+            .mailbox_locks
+            .lock()
+            .expect("runtime mailbox_locks mutex poisoned");
+        locks
+            .entry(agent_id)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
     }
 
     /// Return the canonical workspace root.
@@ -174,6 +192,22 @@ impl RuntimeStore {
         read_json_optional(&self.task_state_path(task_id))
     }
 
+    /// Enumerate all persisted runtime tasks.
+    pub fn list_task_states(&self) -> anyhow::Result<Vec<RuntimeTaskState>> {
+        let mut out = Vec::new();
+        for entry in fs::read_dir(&self.tasks_dir)
+            .with_context(|| format!("Failed to read tasks dir: {}", self.tasks_dir.display()))?
+        {
+            let entry = entry?;
+            let path = entry.path();
+            if let Some(task) = read_json_optional::<RuntimeTaskState>(&path)? {
+                out.push(task);
+            }
+        }
+        out.sort_by_key(|task| task.task_id);
+        Ok(out)
+    }
+
     /// Persist a pending question for one agent.
     pub fn save_pending_question(&self, question: &PendingQuestionState) -> anyhow::Result<()> {
         let agent_dir = self.agent_dir(question.agent_id);
@@ -206,6 +240,8 @@ impl RuntimeStore {
         agent_id: Uuid,
         mut entry: MailboxEntry,
     ) -> anyhow::Result<MailboxEntry> {
+        let lock = self.mailbox_lock(agent_id);
+        let _guard = lock.lock().expect("runtime mailbox append lock poisoned");
         let mailbox_path = self.agent_mailbox_path(agent_id);
         let agent_dir = self.agent_dir(agent_id);
         fs::create_dir_all(&agent_dir)
@@ -256,11 +292,44 @@ impl RuntimeStore {
 /// Write one JSON document atomically-ish by replacing the entire target file.
 fn write_json_pretty<T: serde::Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
     let raw = serde_json::to_string_pretty(value).context("Failed to serialize JSON state")?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create parent dir: {}", parent.display()))?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("JSON state path has no parent: {}", path.display()))?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("Failed to create parent dir: {}", parent.display()))?;
+
+    let mut temp = NamedTempFile::new_in(parent)
+        .with_context(|| format!("Failed to create temp JSON file in {}", parent.display()))?;
+    temp.write_all(raw.as_bytes())
+        .with_context(|| format!("Failed to write temp JSON state for {}", path.display()))?;
+    temp.flush()
+        .with_context(|| format!("Failed to flush temp JSON state for {}", path.display()))?;
+    temp.as_file()
+        .sync_all()
+        .with_context(|| format!("Failed to sync temp JSON state for {}", path.display()))?;
+
+    if path.exists() {
+        #[cfg(windows)]
+        {
+            fs::remove_file(path).with_context(|| {
+                format!("Failed to replace existing JSON state at {}", path.display())
+            })?;
+        }
     }
-    fs::write(path, raw).with_context(|| format!("Failed to write JSON state: {}", path.display()))
+
+    temp.persist(path).map_err(|err| {
+        anyhow::anyhow!(
+            "Failed to persist JSON state to {}: {}",
+            path.display(),
+            err.error
+        )
+    })?;
+
+    if let Ok(dir) = fs::File::open(parent) {
+        let _ = dir.sync_all();
+    }
+
+    Ok(())
 }
 
 /// Read one JSON file if it exists.
@@ -388,6 +457,52 @@ mod tests {
     }
 
     #[test]
+    fn runtime_store_serializes_concurrent_mailbox_offsets() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let (_workspace, store) = create_store();
+        let store = Arc::new(store);
+        let agent_id = Uuid::new_v4();
+
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let store = Arc::clone(&store);
+            handles.push(thread::spawn(move || {
+                store
+                    .append_mailbox_entry(
+                        agent_id,
+                        MailboxEntry {
+                            offset: 0,
+                            entry_id: Uuid::new_v4(),
+                            created_at: Utc::now(),
+                            kind: MailboxEntryKind::SystemNotice,
+                            from_agent_id: None,
+                            from_label: None,
+                            message: "race".to_string(),
+                            work_id: None,
+                            related_id: None,
+                        },
+                    )
+                    .expect("concurrent mailbox append should succeed");
+            }));
+        }
+
+        for handle in handles {
+            handle.join().expect("mailbox thread should finish");
+        }
+
+        let mut offsets = store
+            .read_mailbox(agent_id)
+            .expect("mailbox should load")
+            .into_iter()
+            .map(|entry| entry.offset)
+            .collect::<Vec<_>>();
+        offsets.sort_unstable();
+        assert_eq!(offsets, (1..=16).collect::<Vec<_>>());
+    }
+
+    #[test]
     fn runtime_store_persists_agent_and_task_state() {
         let (_workspace, store) = create_store();
         let agent_id = Uuid::new_v4();
@@ -413,9 +528,11 @@ mod tests {
             active_started_at: None,
             work_has_user_output: false,
             work_has_parent_message: false,
+            parent_work_id: None,
             needs_finish_reminder: false,
             waiting_on: None,
             pending_finish_confirmation: None,
+            pending_control: None,
             last_finish_reason: None,
             last_finish_result: None,
             last_finished_work_id: None,
