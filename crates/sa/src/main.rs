@@ -25,7 +25,9 @@ use sa_core::agent::{
 };
 use sa_core::agents_md::{extract_markdown_file_references, load_agents_md};
 use sa_core::cancel::{CancelHandle, cancel_pair};
-use sa_core::config::{Config, PermissionsConfig, TeamConfig, load_config_from_file};
+use sa_core::config::{
+    Config, PermissionsConfig, TeamConfig, load_config_from_file, resolve_config_file_dir,
+};
 use sa_core::dream::DreamManager;
 use sa_core::interaction_history::{
     InteractionPayload, InteractionStore, show_payload_from_visible_file,
@@ -43,13 +45,15 @@ use sa_core::runtime::state::{
 use sa_core::runtime::store::{RootMarker, RuntimeStore};
 use sa_core::session::SessionStore;
 use sa_core::skills::SkillRegistry;
+use sa_core::task_audit::{TaskAuditPhase, TaskAuditStore};
 use sa_core::tools::{
     AgentInfo, AgentMessageReceipt, AgentMessageRequest, AgentScope, AskQuestionFn, AskRequest,
     BroadcastAgentsFn, BroadcastAgentsRequest, BroadcastReceipt, GetAgentFn, GetTaskFn,
     ListAgentsFn, ListAgentsRequest, MAX_SUBAGENT_DEPTH, MessageAgentFn, NotifyParentFn,
-    RunSubAgentFn, SendMessageFn, ShowFileFn, StartTerminalTaskFn, StartTerminalTaskRequest,
-    SubAgentHandle, SubAgentRequest, TerminalTaskHandle, TerminalTaskInfo, ToolContext,
-    ToolExecutor, ToolRuntime, TransferInputFn, TransferInputReceipt, TransferInputRequest,
+    PromptProfile, RunSubAgentFn, SendMessageFn, ShowFileFn, StartTerminalTaskFn,
+    StartTerminalTaskRequest, SubAgentHandle, SubAgentRequest, TerminalTaskHandle,
+    TerminalTaskInfo, ToolContext, ToolExecutor, ToolRuntime, TransferInputFn,
+    TransferInputReceipt, TransferInputRequest,
 };
 use sa_core::ws_identity::{
     LocalIdentity, WS_HANDSHAKE_TIMEOUT_SECS, build_hello_reject, build_server_hello,
@@ -295,6 +299,8 @@ struct Hub {
 
     /// Durable append-only interaction history.
     interaction_store: Arc<InteractionStore>,
+    /// Durable append-only background-task audit history.
+    task_audit_store: Arc<TaskAuditStore>,
 
     /// Context used for safe path resolution when preloading files.
     preload_ctx: ToolContext,
@@ -331,6 +337,7 @@ impl Hub {
         preload_ctx: ToolContext,
         session_store: Arc<SessionStore>,
         interaction_store: Arc<InteractionStore>,
+        task_audit_store: Arc<TaskAuditStore>,
         runtime_store: RuntimeStore,
         team_state: TeamState,
         team_cfg: TeamConfig,
@@ -367,6 +374,7 @@ impl Hub {
             pending_questions: Mutex::new(Vec::new()),
             recent_shows: Mutex::new(VecDeque::new()),
             interaction_store,
+            task_audit_store,
             preload_ctx,
             runner,
             agents_md_path,
@@ -1271,6 +1279,9 @@ impl Hub {
         if matches!(state.kind, AgentKind::Root) {
             blocks.push(self.memory_prompt_block(task_id).await);
         }
+        if matches!(state.kind, AgentKind::Worker) {
+            blocks.extend(self.load_subagent_prompt_blocks(state, task_id).await);
+        }
         blocks.push(self.preload_agents_md_references(agents_md).await);
         if !state.active_command_invocations.is_empty() {
             let mut block = String::from("## 已激活命令上下文\n\n");
@@ -1308,6 +1319,84 @@ impl Hub {
         }
 
         blocks.join("\n\n")
+    }
+
+    /// Load worker-only prompt blocks such as persona skill, persona file, and
+    /// parent-provided prompt text.
+    async fn load_subagent_prompt_blocks(&self, state: &AgentState, task_id: Uuid) -> Vec<String> {
+        let mut blocks = Vec::<String>::new();
+
+        if let Some(skill_name) = state.subagent_prompt_skill.as_deref() {
+            match self
+                .preload_ctx
+                .skills
+                .load_skill_file(skill_name, None)
+                .await
+            {
+                Ok((path, content)) => blocks.push(format!(
+                    "## 子代理主人格 Skill\n\n- 名称：`{skill_name}`\n- 文件：`{path}`\n\n{content}",
+                )),
+                Err(err) => {
+                    self.publish(
+                        EventKind::Error,
+                        task_id,
+                        format!("Failed to load subagent prompt skill `{skill_name}`: {err}"),
+                    );
+                }
+            }
+        }
+
+        if let Some(raw_path) = state.subagent_prompt_file.as_deref() {
+            match self.load_workspace_prompt_file(raw_path).await {
+                Ok(content) => blocks.push(format!(
+                    "## 子代理人格提示词文件\n\n- 文件：`{}`\n\n{}",
+                    raw_path.trim(),
+                    content
+                )),
+                Err(err) => {
+                    self.publish(
+                        EventKind::Error,
+                        task_id,
+                        format!("Failed to load subagent prompt file `{raw_path}`: {err}"),
+                    );
+                }
+            }
+        }
+
+        if let Some(prompt) = state.subagent_prompt.as_deref() {
+            let trimmed = prompt.trim();
+            if !trimmed.is_empty() {
+                blocks.push(format!("## 父代理附加提示词\n\n{trimmed}"));
+            }
+        }
+
+        blocks
+    }
+
+    /// Load one workspace text prompt file with the same workspace safety
+    /// boundary used by other file tools.
+    async fn load_workspace_prompt_file(&self, raw_path: &str) -> anyhow::Result<String> {
+        let path = self.preload_ctx.resolve_under_workspace(raw_path)?;
+        let meta = tokio::fs::metadata(&path)
+            .await
+            .with_context(|| format!("Failed to stat prompt file: {}", path.display()))?;
+        if !meta.is_file() {
+            anyhow::bail!(
+                "Prompt file must be a regular file, not a directory: {}",
+                path.display()
+            );
+        }
+        if meta.len() > 200_000 {
+            anyhow::bail!(
+                "Prompt file is too large to inject ({} bytes): {}",
+                meta.len(),
+                path.display()
+            );
+        }
+
+        tokio::fs::read_to_string(&path)
+            .await
+            .with_context(|| format!("Failed to read prompt file: {}", path.display()))
     }
 
     /// Append one assistant control message into the durable session only when
@@ -1709,6 +1798,24 @@ impl Hub {
                     .to_string(),
             );
             self.runtime_store.save_task_state(&task)?;
+            if let Err(err) = self.task_audit_store.append_new(
+                task.task_id,
+                task.owner_agent_id,
+                self.runtime_store
+                    .load_agent_state(task.owner_agent_id)?
+                    .and_then(|owner| owner.active_work_id),
+                TaskAuditPhase::Finished,
+                "terminal",
+                task.command.clone(),
+                task.workdir.clone(),
+                task.output_path.clone(),
+                Some(task.status),
+                task.exit_code,
+                task.metadata.get("safety_warning").cloned(),
+                task.summary.clone(),
+            ) {
+                tracing::warn!("Failed to append recovered task audit entry: {err:#}");
+            }
             let owner_work_id = self
                 .runtime_store
                 .load_agent_state(task.owner_agent_id)?
@@ -2016,12 +2123,12 @@ impl Hub {
         self.running_agents.lock().await.remove(&agent_id);
         let mut state = self.load_agent_state_required(agent_id)?;
         self.sync_agent_session_paths(&mut state, &session_store)?;
-        if let Some(offset) = max_offset {
-            state.last_mailbox_offset = offset;
-        }
 
         match quantum {
             Ok(quantum) => {
+                if let Some(offset) = max_offset {
+                    state.last_mailbox_offset = offset;
+                }
                 state.tool_session_read_set = quantum
                     .tool_session
                     .readable_paths()
@@ -2115,6 +2222,9 @@ impl Hub {
             }
             Err(err) => {
                 if cancel_token.is_cancelled() {
+                    if let Some(offset) = max_offset {
+                        state.last_mailbox_offset = offset;
+                    }
                     state.status = AgentStatus::Idle;
                     state.needs_finish_reminder = false;
                     self.runtime_store.save_agent_state(&state)?;
@@ -2132,9 +2242,15 @@ impl Hub {
                     return Ok(false);
                 }
 
-                state.status = AgentStatus::Failed;
+                state.status = AgentStatus::Idle;
                 self.runtime_store.save_agent_state(&state)?;
-                self.publish(EventKind::Error, work_id, format!("Task crashed: {err:#}"));
+                self.publish(
+                    EventKind::Error,
+                    work_id,
+                    format!(
+                        "Task crashed and mailbox state was preserved for retry/recovery: {err:#}"
+                    ),
+                );
                 Ok(false)
             }
         }
@@ -2147,12 +2263,20 @@ impl Hub {
         request: StartTerminalTaskRequest,
     ) -> anyhow::Result<TerminalTaskHandle> {
         let task_id = Uuid::new_v4();
+        let owner_work_id = self
+            .runtime_store
+            .load_agent_state(owner_agent_id)?
+            .and_then(|owner| owner.active_work_id);
         let output_path = self
             .runtime_store
             .runtime_dir()
             .join("tasks")
             .join(format!("{task_id}.log"));
         let output_path_string = output_path.display().to_string();
+        let mut metadata = std::collections::BTreeMap::new();
+        if let Some(warning) = request.safety_warning.clone() {
+            metadata.insert("safety_warning".to_string(), warning);
+        }
         let initial = RuntimeTaskState {
             task_id,
             owner_agent_id,
@@ -2165,11 +2289,26 @@ impl Hub {
             exit_code: None,
             output_path: Some(output_path_string.clone()),
             summary: None,
-            metadata: Default::default(),
+            metadata,
         };
         self.runtime_store.save_task_state(&initial)?;
+        self.task_audit_store.append_new(
+            task_id,
+            owner_agent_id,
+            owner_work_id,
+            TaskAuditPhase::Started,
+            "terminal",
+            request.command.clone(),
+            request.workdir.clone(),
+            Some(output_path_string.clone()),
+            Some(RuntimeTaskStatus::Running),
+            None,
+            request.safety_warning.clone(),
+            None,
+        )?;
 
         let store = self.runtime_store.clone();
+        let task_audit_store = Arc::clone(&self.task_audit_store);
         let hub = Arc::clone(self);
         tokio::spawn(async move {
             let result = run_background_bash_command(&request, &output_path).await;
@@ -2200,6 +2339,22 @@ impl Hub {
                     None
                 }
             };
+            if let Err(err) = task_audit_store.append_new(
+                task_id,
+                owner_agent_id,
+                owner_work_id,
+                TaskAuditPhase::Finished,
+                "terminal",
+                state.command.clone(),
+                state.workdir.clone(),
+                state.output_path.clone(),
+                Some(state.status),
+                state.exit_code,
+                state.metadata.get("safety_warning").cloned(),
+                state.summary.clone(),
+            ) {
+                tracing::warn!("Failed to append task audit entry: {err:#}");
+            }
             if let Err(err) = hub
                 .append_mailbox_message(
                     owner_agent_id,
@@ -2549,6 +2704,11 @@ impl Hub {
             parent_agent_id,
             root_agent_id,
             runtime_label,
+            if is_root {
+                PromptProfile::Root
+            } else {
+                PromptProfile::SubAgent
+            },
             is_root,
             holds_input_ownership,
             allow_finish_without_output,
@@ -2589,6 +2749,33 @@ impl Hub {
         request.validate()?;
 
         let parent_state = self.load_agent_state_required(parent_agent_id)?;
+        let normalized_prompt = request
+            .prompt
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string);
+        let normalized_prompt_file = match request.prompt_file.as_deref() {
+            Some(raw_path) => {
+                let trimmed = raw_path.trim();
+                let _ = self.load_workspace_prompt_file(trimmed).await?;
+                Some(trimmed.to_string())
+            }
+            None => None,
+        };
+        let prompt_skill_reminder = match request.prompt_skill.as_deref() {
+            Some(raw_name) => {
+                let trimmed = raw_name.trim();
+                let Some(skill) = self.preload_ctx.skills.get(trimmed) else {
+                    anyhow::bail!("SubAgent prompt_skill not found: {trimmed}");
+                };
+                Some((trimmed.to_string(), skill.reminder()))
+            }
+            None => None,
+        };
+        let normalized_prompt_skill = prompt_skill_reminder
+            .as_ref()
+            .map(|(skill_name, _)| skill_name.clone());
         let child_depth = self.agent_depth(parent_agent_id)?.saturating_add(1);
         if child_depth > MAX_SUBAGENT_DEPTH {
             anyhow::bail!(
@@ -2639,6 +2826,9 @@ impl Hub {
                     || existing.allow_user_show != request.allow_user_show
                     || existing.allow_user_ask != request.allow_user_ask
                     || existing.allow_input_transfer_target != request.allow_input_transfer_target
+                    || existing.subagent_prompt != normalized_prompt
+                    || existing.subagent_prompt_file != normalized_prompt_file
+                    || existing.subagent_prompt_skill != normalized_prompt_skill
                 {
                     anyhow::bail!(
                         "SubAgent may not reuse an agent with different capability settings"
@@ -2663,6 +2853,9 @@ impl Hub {
                 request.allow_user_show,
                 request.allow_user_ask,
                 request.allow_input_transfer_target,
+                normalized_prompt.clone(),
+                normalized_prompt_file.clone(),
+                normalized_prompt_skill.clone(),
                 child_session_store.current_session_path(),
             ),
         };
@@ -2682,6 +2875,15 @@ impl Hub {
         child_state.pending_control = None;
         child_state.waiting_on = None;
         child_state.status = AgentStatus::Idle;
+        child_state.subagent_prompt = normalized_prompt;
+        child_state.subagent_prompt_file = normalized_prompt_file;
+        child_state.subagent_prompt_skill = normalized_prompt_skill;
+        if let Some((_skill_name, reminder)) = prompt_skill_reminder {
+            child_state
+                .active_command_invocations
+                .retain(|invocation| invocation.name != reminder.name);
+            child_state.active_command_invocations.push(reminder);
+        }
         self.persist_started_work(
             child_state.agent_id,
             child_state.root_agent_id,
@@ -3096,6 +3298,11 @@ impl Hub {
             } else {
                 format!("subagent-depth-{depth}")
             },
+            if depth == 0 {
+                PromptProfile::Root
+            } else {
+                PromptProfile::SubAgent
+            },
             depth == 0,
             depth == 0,
             false,
@@ -3213,6 +3420,7 @@ impl Hub {
             None,
             task_id,
             label.to_string(),
+            PromptProfile::Background,
             true,
             false,
             false,
@@ -3788,13 +3996,7 @@ async fn build_runtime_from_config(
     cfg: Config,
     config_path: &Path,
 ) -> anyhow::Result<LoadedRuntime> {
-    let config_dir = std::path::absolute(config_path.parent().unwrap_or_else(|| Path::new(".")))
-        .with_context(|| {
-            format!(
-                "Failed to resolve config directory for {}",
-                config_path.display()
-            )
-        })?;
+    let config_dir = resolve_config_file_dir(config_path)?;
     let bind = cfg.server.bind.clone();
     let ws_path = cfg.server.ws_path.clone();
 
@@ -3895,6 +4097,7 @@ async fn build_runtime_from_config(
     let preload_ctx = tool_ctx.clone();
     let session_store = Arc::new(SessionStore::new(preload_ctx.workspace_root.clone())?);
     let interaction_store = Arc::new(InteractionStore::new(preload_ctx.workspace_root.clone())?);
+    let task_audit_store = Arc::new(TaskAuditStore::new(preload_ctx.workspace_root.clone())?);
     let tools = ToolExecutor::new(tool_ctx, mcp_registry);
 
     // Build LLM client.
@@ -3925,6 +4128,7 @@ async fn build_runtime_from_config(
         preload_ctx,
         session_store,
         interaction_store,
+        task_audit_store,
         runtime_store,
         team_state,
         cfg.team.clone(),
@@ -4217,6 +4421,33 @@ fn candidate_bash_programs() -> Vec<PathBuf> {
     out
 }
 
+/// Pump one child-process pipe into the central log writer channel.
+///
+/// The background task runtime keeps a single on-disk log file. Stdout and
+/// stderr are read concurrently in small chunks and forwarded to the main task,
+/// which serializes them into that file. This keeps output visible while the
+/// process is still running instead of buffering everything until exit.
+async fn stream_background_pipe_to_channel<R>(
+    mut reader: R,
+    tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+) -> std::io::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt as _;
+
+    let mut buffer = vec![0_u8; 8192];
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            return Ok(());
+        }
+        if tx.send(buffer[..read].to_vec()).is_err() {
+            return Ok(());
+        }
+    }
+}
+
 /// Run one background Bash command and tee stdout/stderr into one log file.
 async fn run_background_bash_command(
     request: &StartTerminalTaskRequest,
@@ -4224,6 +4455,7 @@ async fn run_background_bash_command(
 ) -> anyhow::Result<i32> {
     use tokio::io::AsyncWriteExt as _;
     use tokio::process::Command;
+    use tokio::sync::mpsc;
 
     if let Some(parent) = output_path.parent() {
         tokio::fs::create_dir_all(parent).await.with_context(|| {
@@ -4246,54 +4478,168 @@ async fn run_background_bash_command(
         cmd.arg("-lc");
         cmd.arg(&request.command);
         cmd.current_dir(&request.workdir);
-        cmd.kill_on_drop(false);
+        cmd.kill_on_drop(true);
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
 
-        match tokio::time::timeout(timeout, cmd.output()).await {
-            Ok(Ok(output)) => {
-                let mut file = tokio::fs::File::create(output_path)
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "Failed to create background task log: {}",
-                            output_path.display()
-                        )
-                    })?;
-                file.write_all(&output.stdout).await.with_context(|| {
-                    format!("Failed to write stdout log: {}", output_path.display())
-                })?;
-                if !output.stdout.is_empty() && !output.stderr.is_empty() {
-                    file.write_all(b"\n").await.with_context(|| {
-                        format!("Failed to write log separator: {}", output_path.display())
-                    })?;
-                }
-                file.write_all(&output.stderr).await.with_context(|| {
-                    format!("Failed to write stderr log: {}", output_path.display())
-                })?;
-                file.flush().await.with_context(|| {
-                    format!(
-                        "Failed to flush background task log: {}",
-                        output_path.display()
-                    )
-                })?;
-                return Ok(output.status.code().unwrap_or(-1));
-            }
-            Ok(Err(err)) if err.kind() == std::io::ErrorKind::NotFound => {
+        let mut child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 last_not_found = Some(anyhow::Error::new(err).context(format!(
                     "Bash executable not found at {}",
                     program.display()
                 )));
+                continue;
             }
-            Ok(Err(err)) => {
+            Err(err) => {
                 return Err(anyhow::Error::new(err))
                     .with_context(|| format!("Failed to execute Bash via {}", program.display()));
             }
-            Err(_) => {
-                return Err(anyhow::anyhow!(
-                    "Background Bash command timed out after {:?}",
-                    timeout
-                ));
+        };
+
+        let stdout = child.stdout.take().with_context(|| {
+            format!(
+                "Failed to capture stdout for background Bash via {}",
+                program.display()
+            )
+        })?;
+        let stderr = child.stderr.take().with_context(|| {
+            format!(
+                "Failed to capture stderr for background Bash via {}",
+                program.display()
+            )
+        })?;
+
+        let mut file = match tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(output_path)
+            .await
+        {
+            Ok(file) => file,
+            Err(err) => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                return Err(anyhow::Error::new(err).context(format!(
+                    "Failed to create background task log securely: {}",
+                    output_path.display()
+                )));
+            }
+        };
+
+        let (chunk_tx, mut chunk_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let stdout_task = {
+            let tx = chunk_tx.clone();
+            tokio::spawn(async move { stream_background_pipe_to_channel(stdout, tx).await })
+        };
+        let stderr_task = {
+            let tx = chunk_tx.clone();
+            tokio::spawn(async move { stream_background_pipe_to_channel(stderr, tx).await })
+        };
+        drop(chunk_tx);
+
+        let mut timed_out = false;
+        let mut child_status: Option<std::process::ExitStatus> = None;
+        let mut streams_closed = false;
+        let timeout_sleep = tokio::time::sleep(timeout);
+        tokio::pin!(timeout_sleep);
+        let mut poll_interval = tokio::time::interval(std::time::Duration::from_millis(25));
+        poll_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            if child_status.is_some() && streams_closed {
+                break;
+            }
+
+            tokio::select! {
+                maybe_chunk = chunk_rx.recv(), if !streams_closed => {
+                    match maybe_chunk {
+                        Some(chunk) => {
+                            file.write_all(&chunk).await.with_context(|| {
+                                format!("Failed to append streamed log: {}", output_path.display())
+                            })?;
+                            file.flush().await.with_context(|| {
+                                format!("Failed to flush background task log: {}", output_path.display())
+                            })?;
+                        }
+                        None => {
+                            streams_closed = true;
+                        }
+                    }
+                }
+                _ = poll_interval.tick(), if child_status.is_none() => {
+                    child_status = child.try_wait().with_context(|| {
+                        format!("Failed to poll background Bash via {}", program.display())
+                    })?;
+                }
+                _ = &mut timeout_sleep, if !timed_out && child_status.is_none() => {
+                    timed_out = true;
+                    match child.kill().await {
+                        Ok(()) => {}
+                        Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {}
+                        Err(err) => {
+                            return Err(anyhow::Error::new(err)).with_context(|| {
+                                format!(
+                                    "Failed to terminate timed-out background Bash via {}",
+                                    program.display()
+                                )
+                            });
+                        }
+                    }
+                    child_status = Some(child.wait().await.with_context(|| {
+                        format!(
+                            "Failed to wait for timed-out background Bash via {}",
+                            program.display()
+                        )
+                    })?);
+                }
+            }
+
+            if child_status.is_none() {
+                child_status = child.try_wait().with_context(|| {
+                    format!("Failed to poll background Bash via {}", program.display())
+                })?;
             }
         }
+
+        for (label, task) in [("stdout", stdout_task), ("stderr", stderr_task)] {
+            match task.await {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    return Err(anyhow::Error::new(err)).with_context(|| {
+                        format!(
+                            "Failed while streaming background {label} for Bash via {}",
+                            program.display()
+                        )
+                    });
+                }
+                Err(err) => {
+                    return Err(anyhow::Error::new(err)).with_context(|| {
+                        format!(
+                            "Background {label} stream task crashed for Bash via {}",
+                            program.display()
+                        )
+                    });
+                }
+            }
+        }
+
+        file.flush().await.with_context(|| {
+            format!(
+                "Failed to flush background task log: {}",
+                output_path.display()
+            )
+        })?;
+
+        if timed_out {
+            return Err(anyhow::anyhow!(
+                "Background Bash command timed out after {:?}",
+                timeout
+            ));
+        }
+
+        let status = child_status.expect("background Bash loop must observe child exit");
+        return Ok(status.code().unwrap_or(-1));
     }
 
     Err(last_not_found.unwrap_or_else(|| {
@@ -5090,7 +5436,14 @@ mod tests {
 
     /// Minimal `Hub` factory for WS handshake tests.
     fn build_test_hub(workspace: &TempDir) -> Arc<Hub> {
-        let skills = Arc::new(SkillRegistry::scan(&[]).expect("empty skill registry should build"));
+        build_test_hub_with_skill_dirs(workspace, &[])
+    }
+
+    /// Variant of the test hub that scans explicit skill directories.
+    fn build_test_hub_with_skill_dirs(workspace: &TempDir, skill_dirs: &[PathBuf]) -> Arc<Hub> {
+        let skills = Arc::new(
+            SkillRegistry::scan(skill_dirs).expect("skill registry should build for test hub"),
+        );
         let tool_ctx = ToolContext::new(workspace.path().to_path_buf(), Arc::clone(&skills))
             .expect("tool context should build for temp workspace");
         let preload_ctx = tool_ctx.clone();
@@ -5101,6 +5454,10 @@ mod tests {
         let interaction_store = Arc::new(
             InteractionStore::new(preload_ctx.workspace_root.clone())
                 .expect("interaction store should build for temp workspace"),
+        );
+        let task_audit_store = Arc::new(
+            TaskAuditStore::new(preload_ctx.workspace_root.clone())
+                .expect("task audit store should build for temp workspace"),
         );
         let tools = ToolExecutor::new(tool_ctx, None);
         let llm = OpenAiClient::new("http://127.0.0.1:1".to_string(), "test-key".to_string())
@@ -5144,6 +5501,7 @@ mod tests {
             preload_ctx,
             session_store,
             interaction_store,
+            task_audit_store,
             runtime_store,
             team_state,
             TeamConfig::default(),
@@ -5205,6 +5563,251 @@ mod tests {
             _workspace: workspace,
             task,
         }
+    }
+
+    /// Return whether the current machine exposes a usable Git-Bash style shell
+    /// for background-task integration tests. Some CI environments may not have
+    /// Bash available, so those tests degrade to a no-op instead of producing a
+    /// misleading failure unrelated to the streaming logic under test.
+    async fn has_background_bash_for_tests() -> bool {
+        for program in candidate_bash_programs() {
+            match tokio::process::Command::new(&program)
+                .arg("-lc")
+                .arg("printf ok")
+                .output()
+                .await
+            {
+                Ok(output) if output.status.success() && output.stdout == b"ok" => return true,
+                Ok(_) => continue,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => continue,
+            }
+        }
+
+        false
+    }
+
+    #[tokio::test]
+    async fn background_bash_writes_output_incrementally_before_process_exit() {
+        if !has_background_bash_for_tests().await {
+            return;
+        }
+
+        let workspace = TempDir::new().expect("temp workspace should build");
+        let output_path = workspace.path().join("background-task.log");
+        let request = StartTerminalTaskRequest {
+            command: "printf start; sleep 1; printf end".to_string(),
+            workdir: workspace.path().display().to_string(),
+            timeout_seconds: Some(10),
+            safety_warning: None,
+        };
+
+        let request_for_task = request.clone();
+        let output_for_task = output_path.clone();
+        let task = tokio::spawn(async move {
+            run_background_bash_command(&request_for_task, &output_for_task).await
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        let partial = String::from_utf8_lossy(
+            &tokio::fs::read(&output_path)
+                .await
+                .expect("partial log should exist before command exit"),
+        )
+        .into_owned();
+        assert!(
+            partial.contains("start"),
+            "expected partial log to contain the early stdout chunk, got: {partial:?}"
+        );
+        assert!(
+            !partial.contains("end"),
+            "partial log should not already contain the trailing chunk: {partial:?}"
+        );
+
+        let exit_code = task
+            .await
+            .expect("background command join should succeed")
+            .expect("background command should exit successfully");
+        assert_eq!(exit_code, 0);
+
+        let final_log = String::from_utf8_lossy(
+            &tokio::fs::read(&output_path)
+                .await
+                .expect("final log should read"),
+        )
+        .into_owned();
+        assert!(final_log.contains("start"));
+        assert!(final_log.contains("end"));
+    }
+
+    #[tokio::test]
+    async fn background_bash_timeout_keeps_partial_output_without_trailing_tail() {
+        if !has_background_bash_for_tests().await {
+            return;
+        }
+
+        let workspace = TempDir::new().expect("temp workspace should build");
+        let output_path = workspace.path().join("background-timeout.log");
+        let request = StartTerminalTaskRequest {
+            command: "printf start; sleep 3; printf end".to_string(),
+            workdir: workspace.path().display().to_string(),
+            timeout_seconds: Some(1),
+            safety_warning: None,
+        };
+
+        let err = run_background_bash_command(&request, &output_path)
+            .await
+            .expect_err("command should time out");
+        let err_text = format!("{err:#}");
+        assert!(
+            err_text.contains("timed out"),
+            "unexpected error: {err_text}"
+        );
+
+        let partial = String::from_utf8_lossy(
+            &tokio::fs::read(&output_path)
+                .await
+                .expect("timeout should still leave a streamed log"),
+        )
+        .into_owned();
+        assert!(partial.contains("start"));
+        assert!(
+            !partial.contains("end"),
+            "timed-out command should not flush trailing output after kill: {partial:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_subagent_persists_prompt_configuration_and_persona_skill() {
+        let workspace = TempDir::new().expect("temp workspace should be created");
+        let skill_dir = workspace.path().join("skills").join("role").join("teacher");
+        std::fs::create_dir_all(&skill_dir).expect("create skill dir");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            r#"---
+name: teacher
+description: Teaches patiently
+allowed-tools:
+  - Read
+model: gpt-5.4
+effort: high
+---
+
+你是一个耐心、清晰、循序渐进的老师。
+"#,
+        )
+        .expect("write teacher skill");
+        std::fs::write(
+            workspace.path().join("DESIGNER.md"),
+            "你是一位注重细节与版式的设计师。",
+        )
+        .expect("write prompt file");
+
+        let hub = build_test_hub_with_skill_dirs(&workspace, &[workspace.path().join("skills")]);
+        let root_agent_id = hub
+            .runtime_store
+            .load_root_marker()
+            .expect("root marker should load")
+            .expect("root marker should exist")
+            .root_agent_id;
+
+        let handle = hub
+            .run_durable_subagent(
+                root_agent_id,
+                Uuid::new_v4(),
+                SubAgentRequest {
+                    label: Some("designer-teacher".to_string()),
+                    task: "完成界面设计".to_string(),
+                    context: "聚焦布局与教学表达".to_string(),
+                    prompt: Some("你必须始终先给出结构化思路，再给出细节。".to_string()),
+                    prompt_file: Some("DESIGNER.md".to_string()),
+                    prompt_skill: Some("role:teacher".to_string()),
+                    allow_user_send: false,
+                    allow_user_show: false,
+                    allow_user_ask: false,
+                    allow_input_transfer_target: false,
+                    existing_agent_id: None,
+                },
+                sa_core::cancel::cancel_pair().1,
+            )
+            .await
+            .expect("subagent should start");
+
+        let state = hub
+            .runtime_store
+            .load_agent_state(handle.agent_id)
+            .expect("agent state load should succeed")
+            .expect("child agent state should exist");
+
+        assert_eq!(
+            state.subagent_prompt.as_deref(),
+            Some("你必须始终先给出结构化思路，再给出细节。")
+        );
+        assert_eq!(state.subagent_prompt_file.as_deref(), Some("DESIGNER.md"));
+        assert_eq!(state.subagent_prompt_skill.as_deref(), Some("role:teacher"));
+        assert!(
+            state
+                .active_command_invocations
+                .iter()
+                .any(|invocation| invocation.name == "role:teacher")
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_extra_prompt_includes_prompt_file_and_prompt_skill_content() {
+        let workspace = TempDir::new().expect("temp workspace should be created");
+        let skill_dir = workspace.path().join("skills").join("role").join("teacher");
+        std::fs::create_dir_all(&skill_dir).expect("create skill dir");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            r#"---
+name: teacher
+description: Teaches patiently
+---
+
+你是一位会先讲概念、再讲例子的老师。
+"#,
+        )
+        .expect("write teacher skill");
+        std::fs::write(
+            workspace.path().join("DESIGNER.md"),
+            "你是一位会先做版式骨架再补视觉细节的设计师。",
+        )
+        .expect("write prompt file");
+
+        let hub = build_test_hub_with_skill_dirs(&workspace, &[workspace.path().join("skills")]);
+        let state = AgentState {
+            subagent_prompt: Some("始终先输出提纲。".to_string()),
+            subagent_prompt_file: Some("DESIGNER.md".to_string()),
+            subagent_prompt_skill: Some("role:teacher".to_string()),
+            ..AgentState::new_child(
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                "worker".to_string(),
+                false,
+                false,
+                false,
+                false,
+                None,
+                None,
+                None,
+                "sessions/agents/test.jsonl".to_string(),
+            )
+        };
+        let agents_md = sa_core::agents_md::AgentsMd {
+            path: workspace.path().join("AGENTS.md"),
+            content: "主项目约束".to_string(),
+            found: true,
+        };
+
+        let extra = hub
+            .build_agent_extra_prompt(&state, Uuid::new_v4(), &agents_md)
+            .await;
+
+        assert!(extra.contains("始终先输出提纲"));
+        assert!(extra.contains("版式骨架"));
+        assert!(extra.contains("先讲概念、再讲例子"));
     }
 
     /// Connect one tungstenite client to the ephemeral test server.

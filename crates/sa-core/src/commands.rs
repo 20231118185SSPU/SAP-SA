@@ -294,12 +294,23 @@ impl CommandRegistry {
                 continue;
             }
 
-            for entry in walkdir::WalkDir::new(dir).follow_links(true) {
+            let scan_root = std::fs::canonicalize(dir).with_context(|| {
+                format!("Failed to canonicalize skill scan dir {}", dir.display())
+            })?;
+
+            for entry in walkdir::WalkDir::new(&scan_root).follow_links(true) {
                 let entry = entry?;
                 if !entry.file_type().is_file() || entry.file_name() != "SKILL.md" {
                     continue;
                 }
 
+                let logical_skill_dir = entry
+                    .path()
+                    .parent()
+                    .ok_or_else(|| anyhow::anyhow!("SKILL.md has no parent directory"))?
+                    .strip_prefix(&scan_root)
+                    .ok()
+                    .map(Path::to_path_buf);
                 let skill_md_path = std::fs::canonicalize(entry.path()).with_context(|| {
                     format!("Failed to canonicalize {}", entry.path().display())
                 })?;
@@ -311,6 +322,7 @@ impl CommandRegistry {
                     &skill_md_path,
                     Some(root_dir),
                     CommandSource::LocalSkill,
+                    logical_skill_dir.as_deref(),
                 )
                 .with_context(|| format!("Failed to load {}", skill_md_path.display()))?;
                 registry
@@ -485,6 +497,7 @@ fn load_markdown_command(
     markdown_path: &Path,
     root_dir: Option<PathBuf>,
     source: CommandSource,
+    logical_skill_dir: Option<&Path>,
 ) -> anyhow::Result<CommandSpec> {
     let raw = std::fs::read_to_string(markdown_path)?;
     let Some(frontmatter_raw) = extract_yaml_frontmatter(&raw) else {
@@ -495,13 +508,13 @@ fn load_markdown_command(
     let body = strip_yaml_frontmatter(&raw)
         .ok_or_else(|| anyhow::anyhow!("SKILL.md missing markdown body"))?;
 
-    let name = frontmatter
+    let raw_name = frontmatter
         .name
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("Command frontmatter must define `name`"))?
-        .to_string();
+        .ok_or_else(|| anyhow::anyhow!("Command frontmatter must define `name`"))?;
+    let name = derive_command_name(raw_name, logical_skill_dir)?;
     let description = frontmatter
         .description
         .as_deref()
@@ -582,6 +595,47 @@ fn expand_command_body(
     Ok(out)
 }
 
+/// Derive the canonical command name used inside SA.
+///
+/// Naming rules:
+/// - flat skills keep their existing leaf name, for example `brainstorming`
+/// - nested skill directories become colon-qualified, for example
+///   `superpowers/brainstorming/SKILL.md` => `superpowers:brainstorming`
+/// - if frontmatter already provides an explicit colon-qualified name, keep it
+fn derive_command_name(raw_name: &str, logical_skill_dir: Option<&Path>) -> anyhow::Result<String> {
+    let raw_name = raw_name.trim();
+    if raw_name.is_empty() {
+        anyhow::bail!("Command name must not be empty");
+    }
+
+    if raw_name.contains(':') {
+        let explicit = raw_name
+            .split(':')
+            .map(normalize_command_name_segment)
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        return Ok(explicit.join(":"));
+    }
+
+    let mut parts = logical_skill_dir
+        .and_then(Path::parent)
+        .map(command_namespace_parts_from_path)
+        .transpose()?
+        .unwrap_or_default();
+    parts.push(normalize_command_name_segment(raw_name)?);
+    Ok(parts.join(":"))
+}
+
+/// Convert a relative skill parent directory into colon namespace segments.
+fn command_namespace_parts_from_path(path: &Path) -> anyhow::Result<Vec<String>> {
+    path.components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(part) => Some(part.to_string_lossy().to_string()),
+            _ => None,
+        })
+        .map(|segment| normalize_command_name_segment(&segment))
+        .collect()
+}
+
 /// Extract YAML frontmatter from the top of a markdown file.
 fn extract_yaml_frontmatter(raw: &str) -> Option<String> {
     let mut lines = raw.lines();
@@ -628,6 +682,23 @@ fn normalize_optional(value: Option<String>) -> Option<String> {
     value
         .map(|raw| raw.trim().to_string())
         .filter(|raw| !raw.is_empty())
+}
+
+/// Normalize one command-name segment used inside a colon-qualified command
+/// name such as `superpowers:brainstorming`.
+fn normalize_command_name_segment(raw: &str) -> anyhow::Result<String> {
+    let normalized = raw.trim();
+    if normalized.is_empty() {
+        anyhow::bail!("Command name segment must not be empty");
+    }
+    if normalized.contains('/') || normalized.contains('\\') {
+        anyhow::bail!("Command name segment must not contain path separators");
+    }
+    if normalized.contains(':') {
+        anyhow::bail!("Command name segment must not contain `:`");
+    }
+
+    Ok(normalized.to_string())
 }
 
 /// Normalize one skill-relative path and reject traversal.
@@ -815,6 +886,58 @@ Write about $topic from ${SA_SKILL_DIR} in session ${SA_SESSION_ID}.
         assert_eq!(command.effort.as_deref(), Some("high"));
         assert_eq!(command.paths, vec!["docs/**"]);
         assert_eq!(command.shell.as_deref(), Some("bash"));
+    }
+
+    #[test]
+    fn nested_skill_scan_uses_colon_namespaces_from_path() {
+        let root = unique_temp_dir();
+        let skill_dir = root.join("superpowers").join("brainstorming");
+        fs::create_dir_all(&skill_dir).expect("create nested skill dir");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            r#"---
+name: brainstorming
+description: Explores task design before implementation
+---
+
+# Brainstorming
+"#,
+        )
+        .expect("write nested skill");
+
+        let registry = CommandRegistry::scan(&[root]).expect("scan commands");
+        assert!(registry.get("brainstorming").is_none());
+        let command = registry
+            .get("superpowers:brainstorming")
+            .expect("nested skill should be namespaced");
+        assert_eq!(
+            command.description,
+            "Explores task design before implementation"
+        );
+    }
+
+    #[test]
+    fn explicit_colon_name_in_frontmatter_is_preserved() {
+        let root = unique_temp_dir();
+        let skill_dir = root.join("superpowers").join("brainstorming");
+        fs::create_dir_all(&skill_dir).expect("create nested skill dir");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            r#"---
+name: superpowers:brainstorming
+description: Explicit namespaced skill
+---
+
+# Brainstorming
+"#,
+        )
+        .expect("write nested skill");
+
+        let registry = CommandRegistry::scan(&[root]).expect("scan commands");
+        let command = registry
+            .get("superpowers:brainstorming")
+            .expect("explicit namespaced skill should load");
+        assert_eq!(command.description, "Explicit namespaced skill");
     }
 
     #[test]

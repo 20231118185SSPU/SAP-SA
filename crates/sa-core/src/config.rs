@@ -533,16 +533,34 @@ pub fn load_config_from_file(path: &Path) -> anyhow::Result<Config> {
     // Parse TOML into typed config.
     let mut config = toml::from_str::<Config>(&raw)
         .with_context(|| format!("Failed to parse TOML config file: {}", path.display()))?;
-    let config_file_dir = std::path::absolute(path.parent().unwrap_or_else(|| Path::new(".")))
-        .with_context(|| {
-            format!(
-                "Failed to resolve config file directory for {}",
-                path.display()
-            )
-        })?;
+    let config_file_dir = resolve_config_file_dir(path)?;
     normalize_mcp_config_paths(&mut config.mcp, &config_file_dir)?;
     validate_mcp_config(&config.mcp)?;
     Ok(config)
+}
+
+/// Resolve the directory containing one config file path.
+///
+/// Important edge case:
+/// - `Path::new("sa.toml").parent()` may behave like an empty path on some
+///   platforms
+/// - `std::path::absolute("")` then fails with
+///   "cannot make an empty path absolute"
+///
+/// So a bare relative filename must be treated as `./sa.toml`, whose parent is
+/// the current working directory.
+pub fn resolve_config_file_dir(path: &Path) -> anyhow::Result<PathBuf> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+
+    std::path::absolute(parent).with_context(|| {
+        format!(
+            "Failed to resolve config file directory for {}",
+            path.display()
+        )
+    })
 }
 
 /// Best-effort expansion of `~` (tilde) to the current user's home directory.
@@ -717,11 +735,12 @@ fn validate_mcp_config(config: &McpConfig) -> anyhow::Result<()> {
 mod tests {
     use super::{
         Config, LlmConfig, McpConfig, McpServerConfig, McpTransport, PermissionMode, TeamConfig,
-        load_config_from_file, validate_mcp_config,
+        load_config_from_file, resolve_config_file_dir, validate_mcp_config,
     };
     use crate::openai::{AuthStyle, WireApi};
     use std::collections::HashMap;
     use std::fs;
+    use std::path::Path;
     use tempfile::TempDir;
 
     fn sample_llm() -> LlmConfig {
@@ -1256,6 +1275,14 @@ cwd = "mcp-workdir"
             load_config_from_file(&config_path).expect("config with relative cwd should load");
         assert_eq!(cfg.mcp.servers.len(), 1);
         assert_eq!(cfg.mcp.servers[0].cwd.as_deref(), Some(mcp_cwd.as_path()));
+    }
+
+    #[test]
+    fn resolve_config_file_dir_handles_relative_leaf_filename() {
+        let resolved =
+            resolve_config_file_dir(Path::new("sa.toml")).expect("relative sa.toml should resolve");
+        let current = std::path::absolute(Path::new(".")).expect("cwd should resolve");
+        assert_eq!(resolved, current);
     }
 
     #[test]

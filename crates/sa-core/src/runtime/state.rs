@@ -193,6 +193,15 @@ pub struct AgentState {
     pub allow_user_ask: bool,
     /// Whether root may transfer input ownership to this agent.
     pub allow_input_transfer_target: bool,
+    /// Optional direct parent-provided prompt block for ordinary sub-agents.
+    #[serde(default)]
+    pub subagent_prompt: Option<String>,
+    /// Optional workspace prompt file for ordinary sub-agents.
+    #[serde(default)]
+    pub subagent_prompt_file: Option<String>,
+    /// Optional persona skill name for ordinary sub-agents.
+    #[serde(default)]
+    pub subagent_prompt_skill: Option<String>,
     /// Active session file path for this agent.
     pub current_session_path: String,
     /// Previous compacted-away session file path for this agent.
@@ -258,6 +267,9 @@ impl AgentState {
             allow_user_show: true,
             allow_user_ask: true,
             allow_input_transfer_target: false,
+            subagent_prompt: None,
+            subagent_prompt_file: None,
+            subagent_prompt_skill: None,
             current_session_path,
             previous_session_path: None,
             tool_session_read_set: Vec::new(),
@@ -292,6 +304,9 @@ impl AgentState {
         allow_user_show: bool,
         allow_user_ask: bool,
         allow_input_transfer_target: bool,
+        subagent_prompt: Option<String>,
+        subagent_prompt_file: Option<String>,
+        subagent_prompt_skill: Option<String>,
         current_session_path: String,
     ) -> Self {
         Self {
@@ -305,6 +320,9 @@ impl AgentState {
             allow_user_show,
             allow_user_ask,
             allow_input_transfer_target,
+            subagent_prompt,
+            subagent_prompt_file,
+            subagent_prompt_skill,
             current_session_path,
             previous_session_path: None,
             tool_session_read_set: Vec::new(),

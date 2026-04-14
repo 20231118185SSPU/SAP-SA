@@ -21,8 +21,9 @@ use chrono::{DateTime, Duration, Local, LocalResult, NaiveDate, TimeZone};
 use fs4::fs_std::FileExt as _;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
-use std::io::Write as _;
+use std::io::{BufRead as _, BufReader, Write as _};
 use std::path::{Path, PathBuf};
+use walkdir::WalkDir;
 
 /// Relative directory that stores curated topic memory.
 pub const DREAM_TOPIC_MEMORY_DIR: &str = "memory/topics";
@@ -150,15 +151,31 @@ impl DreamManager {
     /// Current policy:
     /// - if disabled, never run
     /// - otherwise run at most once per local calendar date
-    /// - this naturally supports "startup catch-up": if the daemon starts later
-    ///   the same day and no successful dream exists for today, a run is due
+    /// - a workspace that has already completed at least one dream keeps the
+    ///   old "startup catch-up" behavior
+    /// - a never-processed workspace only catches up when substantive memory or
+    ///   session history already exists; an auto-created empty bootstrap
+    ///   session must not trigger dream by itself
     pub fn should_run_now(&self, now: DateTime<Local>) -> anyhow::Result<bool> {
         if !self.cfg.enabled {
             return Ok(false);
         }
 
         let state = self.load_state()?;
-        Ok(state.last_success_local_date.as_deref() != Some(&now.date_naive().to_string()))
+        let today = now.date_naive().to_string();
+        if state.last_success_local_date.as_deref() == Some(today.as_str()) {
+            return Ok(false);
+        }
+
+        if state.last_success_local_date.is_some() {
+            return Ok(true);
+        }
+
+        let sources = self.collect_sources(now)?;
+        Ok(sources.memory_index.is_some()
+            || !sources.topic_files.is_empty()
+            || !sources.daily_notes.is_empty()
+            || !sources.session_segments.is_empty())
     }
 
     /// Compute the next local midnight strictly after `now`.
@@ -493,42 +510,74 @@ fn list_recent_session_segments(
         return Ok(Vec::new());
     }
 
-    let mut entries = fs::read_dir(sessions_dir)
-        .with_context(|| format!("Failed to read sessions dir: {}", sessions_dir.display()))?
-        .filter_map(|entry| {
-            let entry = entry.ok()?;
-            let path = entry.path();
-            let is_jsonl = path
-                .extension()
-                .and_then(|value| value.to_str())
-                .is_some_and(|value| value.eq_ignore_ascii_case("jsonl"));
-            if !is_jsonl || !path.is_file() {
-                return None;
-            }
+    let mut entries = Vec::<(std::time::SystemTime, String)>::new();
+    for entry in WalkDir::new(sessions_dir) {
+        let entry = entry
+            .with_context(|| format!("Failed to walk sessions dir: {}", sessions_dir.display()))?;
+        let path = entry.path().to_path_buf();
+        let is_jsonl = path
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value.eq_ignore_ascii_case("jsonl"));
+        if !is_jsonl || !path.is_file() {
+            continue;
+        }
 
-            let metadata = entry.metadata().ok()?;
-            let relative = path
-                .strip_prefix(workspace_root)
-                .ok()?
-                .to_string_lossy()
-                .replace('\\', "/");
-            Some((
-                metadata
-                    .modified()
-                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH),
-                relative,
-            ))
-        })
-        .collect::<Vec<_>>();
+        if !session_segment_contains_history(&path)? {
+            continue;
+        }
+        let metadata = entry
+            .metadata()
+            .with_context(|| format!("Failed to stat session segment: {}", path.display()))?;
+        let relative = path
+            .strip_prefix(workspace_root)
+            .with_context(|| {
+                format!(
+                    "Session segment resolved outside workspace root: {}",
+                    path.display()
+                )
+            })?
+            .to_string_lossy()
+            .replace('\\', "/");
+        entries.push((
+            metadata
+                .modified()
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+            relative,
+        ));
+    }
 
     entries.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
     entries.truncate(limit);
     Ok(entries.into_iter().map(|(_, path)| path).collect())
 }
 
+/// Return `true` when a session segment contains something beyond the mandatory
+/// bootstrap metadata line.
+fn session_segment_contains_history(path: &Path) -> anyhow::Result<bool> {
+    let file = File::open(path)
+        .with_context(|| format!("Failed to open session segment: {}", path.display()))?;
+    let mut non_empty_lines = 0usize;
+    for line in BufReader::new(file).lines() {
+        let line =
+            line.with_context(|| format!("Failed to read session segment: {}", path.display()))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        non_empty_lines += 1;
+        if non_empty_lines >= 2 {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::SessionStore;
     use chrono::Timelike as _;
     use tempfile::TempDir;
 
@@ -575,6 +624,60 @@ mod tests {
     }
 
     #[test]
+    fn should_run_now_is_false_for_first_start_with_only_bootstrap_session() {
+        let workspace = temp_workspace();
+        let manager = manager(&workspace);
+        let now =
+            resolve_local_time(NaiveDate::from_ymd_opt(2026, 4, 13).unwrap()) + Duration::hours(9);
+
+        let store = SessionStore::new(workspace.path().to_path_buf())
+            .expect("bootstrap session store should be created");
+        let bootstrap_session = workspace.path().join(store.current_session_path());
+        assert!(bootstrap_session.is_file());
+
+        assert!(!manager.should_run_now(now).unwrap());
+    }
+
+    #[test]
+    fn should_run_now_is_true_when_prior_session_history_exists() {
+        let workspace = temp_workspace();
+        fs::create_dir_all(workspace.path().join(DREAM_SESSIONS_DIR)).unwrap();
+        fs::write(
+            workspace
+                .path()
+                .join(DREAM_SESSIONS_DIR)
+                .join("session-2026-04-12-history.jsonl"),
+            "{\"type\":\"session_meta\"}\n{\"type\":\"message\",\"role\":\"user\",\"content\":\"history\"}\n",
+        )
+        .unwrap();
+        let manager = manager(&workspace);
+        let now =
+            resolve_local_time(NaiveDate::from_ymd_opt(2026, 4, 13).unwrap()) + Duration::hours(9);
+
+        assert!(manager.should_run_now(now).unwrap());
+    }
+
+    #[test]
+    fn should_run_now_is_true_the_day_after_a_successful_run() {
+        let workspace = temp_workspace();
+        let manager = manager(&workspace);
+        let yesterday =
+            resolve_local_time(NaiveDate::from_ymd_opt(2026, 4, 12).unwrap()) + Duration::hours(23);
+        let today =
+            resolve_local_time(NaiveDate::from_ymd_opt(2026, 4, 13).unwrap()) + Duration::hours(1);
+
+        manager
+            .mark_completed(
+                yesterday.date_naive(),
+                yesterday,
+                "memory/dreams/2026-04-12.md",
+            )
+            .unwrap();
+
+        assert!(manager.should_run_now(today).unwrap());
+    }
+
+    #[test]
     fn dream_lock_allows_only_one_live_holder() {
         let workspace = temp_workspace();
         let manager = manager(&workspace);
@@ -614,7 +717,25 @@ mod tests {
                 .path()
                 .join(DREAM_SESSIONS_DIR)
                 .join("session-2026-04-13-a.jsonl"),
-            "{}\n",
+            "{\"type\":\"session_meta\"}\n{\"type\":\"message\",\"role\":\"user\",\"content\":\"hello\"}\n",
+        )
+        .unwrap();
+        fs::create_dir_all(
+            workspace
+                .path()
+                .join(DREAM_SESSIONS_DIR)
+                .join("agents")
+                .join("child-1"),
+        )
+        .unwrap();
+        fs::write(
+            workspace
+                .path()
+                .join(DREAM_SESSIONS_DIR)
+                .join("agents")
+                .join("child-1")
+                .join("session-2026-04-13-b.jsonl"),
+            "{\"type\":\"session_meta\"}\n{\"type\":\"message\",\"role\":\"assistant\",\"content\":\"child work\"}\n",
         )
         .unwrap();
 
@@ -645,6 +766,13 @@ mod tests {
                 .session_segments
                 .iter()
                 .any(|path| path == "sessions/session-2026-04-13-a.jsonl")
+        );
+        assert!(
+            prepared
+                .sources
+                .session_segments
+                .iter()
+                .any(|path| path == "sessions/agents/child-1/session-2026-04-13-b.jsonl")
         );
         assert!(
             prepared

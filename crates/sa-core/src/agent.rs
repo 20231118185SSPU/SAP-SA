@@ -20,7 +20,8 @@ use crate::retry::retry_delay;
 use crate::session::SessionStore;
 use crate::skills::SkillRegistry;
 use crate::tools::{
-    AskRequest, ToolControl, ToolExecutionResult, ToolExecutor, ToolRuntime, ToolSession,
+    AskRequest, PromptProfile, ToolControl, ToolExecutionResult, ToolExecutor, ToolRuntime,
+    ToolSession,
 };
 use crate::ws_protocol::EventKind;
 use anyhow::Context as _;
@@ -33,6 +34,9 @@ use uuid::Uuid;
 /// prompt drift between runtime behavior and the human-editable prompt
 /// document.
 const STATIC_PROMPT_TEMPLATE: &str = include_str!("../../../prompt.md");
+
+/// Static prompt source-of-truth for ordinary worker sub-agents.
+const STATIC_SUBAGENT_PROMPT_TEMPLATE: &str = include_str!("../../../SubAgents.md");
 
 /// Callback used by the agent to emit progress events.
 ///
@@ -989,8 +993,16 @@ impl AgentRunner {
 
         let now = chrono::Local::now();
 
-        let mut out = String::from(STATIC_PROMPT_TEMPLATE.trim_end());
+        let base_template = match runtime.prompt_profile {
+            PromptProfile::Root => STATIC_PROMPT_TEMPLATE,
+            PromptProfile::SubAgent => STATIC_SUBAGENT_PROMPT_TEMPLATE,
+            PromptProfile::Background => STATIC_PROMPT_TEMPLATE,
+        };
+
+        let mut out = String::from(base_template.trim_end());
         out.push_str("\n\n");
+        out.push_str(&self.build_tool_prompt_block(runtime));
+        out.push('\n');
 
         let visible_commands = self.skills.list_model_invocable(
             runtime
@@ -1057,6 +1069,61 @@ impl AgentRunner {
                 out.push_str(extra);
                 out.push('\n');
             }
+        }
+
+        out
+    }
+
+    /// Build the runtime-accurate tool guidance block.
+    ///
+    /// This block is generated from the same tool schema that is sent to the
+    /// model, so prompt-visible capabilities stay aligned with actual
+    /// executable capabilities.
+    fn build_tool_prompt_block(&self, runtime: &ToolRuntime) -> String {
+        use std::fmt::Write as _;
+
+        let definitions = self.tools.tool_definitions(runtime);
+        let mut out = String::from(
+            "## 工具\n\n以下是你当前这一轮真实可用的工具。只能依赖这里列出的工具，不要假设隐藏工具依然可用。\n\n",
+        );
+
+        for definition in &definitions {
+            let _ = writeln!(
+                out,
+                "- `{}`：{}",
+                definition.function.name,
+                definition.function.description.trim()
+            );
+        }
+
+        let tool_names = definitions
+            .iter()
+            .map(|definition| definition.function.name.as_str())
+            .collect::<Vec<_>>();
+
+        if tool_names
+            .iter()
+            .any(|name| matches!(*name, "Send" | "Ask" | "Show"))
+        {
+            out.push_str(
+                "\n### 交互最佳实践\n\n- 简短进度、简短回答，用发送型工具。\n- 需要同学选择或补充关键信息时，再使用提问型工具。\n- 高信息密度内容优先通过展示文件的方式给同学看。\n",
+            );
+        } else if runtime.parent_agent_id.is_some() {
+            out.push_str(
+                "\n### 交互限制\n\n- 你当前没有直接面向同学的交互权限。\n- 你的普通文本不会直接显示给同学。\n- 如需汇报、同步或交接，请优先使用父代理/代理间协作工具。\n",
+            );
+        }
+
+        if tool_names.iter().any(|name| *name == "SubAgent") {
+            out.push_str(
+                "\n### 子代理协作\n\n- 只有当子任务边界清晰、值得隔离上下文时，才继续派生子代理。\n- 传入子代理的上下文必须具体、自包含、可验证。\n",
+            );
+        }
+
+        if tool_names.iter().any(|name| name.starts_with("mcp__")) {
+            out.push_str(
+                "\n### MCP 工具\n\n- 名称形如 `mcp__server__tool` 的工具来自外部 MCP server。\n- 它们和内置工具一样可直接调用，但参数必须严格遵守对应 schema。\n",
+            );
         }
 
         out
@@ -1295,9 +1362,9 @@ fn build_internal_memory_refresh_runtime(
     use crate::runtime::state::AgentStatus;
     use crate::tools::{
         AgentInfo, AskQuestionFn, BroadcastAgentsFn, GetAgentFn, GetTaskFn, ListAgentsFn,
-        MAX_SUBAGENT_DEPTH, MessageAgentFn, NotifyParentFn, RunSubAgentFn, SendMessageFn,
-        ShowFileFn, StartTerminalTaskFn, SubAgentHandle, SubAgentRequest, ToolRuntime,
-        TransferInputFn,
+        MAX_SUBAGENT_DEPTH, MessageAgentFn, NotifyParentFn, PromptProfile, RunSubAgentFn,
+        SendMessageFn, ShowFileFn, StartTerminalTaskFn, SubAgentHandle, SubAgentRequest,
+        ToolRuntime, TransferInputFn,
     };
 
     let runner_for_subagent = runner.clone();
@@ -1439,6 +1506,7 @@ fn build_internal_memory_refresh_runtime(
         None,
         task_id,
         format!("memory-refresh-depth-{depth}"),
+        PromptProfile::Background,
         false,
         false,
         false,
@@ -1656,6 +1724,14 @@ mod tests {
             .join("prompt.md")
     }
 
+    /// Resolve the repository-level sub-agent prompt source file.
+    fn subagent_prompt_md_path() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("SubAgents.md")
+    }
+
     /// The static prompt must come from `sa/prompt.md` so that prompt edits
     /// have one canonical source of truth.
     #[test]
@@ -1691,6 +1767,37 @@ mod tests {
         assert!(prompt.contains("## 运行时"));
         assert!(prompt.contains("## 附加运行时上下文"));
         assert!(prompt.contains("dream 状态：idle"));
+    }
+
+    #[test]
+    fn system_prompt_hides_interaction_tools_when_runtime_lacks_permissions() {
+        let runner = test_runner();
+        let mut runtime = ToolRuntime::detached();
+        runtime.allow_user_send = false;
+        runtime.allow_user_show = false;
+        runtime.allow_user_ask = false;
+
+        let prompt = runner.build_system_prompt(&runtime, &test_agents_md(), None);
+
+        assert!(!prompt.contains("`Send`"));
+        assert!(!prompt.contains("`Show`"));
+        assert!(!prompt.contains("`Ask`"));
+    }
+
+    #[test]
+    fn subagent_prompt_starts_with_subagent_md_static_source() {
+        let static_prompt =
+            fs::read_to_string(subagent_prompt_md_path()).expect("read repository SubAgents.md");
+
+        let runner = test_runner();
+        let mut runtime = ToolRuntime::detached();
+        runtime.prompt_profile = crate::tools::PromptProfile::SubAgent;
+        runtime.allow_user_send = false;
+        runtime.allow_user_show = false;
+        runtime.allow_user_ask = false;
+
+        let prompt = runner.build_system_prompt(&runtime, &test_agents_md(), None);
+        assert!(prompt.starts_with(static_prompt.trim_end()));
     }
 
     /// Compact-triggered memory refresh context should include the summary and
@@ -1761,6 +1868,9 @@ mod tests {
             label: Some("memory-topics".to_string()),
             task: "整理 testing 主题记忆".to_string(),
             context: "聚焦 testing 偏好".to_string(),
+            prompt: None,
+            prompt_file: None,
+            prompt_skill: None,
             allow_user_send: false,
             allow_user_show: false,
             allow_user_ask: false,

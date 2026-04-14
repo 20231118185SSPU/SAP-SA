@@ -25,13 +25,19 @@
 //! - Allow the daemon layer to inject user-interaction and sub-agent behavior
 //!   without coupling this crate to any particular transport.
 
+use crate::bash_safety::{BashSafetyDecision, validate_bash_command_safety};
 use crate::cancel::CancelToken;
+use crate::fetch_safety::{
+    FETCH_TIMEOUT_SECS, MAX_FETCH_REDIRECTS, MAX_FETCH_TRANSFER_BYTES, is_permitted_redirect,
+    validate_fetch_request,
+};
 use crate::interaction_history::{
     InteractionDisclosureMode, InteractionReadOptions, InteractionStore,
 };
 use crate::mcp_client::McpRegistry;
 use crate::memory::{read_markdown_memory, search_markdown_memory};
 use crate::openai::{ToolDefinition, ToolFunctionDefinition};
+use crate::path_guard::{PathOperation, validate_resolved_tool_path, validate_tool_path_input};
 use crate::runtime::state::{AgentStatus, RuntimeTaskStatus, WaitKind, WaitUntil};
 use crate::skills::{ActiveCommandInvocation, SkillRegistry, matches_command_patterns};
 use crate::ws_protocol::{
@@ -40,7 +46,7 @@ use crate::ws_protocol::{
 use anyhow::Context as _;
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::OsString;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -383,6 +389,8 @@ pub struct StartTerminalTaskRequest {
     pub workdir: String,
     /// Optional timeout in seconds.
     pub timeout_seconds: Option<u64>,
+    /// Safety warning computed when the foreground tool call was accepted.
+    pub safety_warning: Option<String>,
 }
 
 /// Handle returned when a background terminal task is accepted.
@@ -461,6 +469,13 @@ pub struct SubAgentRequest {
     pub task: String,
     /// Parent-provided context that will be injected into the child prompt.
     pub context: String,
+    /// Optional direct prompt block provided by the parent agent.
+    pub prompt: Option<String>,
+    /// Optional workspace prompt file such as `DESIGNER.md`.
+    pub prompt_file: Option<String>,
+    /// Optional skill name used as a persona prompt; defaults to that skill's
+    /// `SKILL.md`.
+    pub prompt_skill: Option<String>,
     /// Whether the child may directly `Send`.
     pub allow_user_send: bool,
     /// Whether the child may directly `Show`.
@@ -484,8 +499,37 @@ impl SubAgentRequest {
             anyhow::bail!("SubAgent context must not be empty");
         }
 
+        if let Some(prompt) = self.prompt.as_deref()
+            && prompt.trim().is_empty()
+        {
+            anyhow::bail!("SubAgent prompt must not be empty when provided");
+        }
+
+        if let Some(prompt_file) = self.prompt_file.as_deref()
+            && prompt_file.trim().is_empty()
+        {
+            anyhow::bail!("SubAgent prompt_file must not be empty when provided");
+        }
+
+        if let Some(prompt_skill) = self.prompt_skill.as_deref()
+            && prompt_skill.trim().is_empty()
+        {
+            anyhow::bail!("SubAgent prompt_skill must not be empty when provided");
+        }
+
         Ok(())
     }
+}
+
+/// Base prompt template selected for one agent runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptProfile {
+    /// Main root-agent prompt.
+    Root,
+    /// Ordinary durable worker / child-agent prompt.
+    SubAgent,
+    /// Internal background runtime such as memory-refresh.
+    Background,
 }
 
 /// Shared callbacks injected by the daemon layer.
@@ -502,6 +546,8 @@ pub struct ToolRuntime {
     pub root_agent_id: Uuid,
     /// Human-friendly label for this runtime.
     pub agent_label: String,
+    /// Base prompt profile used when composing the system prompt.
+    pub prompt_profile: PromptProfile,
     /// Whether this agent is currently the root agent.
     pub is_root: bool,
     /// Whether this agent currently holds user input ownership.
@@ -564,6 +610,7 @@ impl ToolRuntime {
         parent_agent_id: Option<Uuid>,
         root_agent_id: Uuid,
         agent_label: String,
+        prompt_profile: PromptProfile,
         is_root: bool,
         holds_input_ownership: bool,
         allow_finish_without_output: bool,
@@ -596,6 +643,7 @@ impl ToolRuntime {
             parent_agent_id,
             root_agent_id,
             agent_label,
+            prompt_profile,
             is_root,
             holds_input_ownership,
             allow_finish_without_output,
@@ -671,6 +719,7 @@ impl ToolRuntime {
             None,
             nil,
             "detached".to_string(),
+            PromptProfile::Root,
             true,
             true,
             false,
@@ -862,13 +911,38 @@ impl ToolContext {
 #[derive(Debug, Clone, Default)]
 pub struct ToolSession {
     /// Canonical file paths that are currently eligible for `Edit`.
-    readable_for_edit: HashSet<PathBuf>,
+    readable_for_edit: HashMap<PathBuf, Option<FileReadVersion>>,
     /// Commands that remain active for future turns.
     active_command_invocations: Vec<ActiveCommandInvocation>,
     /// Conditional commands already unlocked by touched paths.
     activated_conditional_commands: BTreeSet<String>,
     /// Workspace paths touched during the current quantum.
     touched_paths: BTreeSet<PathBuf>,
+}
+
+/// Lightweight version fingerprint captured when a file is read for later
+/// `Edit` safety checks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileReadVersion {
+    /// Byte length of the file at read time.
+    bytes: usize,
+    /// Fast content hash used to detect silent external modifications.
+    hash: [u8; 32],
+}
+
+impl FileReadVersion {
+    /// Build one deterministic fingerprint from UTF-8 content.
+    fn from_content(content: &str) -> Self {
+        use sha2::Digest as _;
+
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(content.as_bytes());
+        let hash: [u8; 32] = hasher.finalize().into();
+        Self {
+            bytes: content.len(),
+            hash,
+        }
+    }
 }
 
 impl ToolSession {
@@ -879,7 +953,7 @@ impl ToolSession {
         activated_conditional_commands: impl IntoIterator<Item = String>,
     ) -> Self {
         Self {
-            readable_for_edit: paths.into_iter().collect(),
+            readable_for_edit: paths.into_iter().map(|path| (path, None)).collect(),
             active_command_invocations: active_command_invocations.into_iter().collect(),
             activated_conditional_commands: activated_conditional_commands.into_iter().collect(),
             touched_paths: BTreeSet::new(),
@@ -899,7 +973,7 @@ impl ToolSession {
 
     /// Export the current "freshly read" set for persistence.
     pub fn readable_paths(&self) -> Vec<PathBuf> {
-        self.readable_for_edit.iter().cloned().collect()
+        self.readable_for_edit.keys().cloned().collect()
     }
 
     /// Export the active command reminder set for persistence.
@@ -921,21 +995,36 @@ impl ToolSession {
     }
 
     /// Mark that a file has just been read in this session.
-    fn note_read(&mut self, path: PathBuf) {
-        self.readable_for_edit.insert(path.clone());
+    fn note_read(&mut self, path: PathBuf, version: FileReadVersion) {
+        self.readable_for_edit.insert(path.clone(), Some(version));
         self.note_touched_path(path);
     }
 
     /// Enforce the "must read before edit" rule.
-    fn require_fresh_read(&self, path: &Path) -> anyhow::Result<()> {
-        if self.readable_for_edit.contains(path) {
-            return Ok(());
+    fn require_fresh_read(&self, path: &Path, current_content: &str) -> anyhow::Result<()> {
+        let Some(version) = self.readable_for_edit.get(path) else {
+            anyhow::bail!(
+                "Edit is not allowed until the file has been Read in this session: {}",
+                path.display()
+            );
+        };
+
+        let Some(version) = version else {
+            anyhow::bail!(
+                "Edit requires a fresh re-Read after restart because the previous file version metadata is unavailable: {}",
+                path.display()
+            );
+        };
+
+        let current = FileReadVersion::from_content(current_content);
+        if version != &current {
+            anyhow::bail!(
+                "Edit requires a fresh re-Read because the file changed since it was last Read in this session: {}",
+                path.display()
+            );
         }
 
-        anyhow::bail!(
-            "Edit is not allowed until the file has been Read in this session: {}",
-            path.display()
-        );
+        Ok(())
     }
 
     /// After an edit, the caller must re-read the file before the next edit.
@@ -1091,7 +1180,7 @@ impl ToolExecutor {
                 kind: "function".to_string(),
                 function: ToolFunctionDefinition {
                     name: "Fetch".to_string(),
-                    description: "Send a direct HTTP request to a known URL and return the response body."
+                    description: "Fetch a public HTTP(S) URL in SA's read-only safety model and return the response body."
                         .to_string(),
                     parameters: serde_json::json!({
                         "type": "object",
@@ -1102,15 +1191,15 @@ impl ToolExecutor {
                             },
                             "method": {
                                 "type": "string",
-                                "description": "HTTP method. Defaults to GET."
+                                "description": "HTTP method. Only `GET` and `HEAD` are supported. Defaults to `GET`."
                             },
                             "headers": {
                                 "type": "object",
-                                "description": "Optional request headers as string key/value pairs."
+                                "description": "Optional request headers as string key/value pairs. Sensitive headers such as `Authorization` and `Cookie` are blocked."
                             },
                             "body": {
                                 "type": "string",
-                                "description": "Optional UTF-8 request body."
+                                "description": "Not currently supported in SA's read-only Fetch safety model."
                             },
                             "max_bytes": {
                                 "type": "integer",
@@ -1456,6 +1545,18 @@ impl ToolExecutor {
                                 "type": "string",
                                 "description": "Parent-provided context, constraints, and findings for the child agent."
                             },
+                            "prompt": {
+                                "type": "string",
+                                "description": "Optional direct prompt block injected into the child agent's prompt."
+                            },
+                            "prompt_file": {
+                                "type": "string",
+                                "description": "Optional workspace prompt file such as `DESIGNER.md`."
+                            },
+                            "prompt_skill": {
+                                "type": "string",
+                                "description": "Optional skill name used as the child agent's persona prompt. Defaults to that skill's `SKILL.md`."
+                            },
                             "allow_user_send": {
                                 "type": "boolean",
                                 "description": "Whether the child may directly Send."
@@ -1759,6 +1860,15 @@ impl ToolExecutor {
 
     /// Whether a tool should be visible in the advertised model tool list.
     fn tool_is_model_visible(&self, runtime: &ToolRuntime, tool_name: &str) -> bool {
+        match tool_name {
+            "Send" if !runtime.allow_user_send => return false,
+            "Show" if !runtime.allow_user_show => return false,
+            "Ask" if !runtime.allow_user_ask => return false,
+            "NotifyParent" if runtime.parent_agent_id.is_none() => return false,
+            "TransferInput" if !runtime.is_root => return false,
+            _ => {}
+        }
+
         if matches_tool_patterns(tool_name, None, &runtime.denied_tools) {
             return false;
         }
@@ -1822,7 +1932,9 @@ impl ToolExecutor {
         }
 
         let args: Args = serde_json::from_value(args).context("Invalid arguments for Read")?;
+        validate_tool_path_input(&args.path, PathOperation::Read)?;
         let path = self.ctx.resolve_under_workspace(&args.path)?;
+        validate_resolved_tool_path(&self.ctx.workspace_root, &path, PathOperation::Read)?;
 
         let meta = tokio::fs::metadata(&path)
             .await
@@ -1845,7 +1957,7 @@ impl ToolExecutor {
             .await
             .with_context(|| format!("Failed to read file: {}", path.display()))?;
 
-        session.note_read(path.clone());
+        session.note_read(path.clone(), FileReadVersion::from_content(&content));
 
         Ok(serde_json::json!({
             "path": path.display().to_string(),
@@ -1873,14 +1985,9 @@ impl ToolExecutor {
         }
 
         let args: Args = serde_json::from_value(args).context("Invalid arguments for Write")?;
+        validate_tool_path_input(&args.path, PathOperation::Write)?;
         let path = self.ctx.resolve_under_workspace(&args.path)?;
-
-        if tokio::fs::try_exists(&path).await? {
-            anyhow::bail!(
-                "Write refuses to overwrite an existing path: {}",
-                path.display()
-            );
-        }
+        validate_resolved_tool_path(&self.ctx.workspace_root, &path, PathOperation::Write)?;
 
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await.with_context(|| {
@@ -1888,9 +1995,27 @@ impl ToolExecutor {
             })?;
         }
 
-        tokio::fs::write(&path, args.content.as_bytes())
-            .await
-            .with_context(|| format!("Failed to write file: {}", path.display()))?;
+        {
+            use tokio::io::AsyncWriteExt as _;
+
+            let mut file = tokio::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .await
+                .with_context(|| {
+                    format!(
+                        "Write refuses to overwrite an existing path: {}",
+                        path.display()
+                    )
+                })?;
+            file.write_all(args.content.as_bytes())
+                .await
+                .with_context(|| format!("Failed to write file: {}", path.display()))?;
+            file.flush()
+                .await
+                .with_context(|| format!("Failed to flush file: {}", path.display()))?;
+        }
         session.note_touched_path(path.clone());
 
         Ok(serde_json::json!({
@@ -1922,17 +2047,18 @@ impl ToolExecutor {
 
         let args: Args = serde_json::from_value(args).context("Invalid arguments for Edit")?;
         let replace_all = args.replace_all.unwrap_or(false);
+        validate_tool_path_input(&args.path, PathOperation::Edit)?;
         let path = self.ctx.resolve_under_workspace(&args.path)?;
-
-        session.require_fresh_read(&path)?;
-
-        if args.old_text.is_empty() {
-            anyhow::bail!("Edit old_text must be non-empty");
-        }
+        validate_resolved_tool_path(&self.ctx.workspace_root, &path, PathOperation::Edit)?;
 
         let content = tokio::fs::read_to_string(&path)
             .await
             .with_context(|| format!("Failed to read file for edit: {}", path.display()))?;
+        session.require_fresh_read(&path, &content)?;
+
+        if args.old_text.is_empty() {
+            anyhow::bail!("Edit old_text must be non-empty");
+        }
 
         let match_count = content.matches(&args.old_text).count();
         if match_count == 0 {
@@ -1997,6 +2123,14 @@ impl ToolExecutor {
             .unwrap_or(DEFAULT_BASH_TIMEOUT)
             .min(MAX_BASH_TIMEOUT);
 
+        let safety_warning =
+            match validate_bash_command_safety(&args.command, &self.ctx.workspace_root, &workdir) {
+                BashSafetyDecision::Allow { warning } => warning,
+                BashSafetyDecision::Block { reason } => {
+                    anyhow::bail!("Bash blocked by SA safety checks: {reason}");
+                }
+            };
+
         if args.run_in_background {
             let handle = runtime
                 .start_terminal_task(
@@ -2004,6 +2138,7 @@ impl ToolExecutor {
                         command: args.command.clone(),
                         workdir: workdir.display().to_string(),
                         timeout_seconds: args.timeout_seconds,
+                        safety_warning: safety_warning.clone(),
                     },
                     cancel.clone(),
                 )
@@ -2015,6 +2150,7 @@ impl ToolExecutor {
                 "status": handle.status,
                 "output_path": handle.output_path,
                 "workdir": workdir.display().to_string(),
+                "safety_warning": safety_warning,
             })
             .to_string());
         }
@@ -2054,6 +2190,7 @@ impl ToolExecutor {
                         "exit_code": exit_code,
                         "stdout": stdout,
                         "stderr": stderr,
+                        "safety_warning": safety_warning,
                     })
                     .to_string());
                 }
@@ -2096,93 +2233,131 @@ impl ToolExecutor {
             anyhow::bail!("Fetch cancelled");
         }
 
-        let url = validate_network_url(&args.url)?;
         let method = args
             .method
             .as_deref()
             .unwrap_or("GET")
             .parse::<reqwest::Method>()
             .context("Fetch method must be a valid HTTP method")?;
+        let validated =
+            validate_fetch_request(&args.url, &method, &args.headers, args.body.as_deref()).await?;
         let max_bytes = args
             .max_bytes
             .unwrap_or(MAX_FETCH_RESPONSE_BYTES)
             .min(MAX_FETCH_RESPONSE_BYTES);
 
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
+            .timeout(Duration::from_secs(FETCH_TIMEOUT_SECS))
+            .redirect(reqwest::redirect::Policy::none())
             .user_agent("StudyAdministrator/0.6 Fetch")
             .build()
             .context("Failed to build Fetch HTTP client")?;
+        let mut current_url = validated.url.clone();
+        let mut redirect_hops = 0usize;
 
-        let mut request = client.request(method.clone(), url.clone());
-        for (name, value) in args.headers {
-            let Some(value) = value.as_str() else {
-                anyhow::bail!("Fetch headers must be string key/value pairs");
+        loop {
+            let mut request = client.request(method.clone(), current_url.clone());
+            for (name, value) in &args.headers {
+                let Some(value) = value.as_str() else {
+                    anyhow::bail!("Fetch headers must be string key/value pairs");
+                };
+                request = request.header(name, value);
+            }
+            let mut response = tokio::select! {
+                _ = cancel.cancelled() => {
+                    anyhow::bail!("Fetch cancelled");
+                }
+                response = request.send() => {
+                    response.context("Fetch request failed")?
+                }
             };
-            request = request.header(&name, value);
-        }
-        if let Some(body) = args.body {
-            request = request.body(body);
-        }
 
-        let response = tokio::select! {
-            _ = cancel.cancelled() => {
-                anyhow::bail!("Fetch cancelled");
+            let status = response.status();
+            if matches!(status.as_u16(), 301 | 302 | 303 | 307 | 308) {
+                let Some(location) = response.headers().get(reqwest::header::LOCATION) else {
+                    anyhow::bail!("Fetch redirect response is missing a Location header");
+                };
+                let location = location
+                    .to_str()
+                    .context("Fetch redirect Location header is not valid UTF-8")?;
+                let redirect_url = current_url.join(location).with_context(|| {
+                    format!("Failed to resolve Fetch redirect target `{location}`")
+                })?;
+
+                if redirect_hops >= MAX_FETCH_REDIRECTS {
+                    anyhow::bail!(
+                        "Fetch exceeded SA's redirect safety limit of {} hops",
+                        MAX_FETCH_REDIRECTS
+                    );
+                }
+
+                let allows_auto_follow =
+                    matches!(method, reqwest::Method::GET | reqwest::Method::HEAD)
+                        && is_permitted_redirect(&current_url, &redirect_url);
+                if !allows_auto_follow {
+                    return Ok(serde_json::json!({
+                        "redirect": true,
+                        "redirect_blocked": true,
+                        "original_url": args.url,
+                        "current_url": current_url.as_str(),
+                        "redirect_url": redirect_url.as_str(),
+                        "method": method.as_str(),
+                        "status": status.as_u16(),
+                        "message": "Fetch detected a redirect that SA will not follow automatically. Re-run Fetch explicitly with the redirected URL if you intend to trust it.",
+                        "safety_warning": validated.safety_warning,
+                    })
+                    .to_string());
+                }
+
+                validate_fetch_request(redirect_url.as_str(), &method, &args.headers, None).await?;
+                redirect_hops += 1;
+                current_url = redirect_url;
+                continue;
             }
-            response = request.send() => {
-                response.context("Fetch request failed")?
+
+            if let Some(content_length) = response.content_length()
+                && content_length > MAX_FETCH_TRANSFER_BYTES as u64
+            {
+                anyhow::bail!(
+                    "Fetch response exceeds SA's {}-byte transport safety limit",
+                    MAX_FETCH_TRANSFER_BYTES
+                );
             }
-        };
 
-        let status = response.status();
-        let final_url = response.url().to_string();
-        let content_type = response
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .map(ToOwned::to_owned);
-        let headers = response.headers().clone();
-
-        let body_bytes = tokio::select! {
-            _ = cancel.cancelled() => {
-                anyhow::bail!("Fetch cancelled");
-            }
-            body = response.bytes() => {
-                body.context("Failed to read Fetch response body")?
-            }
-        };
-
-        let truncated = body_bytes.len() > max_bytes;
-        let clipped = if truncated {
-            &body_bytes[..max_bytes]
-        } else {
-            body_bytes.as_ref()
-        };
-
-        let body_text = String::from_utf8_lossy(clipped).to_string();
-        let response_headers = headers
-            .iter()
-            .filter_map(|(name, value)| {
-                value.to_str().ok().map(|value| {
-                    (
-                        name.as_str().to_string(),
-                        serde_json::Value::String(value.to_string()),
-                    )
+            let headers = response.headers().clone();
+            let content_type = headers
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .map(ToOwned::to_owned);
+            let (body_bytes, total_bytes, truncated) =
+                read_fetch_body_limited(&mut response, max_bytes, cancel).await?;
+            let body_text = String::from_utf8_lossy(&body_bytes).to_string();
+            let response_headers = headers
+                .iter()
+                .filter_map(|(name, value)| {
+                    value.to_str().ok().map(|value| {
+                        (
+                            name.as_str().to_string(),
+                            serde_json::Value::String(value.to_string()),
+                        )
+                    })
                 })
-            })
-            .collect::<serde_json::Map<_, _>>();
+                .collect::<serde_json::Map<_, _>>();
 
-        Ok(serde_json::json!({
-            "url": final_url,
-            "method": method.as_str(),
-            "status": status.as_u16(),
-            "content_type": content_type,
-            "headers": response_headers,
-            "bytes": body_bytes.len(),
-            "truncated": truncated,
-            "body": body_text,
-        })
-        .to_string())
+            return Ok(serde_json::json!({
+                "url": current_url.as_str(),
+                "original_url": args.url,
+                "method": method.as_str(),
+                "status": status.as_u16(),
+                "content_type": content_type,
+                "headers": response_headers,
+                "bytes": total_bytes,
+                "truncated": truncated,
+                "body": body_text,
+                "safety_warning": validated.safety_warning,
+            })
+            .to_string());
+        }
     }
 
     /// `Search`: discover relevant URLs before a more targeted `Fetch`.
@@ -2206,43 +2381,67 @@ impl ToolExecutor {
         }
 
         let max_results = args.max_results.unwrap_or(5).clamp(1, 10);
-        let url = reqwest::Url::parse_with_params(
-            "https://html.duckduckgo.com/html/",
-            &[("q", args.query.trim())],
-        )
-        .context("Failed to build Search URL")?;
-
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .user_agent("StudyAdministrator/0.6 Search")
             .build()
             .context("Failed to build Search HTTP client")?;
+        let mut attempts = Vec::<String>::new();
 
-        let response = tokio::select! {
-            _ = cancel.cancelled() => {
-                anyhow::bail!("Search cancelled");
-            }
-            response = client.get(url).send() => {
-                response.context("Search request failed")?
-            }
-        };
+        for url in search_endpoint_candidates(args.query.trim())? {
+            let response = tokio::select! {
+                _ = cancel.cancelled() => {
+                    anyhow::bail!("Search cancelled");
+                }
+                response = client.get(url.clone()).send() => {
+                    match response {
+                        Ok(response) => response,
+                        Err(err) => {
+                            attempts.push(format!("{} -> request failed: {err}", url));
+                            continue;
+                        }
+                    }
+                }
+            };
 
-        let html = tokio::select! {
-            _ = cancel.cancelled() => {
-                anyhow::bail!("Search cancelled");
-            }
-            body = response.text() => {
-                body.context("Failed to read Search response body")?
-            }
-        };
+            let status = response.status();
+            let html = tokio::select! {
+                _ = cancel.cancelled() => {
+                    anyhow::bail!("Search cancelled");
+                }
+                body = response.text() => {
+                    match body {
+                        Ok(body) => body,
+                        Err(err) => {
+                            attempts.push(format!("{} -> body read failed: {err}", url));
+                            continue;
+                        }
+                    }
+                }
+            };
 
-        let results = extract_duckduckgo_results(&html, max_results);
+            if !status.is_success() {
+                attempts.push(format!("{} -> http {}", url, status.as_u16()));
+                continue;
+            }
 
-        Ok(serde_json::json!({
-            "query": args.query,
-            "results": results,
-        })
-        .to_string())
+            let results = extract_duckduckgo_results(&html, max_results);
+            if !results.is_empty() {
+                return Ok(serde_json::json!({
+                    "query": args.query,
+                    "results": results,
+                    "backend": url.as_str(),
+                })
+                .to_string());
+            }
+
+            attempts.push(format!("{} -> parsed zero results", url));
+        }
+
+        anyhow::bail!(
+            "Search failed across all configured backends: {}",
+            attempts.join(" | ")
+        )
     }
 
     /// `MemorySearch`: search Markdown memory files on demand.
@@ -2364,7 +2563,9 @@ impl ToolExecutor {
         if args.prompt.trim().is_empty() {
             anyhow::bail!("Show prompt must not be empty");
         }
+        validate_tool_path_input(&args.path, PathOperation::Read)?;
         let path = self.ctx.resolve_under_workspace(&args.path)?;
+        validate_resolved_tool_path(&self.ctx.workspace_root, &path, PathOperation::Read)?;
         let meta = tokio::fs::metadata(&path)
             .await
             .with_context(|| format!("Failed to stat file for Show: {}", path.display()))?;
@@ -2658,6 +2859,9 @@ impl ToolExecutor {
             label: Option<String>,
             task: String,
             context: String,
+            prompt: Option<String>,
+            prompt_file: Option<String>,
+            prompt_skill: Option<String>,
             #[serde(default)]
             allow_user_send: bool,
             #[serde(default)]
@@ -2674,6 +2878,9 @@ impl ToolExecutor {
             label: args.label,
             task: args.task,
             context: args.context,
+            prompt: args.prompt,
+            prompt_file: args.prompt_file,
+            prompt_skill: args.prompt_skill,
             allow_user_send: args.allow_user_send,
             allow_user_show: args.allow_user_show,
             allow_user_ask: args.allow_user_ask,
@@ -2928,31 +3135,161 @@ impl ToolExecutor {
 /// Candidate `bash` programs to try, in order.
 ///
 /// Strategy:
-/// - `bash` from PATH is the preferred option because it respects the user's
-///   environment.
-/// - Then we try common Git for Windows installation paths.
+/// - On Windows, prefer Git Bash specifically.
+/// - Do not prefer the generic `System32\\bash.exe` / WSL shim because it can
+///   launch a different environment where `git` is unavailable, which is the
+///   exact failure mode SA must avoid.
+/// - On non-Windows platforms, plain `bash` remains fine.
 fn candidate_bash_programs() -> Vec<PathBuf> {
-    let mut out = vec![PathBuf::from("bash")];
-
-    for env_name in ["ProgramFiles", "ProgramFiles(x86)"] {
-        if let Ok(root) = std::env::var(env_name) {
-            let root = PathBuf::from(root);
-            out.push(root.join("Git").join("bin").join("bash.exe"));
-            out.push(root.join("Git").join("usr").join("bin").join("bash.exe"));
-        }
+    #[cfg(not(windows))]
+    {
+        return vec![PathBuf::from("bash")];
     }
 
+    #[cfg(windows)]
+    {
+        let mut out = Vec::<PathBuf>::new();
+
+        if let Ok(git_paths) = which::which_all("git") {
+            for git_path in git_paths {
+                out.extend(infer_git_bash_candidates_from_git_path(&git_path));
+            }
+        }
+
+        if let Ok(bash_paths) = which::which_all("bash") {
+            for bash_path in bash_paths {
+                if is_preferred_windows_bash_candidate(&bash_path) {
+                    out.push(bash_path);
+                }
+            }
+        }
+
+        for env_name in ["ProgramFiles", "ProgramFiles(x86)"] {
+            if let Ok(root) = std::env::var(env_name) {
+                let root = PathBuf::from(root);
+                out.push(root.join("Git").join("bin").join("bash.exe"));
+                out.push(root.join("Git").join("usr").join("bin").join("bash.exe"));
+            }
+        }
+
+        dedup_paths_preserve_order(out)
+    }
+}
+
+/// Infer likely Git Bash locations from one discovered `git.exe` path.
+#[cfg(windows)]
+fn infer_git_bash_candidates_from_git_path(git_path: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Some(parent) = git_path.parent() else {
+        return out;
+    };
+    let Some(root) = parent.parent() else {
+        return out;
+    };
+
+    out.push(root.join("bin").join("bash.exe"));
+    out.push(root.join("usr").join("bin").join("bash.exe"));
     out
+}
+
+/// Return whether a Windows `bash.exe` path looks like Git Bash rather than a
+/// WSL or Windows shim.
+#[cfg(windows)]
+fn is_preferred_windows_bash_candidate(path: &Path) -> bool {
+    let normalized = path
+        .to_string_lossy()
+        .replace('/', "\\")
+        .to_ascii_lowercase();
+    normalized.ends_with("\\git\\bin\\bash.exe")
+        || normalized.ends_with("\\git\\usr\\bin\\bash.exe")
+}
+
+/// Deduplicate paths while preserving their first-seen order.
+fn dedup_paths_preserve_order(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    use std::collections::HashSet;
+
+    let mut seen = HashSet::<PathBuf>::new();
+    let mut out = Vec::new();
+    for path in paths {
+        if seen.insert(path.clone()) {
+            out.push(path);
+        }
+    }
+    out
+}
+
+/// Candidate HTML search endpoints, ordered from most stable to fallback.
+fn search_endpoint_candidates(query: &str) -> anyhow::Result<Vec<reqwest::Url>> {
+    let mut urls = Vec::new();
+    for base in [
+        "https://duckduckgo.com/html/",
+        "https://html.duckduckgo.com/html/",
+    ] {
+        urls.push(
+            reqwest::Url::parse_with_params(base, &[("q", query)])
+                .with_context(|| format!("Failed to build Search URL from {base}"))?,
+        );
+    }
+    Ok(urls)
 }
 
 /// Validate that a network URL is HTTP(S) and therefore appropriate for
 /// `Fetch`.
-fn validate_network_url(raw: &str) -> anyhow::Result<reqwest::Url> {
+pub(crate) fn validate_network_url(raw: &str) -> anyhow::Result<reqwest::Url> {
     let url = reqwest::Url::parse(raw).context("Fetch URL must be a valid absolute URL")?;
     match url.scheme() {
         "http" | "https" => Ok(url),
         other => anyhow::bail!("Fetch only allows http/https URLs, got scheme `{other}`"),
     }
+}
+
+/// Read a Fetch response body while enforcing SA's transport safety ceiling.
+async fn read_fetch_body_limited(
+    response: &mut reqwest::Response,
+    return_limit: usize,
+    cancel: &CancelToken,
+) -> anyhow::Result<(Vec<u8>, usize, bool)> {
+    let mut total_bytes = 0usize;
+    let mut clipped = Vec::<u8>::new();
+    let mut truncated = false;
+
+    loop {
+        let next_chunk = tokio::select! {
+            _ = cancel.cancelled() => {
+                anyhow::bail!("Fetch cancelled");
+            }
+            chunk = response.chunk() => {
+                chunk.context("Failed to read Fetch response body chunk")?
+            }
+        };
+
+        let Some(chunk) = next_chunk else {
+            break;
+        };
+
+        total_bytes = total_bytes.saturating_add(chunk.len());
+        if total_bytes > MAX_FETCH_TRANSFER_BYTES {
+            anyhow::bail!(
+                "Fetch response exceeded SA's {}-byte transport safety limit while streaming",
+                MAX_FETCH_TRANSFER_BYTES
+            );
+        }
+
+        let remaining = return_limit.saturating_sub(clipped.len());
+        if remaining > 0 {
+            let take = remaining.min(chunk.len());
+            clipped.extend_from_slice(&chunk[..take]);
+        }
+        if chunk.len() > remaining {
+            truncated = true;
+        }
+    }
+
+    if total_bytes > return_limit {
+        truncated = true;
+    }
+
+    Ok((clipped, total_bytes, truncated))
 }
 
 /// Extract a bounded list of search results from DuckDuckGo's lightweight HTML
@@ -3359,6 +3696,61 @@ mod tests {
         assert_eq!(results[0]["snippet"], "A useful summary.");
     }
 
+    #[test]
+    fn search_endpoint_candidates_prefers_duckduckgo_html_then_html_subdomain() {
+        let urls = search_endpoint_candidates("rust tokio tutorial").expect("urls should build");
+        assert_eq!(urls.len(), 2);
+        assert_eq!(
+            urls[0].as_str(),
+            "https://duckduckgo.com/html/?q=rust+tokio+tutorial"
+        );
+        assert_eq!(
+            urls[1].as_str(),
+            "https://html.duckduckgo.com/html/?q=rust+tokio+tutorial"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_rejects_localhost_before_network() {
+        let ctx = test_context();
+        let executor = ToolExecutor::new(ctx, None);
+        let cancel = crate::cancel::cancel_pair().1;
+
+        let err = executor
+            .fetch(
+                serde_json::json!({
+                    "url": "http://localhost:8080/private"
+                }),
+                &cancel,
+            )
+            .await
+            .expect_err("localhost fetch must fail");
+
+        assert!(err.to_string().contains("localhost"));
+    }
+
+    #[tokio::test]
+    async fn fetch_rejects_sensitive_auth_headers_before_network() {
+        let ctx = test_context();
+        let executor = ToolExecutor::new(ctx, None);
+        let cancel = crate::cancel::cancel_pair().1;
+
+        let err = executor
+            .fetch(
+                serde_json::json!({
+                    "url": "https://example.com/docs",
+                    "headers": {
+                        "Authorization": "Bearer secret"
+                    }
+                }),
+                &cancel,
+            )
+            .await
+            .expect_err("auth header fetch must fail");
+
+        assert!(err.to_string().contains("sensitive request header"));
+    }
+
     #[tokio::test]
     async fn write_refuses_existing_file() {
         let ctx = test_context();
@@ -3380,6 +3772,27 @@ mod tests {
             .expect_err("overwrite must fail");
 
         assert!(err.to_string().contains("refuses to overwrite"));
+    }
+
+    #[tokio::test]
+    async fn write_rejects_sensitive_config_path() {
+        let ctx = test_context();
+        let executor = ToolExecutor::new(ctx.clone(), None);
+        let mut session = ToolSession::default();
+
+        let err = executor
+            .write(
+                &mut session,
+                serde_json::json!({
+                    "path": ".env",
+                    "content": "API_KEY=secret",
+                }),
+                &crate::cancel::cancel_pair().1,
+            )
+            .await
+            .expect_err("sensitive config path must fail");
+
+        assert!(err.to_string().contains("dangerous configuration files"));
     }
 
     #[tokio::test]
@@ -3405,6 +3818,64 @@ mod tests {
             .expect_err("edit without read must fail");
 
         assert!(err.to_string().contains("has been Read"));
+    }
+
+    #[tokio::test]
+    async fn edit_rejects_root_control_file_even_after_read() {
+        let ctx = test_context();
+        let executor = ToolExecutor::new(ctx.clone(), None);
+        let mut session = ToolSession::default();
+        let cancel = crate::cancel::cancel_pair().1;
+
+        fs::write(ctx.workspace_root.join("prompt.md"), "alpha beta").expect("seed prompt.md");
+        executor
+            .read(
+                &mut session,
+                serde_json::json!({
+                    "path": "prompt.md"
+                }),
+                &cancel,
+            )
+            .await
+            .expect("read prompt.md");
+
+        let err = executor
+            .edit(
+                &mut session,
+                serde_json::json!({
+                    "path": "prompt.md",
+                    "old_text": "beta",
+                    "new_text": "gamma",
+                }),
+                &cancel,
+            )
+            .await
+            .expect_err("control file edit must fail");
+
+        assert!(err.to_string().contains("control files"));
+    }
+
+    #[tokio::test]
+    async fn read_rejects_sensitive_config_path() {
+        let ctx = test_context();
+        let executor = ToolExecutor::new(ctx.clone(), None);
+        let mut session = ToolSession::default();
+        let cancel = crate::cancel::cancel_pair().1;
+
+        fs::write(ctx.workspace_root.join("sa.toml"), "api_key = 'secret'").expect("seed sa.toml");
+
+        let err = executor
+            .read(
+                &mut session,
+                serde_json::json!({
+                    "path": "sa.toml"
+                }),
+                &cancel,
+            )
+            .await
+            .expect_err("sensitive read must fail");
+
+        assert!(err.to_string().contains("sensitive configuration files"));
     }
 
     #[tokio::test]
@@ -3455,6 +3926,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn edit_rejects_file_changed_since_read() {
+        let ctx = test_context();
+        let executor = ToolExecutor::new(ctx.clone(), None);
+        let mut session = ToolSession::default();
+        let cancel = crate::cancel::cancel_pair().1;
+
+        let path = ctx.workspace_root.join("note.txt");
+        fs::write(&path, "alpha beta").expect("seed file");
+
+        executor
+            .read(
+                &mut session,
+                serde_json::json!({
+                    "path": "note.txt"
+                }),
+                &cancel,
+            )
+            .await
+            .expect("read note");
+
+        fs::write(&path, "alpha beta changed").expect("mutate file externally");
+
+        let err = executor
+            .edit(
+                &mut session,
+                serde_json::json!({
+                    "path": "note.txt",
+                    "old_text": "beta",
+                    "new_text": "gamma",
+                }),
+                &cancel,
+            )
+            .await
+            .expect_err("edit after external change must fail");
+
+        assert!(
+            err.to_string()
+                .contains("file changed since it was last Read")
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_rejects_restored_read_set_without_version_metadata() {
+        let ctx = test_context();
+        let executor = ToolExecutor::new(ctx.clone(), None);
+        let mut session = ToolSession::from_readable_paths([ctx.workspace_root.join("note.txt")]);
+        let cancel = crate::cancel::cancel_pair().1;
+
+        fs::write(ctx.workspace_root.join("note.txt"), "alpha beta").expect("seed file");
+
+        let err = executor
+            .edit(
+                &mut session,
+                serde_json::json!({
+                    "path": "note.txt",
+                    "old_text": "beta",
+                    "new_text": "gamma",
+                }),
+                &cancel,
+            )
+            .await
+            .expect_err("restored read-set without version metadata must fail");
+
+        assert!(err.to_string().contains("fresh re-Read after restart"));
+    }
+
+    #[tokio::test]
     async fn show_requires_non_empty_prompt() {
         let ctx = test_context();
         let executor = ToolExecutor::new(ctx.clone(), None);
@@ -3477,6 +4015,32 @@ mod tests {
             .expect_err("empty prompt must fail");
 
         assert!(err.to_string().contains("Show prompt must not be empty"));
+    }
+
+    #[tokio::test]
+    async fn show_rejects_sensitive_runtime_file() {
+        let ctx = test_context();
+        let executor = ToolExecutor::new(ctx.clone(), None);
+        let mut session = ToolSession::default();
+        let cancel = crate::cancel::cancel_pair().1;
+        let sessions_dir = ctx.workspace_root.join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+        fs::write(sessions_dir.join("current.jsonl"), "{}\n").expect("seed session file");
+
+        let err = executor
+            .show(
+                &mut session,
+                &ToolRuntime::detached(),
+                serde_json::json!({
+                    "path": "sessions/current.jsonl",
+                    "prompt": "show runtime data"
+                }),
+                &cancel,
+            )
+            .await
+            .expect_err("runtime Show must fail");
+
+        assert!(err.to_string().contains("runtime/session data"));
     }
 
     #[tokio::test]
@@ -3637,6 +4201,70 @@ Write about $topic in session ${SA_SESSION_ID}.
         assert!(names.contains(&"Bash"));
         assert!(!names.contains(&"Show"));
         assert!(!names.contains(&"Send"));
+    }
+
+    #[test]
+    fn tool_definitions_hide_interaction_tools_when_runtime_lacks_permissions() {
+        let ctx = test_context();
+        let executor = ToolExecutor::new(ctx, None);
+        let mut runtime = ToolRuntime::detached();
+        runtime.allow_user_send = false;
+        runtime.allow_user_show = false;
+        runtime.allow_user_ask = false;
+
+        let names = executor
+            .tool_definitions(&runtime)
+            .into_iter()
+            .map(|definition| definition.function.name)
+            .collect::<Vec<_>>();
+
+        assert!(!names.iter().any(|name| name == "Send"));
+        assert!(!names.iter().any(|name| name == "Show"));
+        assert!(!names.iter().any(|name| name == "Ask"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn infer_git_bash_candidates_from_git_path_prefers_git_install_root() {
+        let git_path = PathBuf::from(r"D:\Git\cmd\git.exe");
+        let candidates = infer_git_bash_candidates_from_git_path(&git_path);
+
+        assert_eq!(candidates[0], PathBuf::from(r"D:\Git\bin\bash.exe"));
+        assert_eq!(candidates[1], PathBuf::from(r"D:\Git\usr\bin\bash.exe"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn preferred_windows_bash_candidate_rejects_wsl_shims() {
+        assert!(is_preferred_windows_bash_candidate(Path::new(
+            r"D:\Git\bin\bash.exe"
+        )));
+        assert!(!is_preferred_windows_bash_candidate(Path::new(
+            r"C:\Windows\System32\bash.exe"
+        )));
+        assert!(!is_preferred_windows_bash_candidate(Path::new(
+            r"C:\Users\name\AppData\Local\Microsoft\WindowsApps\bash.exe"
+        )));
+    }
+
+    #[tokio::test]
+    async fn bash_tool_blocks_unsafe_command_before_execution() {
+        let ctx = test_context();
+        let executor = ToolExecutor::new(ctx, None);
+        let cancel = crate::cancel::cancel_pair().1;
+
+        let err = executor
+            .bash(
+                &ToolRuntime::detached(),
+                serde_json::json!({
+                    "command": "echo $(whoami)"
+                }),
+                &cancel,
+            )
+            .await
+            .expect_err("unsafe Bash command must be blocked");
+
+        assert!(err.to_string().contains("Bash blocked by SA safety checks"));
     }
 
     #[tokio::test]

@@ -107,7 +107,7 @@
 - `SOUL.md`
 - `USER.md`
 - `IDENTITY.md`
-- `HEARTBEAT.md`
+- `TODO.md`
 - `BOOT.md`
 - `BOOTSTRAP.md`
 - `TOOLS.md`
@@ -289,7 +289,7 @@ sa/
 ├─ SOUL.md
 ├─ USER.md
 ├─ IDENTITY.md
-├─ HEARTBEAT.md
+├─ TODO.md
 ├─ BOOT.md
 ├─ BOOTSTRAP.md
 ├─ TOOLS.md
@@ -442,15 +442,23 @@ cargo build --release
 
 开发文档位于：
 
-- `docs/development/README.md`
+- `../docs/development/README.md`
 
 如果你要看一份当前提示词快照，可参考：
 
 - `prompt.md`
 
-如果你要看分层记忆与 nightly dream 设计，可参考：
+如果你要看当前这轮安全专题文档，可参考：
 
-- `docs/development/dream-memory.md`
+- `../docs/development/sa-bash-safety-design.md`
+- `../docs/development/sa-fetch-safety-design.md`
+- `../docs/development/sa-path-guard-design.md`
+- `../docs/development/sa-task-audit-design.md`
+
+补充说明：
+
+- 历史上的协议、会话、dream 等专题文档仍保留在 `docs/development/`（`sa/` 子目录内）；
+- 根级 `../docs/development/` 目前优先维护这轮直接对照源码的安全与运维文档。
 
 ## 已知限制
 

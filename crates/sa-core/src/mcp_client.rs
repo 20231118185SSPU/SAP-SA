@@ -353,15 +353,27 @@ impl McpRegistry {
         let mut server_indexes = HashMap::new();
         let mut resources = HashMap::new();
         let mut prompt_defs = HashMap::new();
+        let mut normalized_server_names = HashMap::<String, String>::new();
 
         for config in configs {
+            let normalized_server = normalize_name_for_mcp(&config.name);
+            if let Some(previous) =
+                normalized_server_names.insert(normalized_server.clone(), config.name.clone())
+            {
+                anyhow::bail!(
+                    "MCP server name collision after normalization: `{}` and `{}` both map to `mcp__{}`",
+                    previous,
+                    config.name,
+                    normalized_server
+                );
+            }
+
             match McpServer::connect(config.clone()).await {
                 Ok(server) => {
                     let server_index = servers.len();
                     let tools = server.tools().await;
                     let server_resources = server.resources().await;
                     let prompts = server.prompts().await;
-                    let normalized_server = normalize_name_for_mcp(&config.name);
                     for tool in tools {
                         let prefixed_name = format!("mcp__{}__{}", normalized_server, tool.name);
                         routes.insert(prefixed_name.clone(), (server_index, tool.name.clone()));
@@ -672,5 +684,39 @@ mod tests {
             .expect("connect_all should not fail the whole registry");
         assert!(registry.is_empty());
         assert_eq!(registry.tool_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn connect_all_rejects_normalized_server_name_collision() {
+        let configs = vec![
+            McpServerConfig {
+                name: "play.wright".to_string(),
+                transport: McpTransport::Stdio,
+                url: None,
+                command: "/definitely/missing/sa-mcp-test".to_string(),
+                args: Vec::new(),
+                cwd: None,
+                env: HashMap::new(),
+                headers: HashMap::new(),
+                tool_timeout_secs: None,
+            },
+            McpServerConfig {
+                name: "play/wright".to_string(),
+                transport: McpTransport::Stdio,
+                url: None,
+                command: "/definitely/missing/sa-mcp-test".to_string(),
+                args: Vec::new(),
+                cwd: None,
+                env: HashMap::new(),
+                headers: HashMap::new(),
+                tool_timeout_secs: None,
+            },
+        ];
+
+        let err = match McpRegistry::connect_all(&configs).await {
+            Ok(_) => panic!("normalized collision must fail"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("MCP server name collision"));
     }
 }

@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs;
 use std::io::Write as _;
+use std::io::{BufRead as _, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
@@ -276,14 +277,23 @@ impl InteractionStore {
         if !self.log_path.is_file() {
             return Ok(None);
         }
-        let raw = fs::read_to_string(&self.log_path).with_context(|| {
+        let file = fs::File::open(&self.log_path).with_context(|| {
             format!(
-                "Failed to read interaction log: {}",
+                "Failed to open interaction log for lookup: {}",
                 self.log_path.display()
             )
         })?;
-        for line in raw.lines().filter(|line| !line.trim().is_empty()) {
-            let entry = serde_json::from_str::<InteractionEntry>(line)
+        for line in BufReader::new(file).lines() {
+            let line = line.with_context(|| {
+                format!(
+                    "Failed to read interaction log line: {}",
+                    self.log_path.display()
+                )
+            })?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let entry = serde_json::from_str::<InteractionEntry>(&line)
                 .context("Invalid interaction history JSONL entry")?;
             if entry.id == id {
                 return Ok(Some(entry));
