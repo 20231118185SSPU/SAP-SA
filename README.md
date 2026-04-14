@@ -13,6 +13,7 @@
 - 以 nightly dream 机制持续提炼长期记忆
 - 通过 WebSocket 暴露后端服务
 - 支持 `Send` / `Ask` / `Show` / `SubAgent`
+- 支持 `TransferInput`，可把同学后续自由输入持续移交给指定子代理，直到根代理显式收回或再次转交
 - 按分层结构处理记忆文件（`MEMORY.md`、`memory/topics/*.md`、`memory/*.md`、`memory/dreams/*.md`）
 
 这个仓库只包含后端 Agent。
@@ -31,6 +32,12 @@
 - 调用技能
 - 通过子代理拆分任务
 - 在需要时向用户发消息、提问、展示文件
+- 在需要时把对同学的后续输入长期交给某个子代理处理
+
+前端集成约定：
+
+- `Send` / `Ask` / `Show` / `Event` 会携带正式的代理身份元数据（`agent_id`、`agent_label`、`display_name`、`is_root`）
+- 前端应优先使用这些字段渲染身份，而不是依赖消息正文里的前缀文本
 
 ## 核心能力
 

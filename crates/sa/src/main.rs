@@ -60,9 +60,9 @@ use sa_core::ws_identity::{
     load_local_identity, verify_client_hello,
 };
 use sa_core::ws_protocol::{
-    ClientMessage, Event, EventKind, InitCompleted, InitFailed, InitMethod, InitMethodOption,
-    InitRequired, InitializeConfigRequest, QuestionMode, ServerMessage, UserQuestion,
-    UserQuestionAnswer, UserVisibleFile, UserVisibleFileEncoding,
+    AgentIdentity, ClientMessage, Event, EventKind, InitCompleted, InitFailed, InitMethod,
+    InitMethodOption, InitRequired, InitializeConfigRequest, QuestionMode, ServerMessage,
+    UserQuestion, UserQuestionAnswer, UserVisibleFile, UserVisibleFileEncoding,
 };
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -603,6 +603,17 @@ impl Hub {
     /// - store in buffer
     /// - broadcast to subscribers
     fn publish(&self, kind: EventKind, task_id: Uuid, message: String) {
+        self.publish_with_agent(kind, task_id, message, None);
+    }
+
+    /// Publish one event with optional structured sender identity metadata.
+    fn publish_with_agent(
+        &self,
+        kind: EventKind,
+        task_id: Uuid,
+        message: String,
+        agent: Option<AgentIdentity>,
+    ) {
         // Monotonic id: start at 1.
         let event_id = self.next_event_id.fetch_add(1, Ordering::Relaxed) + 1;
 
@@ -616,6 +627,7 @@ impl Hub {
             task_id,
             kind,
             message,
+            agent,
         };
 
         mirror_server_message(&ServerMessage::Event {
@@ -1072,6 +1084,30 @@ impl Hub {
             allow_user_send: state.allow_user_send,
             allow_user_show: state.allow_user_show,
             allow_user_ask: state.allow_user_ask,
+        }
+    }
+
+    /// Build stable frontend-facing identity metadata for one agent.
+    fn frontend_identity_from_state(state: &AgentState) -> AgentIdentity {
+        Self::frontend_identity(
+            state.agent_id,
+            state.label.clone(),
+            state.parent_agent_id.is_none(),
+        )
+    }
+
+    /// Build stable frontend-facing identity metadata from runtime fields.
+    fn frontend_identity(agent_id: Uuid, agent_label: String, is_root: bool) -> AgentIdentity {
+        let display_name = if is_root {
+            "学习委员".to_string()
+        } else {
+            agent_label.clone()
+        };
+        AgentIdentity {
+            agent_id,
+            agent_label,
+            display_name,
+            is_root,
         }
     }
 
@@ -1758,6 +1794,7 @@ impl Hub {
             question_id,
             task_id: work_id,
             created_at,
+            agent: Some(Self::frontend_identity_from_state(state)),
             prompt: request.prompt.clone(),
             mode: request.mode.clone(),
             options: request.options.clone(),
@@ -1923,13 +1960,6 @@ impl Hub {
             .await?;
         }
 
-        if self.team_state.lock().await.input_owner_agent_id == Some(agent_id)
-            && agent_id != root_agent_id
-        {
-            self.set_input_owner(root_agent_id, Some(work_id), "finished child work")
-                .await?;
-        }
-
         self.wake_waiters_for_dependency(
             WaitKind::Agent,
             agent_id,
@@ -2080,6 +2110,7 @@ impl Hub {
                         question_id: question_state.question_id,
                         task_id: question_state.work_id,
                         created_at: question_state.created_at,
+                        agent: Some(Self::frontend_identity_from_state(&state)),
                         prompt: question_state.prompt,
                         mode,
                         options,
@@ -2634,7 +2665,6 @@ impl Hub {
         holds_input_ownership: bool,
     ) -> ToolRuntime {
         let agent_id = state.agent_id;
-        let agent_label = state.label.clone();
         let parent_agent_id = state.parent_agent_id;
         let root_agent_id = state.root_agent_id;
         let is_root = parent_agent_id.is_none();
@@ -2646,6 +2676,7 @@ impl Hub {
         let permissions = self.current_permissions();
         let denied_tools = permissions.deny_tools;
         let denied_commands = permissions.deny_commands;
+        let frontend_identity = Self::frontend_identity(agent_id, state.label.clone(), is_root);
         let allowed_tool_patterns = state
             .active_command_invocations
             .iter()
@@ -2664,31 +2695,32 @@ impl Hub {
             .rev()
             .find_map(|invocation| invocation.effort_override.clone());
         let runtime_label = state.label.clone();
-        let show_agent_label = state.label.clone();
         let notify_parent_label = state.label.clone();
         let message_agent_label = state.label.clone();
         let broadcast_agent_label = state.label.clone();
         let parent_work_id = state.parent_work_id;
+        let send_frontend_identity = frontend_identity.clone();
+        let show_frontend_identity = frontend_identity.clone();
 
         let hub_for_send = Arc::clone(self);
         let send_message: SendMessageFn = Arc::new(move |message: String| {
             let hub = Arc::clone(&hub_for_send);
-            let agent_label = agent_label.clone();
+            let frontend_identity = send_frontend_identity.clone();
             Box::pin(async move {
                 hub.mark_work_user_output(agent_id, work_id).await?;
-                let visible = if is_root {
-                    message
-                } else {
-                    format!("[{agent_label}] {message}")
-                };
                 hub.record_interaction(
                     Some(work_id),
                     Some(agent_id),
                     InteractionPayload::Send {
-                        message: visible.clone(),
+                        message: message.clone(),
                     },
                 )?;
-                hub.publish(EventKind::Message, work_id, visible);
+                hub.publish_with_agent(
+                    EventKind::Message,
+                    work_id,
+                    message,
+                    Some(frontend_identity),
+                );
                 Ok(())
             })
         });
@@ -2704,16 +2736,11 @@ impl Hub {
         let hub_for_show = Arc::clone(self);
         let show_file: ShowFileFn = Arc::new(move |mut file: UserVisibleFile| {
             let hub = Arc::clone(&hub_for_show);
-            let agent_label = show_agent_label.clone();
+            let frontend_identity = show_frontend_identity.clone();
             Box::pin(async move {
                 hub.mark_work_user_output(agent_id, work_id).await?;
                 file.task_id = work_id;
-                if !is_root {
-                    file.title = Some(match file.title {
-                        Some(title) => format!("[{agent_label}] {title}"),
-                        None => format!("[{agent_label}] {}", file.path),
-                    });
-                }
+                file.agent = Some(frontend_identity);
                 hub.record_interaction(
                     Some(work_id),
                     Some(agent_id),
@@ -3378,6 +3405,7 @@ impl Hub {
             question_id: Uuid::new_v4(),
             task_id,
             created_at: chrono::Utc::now(),
+            agent: None,
             prompt: request.prompt,
             mode: request.mode,
             options: request.options,
@@ -5000,9 +5028,19 @@ fn validate_user_answer(
 
 /// Mirror one event in a stable multi-line format.
 fn mirror_event_line(prefix: &str, event: &Event) {
+    let agent_meta = event
+        .agent
+        .as_ref()
+        .map(|agent| {
+            format!(
+                "[agent={}][agent_id={}][agent_label={}]",
+                agent.display_name, agent.agent_id, agent.agent_label
+            )
+        })
+        .unwrap_or_default();
     let header = format!(
-        "{prefix}[kind={:?}][task={}][event_id={}][ts={}] ",
-        event.kind, event.task_id, event.event_id, event.ts
+        "{prefix}[kind={:?}][task={}][event_id={}][ts={}]{} ",
+        event.kind, event.task_id, event.event_id, event.ts, agent_meta
     );
 
     let mut lines = event.message.lines();
@@ -5020,8 +5058,18 @@ fn mirror_event_line(prefix: &str, event: &Event) {
 /// Mirror one `Show` payload in a stable format.
 fn mirror_shown_file(prefix: &str, file: &UserVisibleFile) {
     let title = file.title.as_deref().unwrap_or(&file.path);
+    let agent_meta = file
+        .agent
+        .as_ref()
+        .map(|agent| {
+            format!(
+                "[agent={}][agent_id={}][agent_label={}]",
+                agent.display_name, agent.agent_id, agent.agent_label
+            )
+        })
+        .unwrap_or_default();
     eprintln!(
-        "{prefix}[task={}][title={}][prompt={}] path={} media_type={} bytes={}",
+        "{prefix}[task={}]{agent_meta}[title={}][prompt={}] path={} media_type={} bytes={}",
         file.task_id, title, file.prompt, file.path, file.media_type, file.bytes
     );
     match file.encoding {
@@ -5072,9 +5120,19 @@ fn mirror_server_message(msg: &ServerMessage) {
             mirror_event_line("[frontend][event]", event);
         }
         ServerMessage::Question { question } => {
+            let agent_meta = question
+                .agent
+                .as_ref()
+                .map(|agent| {
+                    format!(
+                        "[agent={}][agent_id={}][agent_label={}]",
+                        agent.display_name, agent.agent_id, agent.agent_label
+                    )
+                })
+                .unwrap_or_default();
             eprintln!(
-                "[frontend][ask][task={}][id={}] {}",
-                question.task_id, question.question_id, question.prompt
+                "[frontend][ask][task={}][id={}]{} {}",
+                question.task_id, question.question_id, agent_meta, question.prompt
             );
             for (index, option) in question.options.iter().enumerate() {
                 match option.description.as_deref() {
@@ -6437,6 +6495,7 @@ description: Teaches patiently
                     question_id,
                     task_id: work_id,
                     created_at: chrono::Utc::now(),
+                    agent: None,
                     prompt: "请选择".to_string(),
                     mode: QuestionMode::SingleChoice,
                     options: vec![sa_core::ws_protocol::QuestionOption {
@@ -6664,6 +6723,191 @@ description: Teaches patiently
             }
             other => panic!("expected ask interaction, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn root_frontend_identity_uses_study_administrator_display_name() {
+        let root_agent_id = Uuid::new_v4();
+        let state = AgentState::new_root(root_agent_id, "sessions/agents/root.jsonl".to_string());
+        let identity = Hub::frontend_identity_from_state(&state);
+
+        assert_eq!(identity.agent_id, root_agent_id);
+        assert_eq!(identity.agent_label, "root");
+        assert_eq!(identity.display_name, "学习委员");
+        assert!(identity.is_root);
+    }
+
+    #[tokio::test]
+    async fn child_finish_does_not_reclaim_transferred_input_ownership() {
+        let workspace = TempDir::new().expect("temp workspace should build");
+        let hub = build_test_hub(&workspace);
+        let root_agent_id = hub
+            .runtime_store
+            .load_root_marker()
+            .expect("root marker should load")
+            .expect("root marker should exist")
+            .root_agent_id;
+        let child_agent_id = Uuid::new_v4();
+        let child_work_id = Uuid::new_v4();
+        let parent_work_id = Uuid::new_v4();
+        let started_at = chrono::Utc::now();
+        let mut child_state = AgentState::new_child(
+            child_agent_id,
+            root_agent_id,
+            root_agent_id,
+            "聊天助手".to_string(),
+            true,
+            true,
+            true,
+            true,
+            None,
+            None,
+            None,
+            "sessions/agents/child.jsonl".to_string(),
+        );
+        child_state.active_work_id = Some(child_work_id);
+        child_state.active_work_summary = Some("处理和同学的聊天".to_string());
+        child_state.active_started_at = Some(started_at);
+        child_state.parent_work_id = Some(parent_work_id);
+        child_state.work_has_parent_message = true;
+        hub.runtime_store
+            .save_agent_state(&child_state)
+            .expect("child state should save");
+
+        hub.set_input_owner(child_agent_id, Some(child_work_id), "test transfer")
+            .await
+            .expect("input owner should transfer to child");
+        hub.handle_finish_outcome(
+            &mut child_state,
+            "当前轮次完成".to_string(),
+            "已完成当前工作".to_string(),
+            false,
+        )
+        .await
+        .expect("finish should succeed");
+
+        assert_eq!(
+            hub.team_state.lock().await.input_owner_agent_id,
+            Some(child_agent_id)
+        );
+        let persisted = hub
+            .runtime_store
+            .load_team_state()
+            .expect("team state should load")
+            .expect("team state should exist");
+        assert_eq!(persisted.input_owner_agent_id, Some(child_agent_id));
+    }
+
+    #[tokio::test]
+    async fn child_user_outputs_carry_identity_metadata_without_text_prefixes() {
+        let workspace = TempDir::new().expect("temp workspace should build");
+        let hub = build_test_hub(&workspace);
+        let root_agent_id = hub
+            .runtime_store
+            .load_root_marker()
+            .expect("root marker should load")
+            .expect("root marker should exist")
+            .root_agent_id;
+        let child_agent_id = Uuid::new_v4();
+        let work_id = Uuid::new_v4();
+        let mut child_state = AgentState::new_child(
+            child_agent_id,
+            root_agent_id,
+            root_agent_id,
+            "数学老师".to_string(),
+            true,
+            true,
+            true,
+            true,
+            None,
+            None,
+            None,
+            "sessions/agents/child.jsonl".to_string(),
+        );
+        child_state.active_work_id = Some(work_id);
+        child_state.active_work_summary = Some("和同学沟通".to_string());
+        child_state.active_started_at = Some(chrono::Utc::now());
+        hub.runtime_store
+            .save_agent_state(&child_state)
+            .expect("child state should save");
+
+        let runtime = hub.build_agent_tool_runtime(&child_state, work_id, true);
+        let expected_identity = AgentIdentity {
+            agent_id: child_agent_id,
+            agent_label: "数学老师".to_string(),
+            display_name: "数学老师".to_string(),
+            is_root: false,
+        };
+        let mut events_rx = hub.events_tx.subscribe();
+
+        runtime
+            .send_message("我来继续接手和同学对话。".to_string())
+            .await
+            .expect("send should succeed");
+        match events_rx.recv().await.expect("send event should arrive") {
+            ServerMessage::Event { event } => {
+                assert_eq!(event.kind, EventKind::Message);
+                assert_eq!(event.message, "我来继续接手和同学对话。");
+                assert_eq!(event.agent, Some(expected_identity.clone()));
+            }
+            other => panic!("expected message event, got {other:?}"),
+        }
+
+        runtime
+            .show_file(UserVisibleFile {
+                show_id: Uuid::new_v4(),
+                task_id: Uuid::nil(),
+                agent: None,
+                path: "plan.md".to_string(),
+                title: Some("学习计划".to_string()),
+                prompt: "展示整理好的学习计划".to_string(),
+                media_type: "text/markdown".to_string(),
+                encoding: UserVisibleFileEncoding::Utf8,
+                content: "# Plan".to_string(),
+                bytes: 6,
+            })
+            .await
+            .expect("show should succeed");
+        match events_rx.recv().await.expect("show event should arrive") {
+            ServerMessage::Show { file } => {
+                assert_eq!(file.title.as_deref(), Some("学习计划"));
+                assert_eq!(file.agent, Some(expected_identity.clone()));
+            }
+            other => panic!("expected show event, got {other:?}"),
+        }
+
+        hub.persist_pending_question(
+            &mut child_state,
+            work_id,
+            "call_child_ask".to_string(),
+            AskRequest {
+                prompt: "接下来先讲哪一科？".to_string(),
+                mode: QuestionMode::SingleChoice,
+                options: vec![sa_core::ws_protocol::QuestionOption {
+                    id: "math".to_string(),
+                    label: "数学".to_string(),
+                    description: None,
+                }],
+                allow_free_text: false,
+            },
+        )
+        .await
+        .expect("ask should persist");
+        match events_rx
+            .recv()
+            .await
+            .expect("question event should arrive")
+        {
+            ServerMessage::Question { question } => {
+                assert_eq!(question.prompt, "接下来先讲哪一科？");
+                assert_eq!(question.agent, Some(expected_identity.clone()));
+            }
+            other => panic!("expected question event, got {other:?}"),
+        }
+        assert_eq!(
+            hub.pending_questions_snapshot()[0].agent,
+            Some(expected_identity)
+        );
     }
 
     #[tokio::test]

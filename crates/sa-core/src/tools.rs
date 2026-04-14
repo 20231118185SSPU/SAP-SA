@@ -1761,7 +1761,7 @@ impl ToolExecutor {
                 kind: "function".to_string(),
                 function: ToolFunctionDefinition {
                     name: "TransferInput".to_string(),
-                    description: "Transfer free-form user input ownership to another agent, or return it to the root."
+                    description: "Transfer free-form user input ownership to another agent, or return it to the root. Ownership stays with the target until the root explicitly transfers it again or returns it to the root. If you want a child agent to directly reply to the classmate, first transfer input to that child."
                         .to_string(),
                     parameters: serde_json::json!({
                         "type": "object",
@@ -2676,6 +2676,7 @@ impl ToolExecutor {
         let file = UserVisibleFile {
             show_id: uuid::Uuid::new_v4(),
             task_id: uuid::Uuid::nil(),
+            agent: None,
             path: path.display().to_string(),
             title: args.title.filter(|title| !title.trim().is_empty()),
             prompt: args.prompt,

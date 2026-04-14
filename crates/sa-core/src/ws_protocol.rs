@@ -281,6 +281,22 @@ pub struct Event {
     pub kind: EventKind,
     /// Human-readable message.
     pub message: String,
+    /// Optional structured sender identity for frontend rendering.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<AgentIdentity>,
+}
+
+/// Structured agent identity surfaced to frontends.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentIdentity {
+    /// Stable agent UUID inside the current runtime tree.
+    pub agent_id: Uuid,
+    /// Internal durable label used by SA for this agent.
+    pub agent_label: String,
+    /// User-facing display name the frontend should render.
+    pub display_name: String,
+    /// Whether this identity belongs to the root "学习委员" agent.
+    pub is_root: bool,
 }
 
 /// Structured question emitted by the backend.
@@ -293,6 +309,9 @@ pub struct UserQuestion {
     /// Backend-side creation time used by reconnecting frontends to restore
     /// the original ordering around blocking `Ask` messages.
     pub created_at: DateTime<Utc>,
+    /// Agent identity that issued this question.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<AgentIdentity>,
     /// User-facing prompt.
     pub prompt: String,
     /// Expected answer shape.
@@ -349,6 +368,9 @@ pub struct UserVisibleFile {
     pub show_id: Uuid,
     /// Top-level task that produced this file.
     pub task_id: Uuid,
+    /// Agent identity that issued this file display.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<AgentIdentity>,
     /// Original backend path string.
     pub path: String,
     /// Optional user-facing title.
@@ -377,7 +399,7 @@ pub enum UserVisibleFileEncoding {
 }
 
 /// Event kind used by the CLI for formatting.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum EventKind {
     /// Normal logging/progress output.
