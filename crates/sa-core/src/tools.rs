@@ -159,6 +159,17 @@ pub type StartTerminalTaskFn = Arc<
 pub type GetTaskFn =
     Arc<dyn Fn(Uuid) -> ToolFuture<anyhow::Result<TerminalTaskInfo>> + Send + Sync + 'static>;
 
+/// Callback used by `Reload`.
+pub type ReloadRuntimeFn =
+    Arc<dyn Fn() -> ToolFuture<anyhow::Result<ReloadRuntimeReceipt>> + Send + Sync + 'static>;
+
+/// Structured result returned by the runtime hot-reload callback.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReloadRuntimeReceipt {
+    /// Human-readable summary of what was reloaded.
+    pub summary: String,
+}
+
 /// Structured request emitted by the `Ask` tool.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AskRequest {
@@ -562,6 +573,8 @@ pub struct ToolRuntime {
     pub allow_user_ask: bool,
     /// Whether root may transfer input ownership to this agent.
     pub allow_input_transfer_target: bool,
+    /// Whether this runtime may trigger backend hot reload.
+    pub allow_runtime_reload: bool,
     /// Glob-style tool deny patterns that are always enforced.
     pub denied_tools: Vec<String>,
     /// Glob-style command/skill deny patterns.
@@ -600,6 +613,8 @@ pub struct ToolRuntime {
     start_terminal_task: StartTerminalTaskFn,
     /// Inspect one runtime task.
     get_task: GetTaskFn,
+    /// Trigger one in-process backend hot reload.
+    reload_runtime: ReloadRuntimeFn,
 }
 
 impl ToolRuntime {
@@ -618,6 +633,7 @@ impl ToolRuntime {
         allow_user_show: bool,
         allow_user_ask: bool,
         allow_input_transfer_target: bool,
+        allow_runtime_reload: bool,
         denied_tools: Vec<String>,
         denied_commands: Vec<String>,
         allowed_tool_patterns: Vec<String>,
@@ -637,6 +653,7 @@ impl ToolRuntime {
         transfer_input: TransferInputFn,
         start_terminal_task: StartTerminalTaskFn,
         get_task: GetTaskFn,
+        reload_runtime: ReloadRuntimeFn,
     ) -> Self {
         Self {
             agent_id,
@@ -651,6 +668,7 @@ impl ToolRuntime {
             allow_user_show,
             allow_user_ask,
             allow_input_transfer_target,
+            allow_runtime_reload,
             denied_tools,
             denied_commands,
             allowed_tool_patterns,
@@ -670,6 +688,7 @@ impl ToolRuntime {
             transfer_input,
             start_terminal_task,
             get_task,
+            reload_runtime,
         }
     }
 
@@ -713,6 +732,8 @@ impl ToolRuntime {
         let get_task: GetTaskFn = Arc::new(|_task_id| {
             Box::pin(async { anyhow::bail!("GetTask runtime is not configured") })
         });
+        let reload_runtime: ReloadRuntimeFn =
+            Arc::new(|| Box::pin(async { anyhow::bail!("Reload runtime is not configured") }));
 
         Self::new(
             nil,
@@ -726,6 +747,7 @@ impl ToolRuntime {
             true,
             true,
             true,
+            false,
             false,
             Vec::new(),
             Vec::new(),
@@ -746,6 +768,7 @@ impl ToolRuntime {
             transfer_input,
             start_terminal_task,
             get_task,
+            reload_runtime,
         )
     }
 
@@ -828,6 +851,11 @@ impl ToolRuntime {
     /// Inspect one runtime task.
     pub async fn get_task(&self, task_id: Uuid) -> anyhow::Result<TerminalTaskInfo> {
         (self.get_task)(task_id).await
+    }
+
+    /// Trigger one in-process backend hot reload.
+    pub async fn reload_runtime(&self) -> anyhow::Result<ReloadRuntimeReceipt> {
+        (self.reload_runtime)().await
     }
 }
 
@@ -1713,6 +1741,18 @@ impl ToolExecutor {
                     }),
                 },
             },
+            ToolDefinition {
+                kind: "function".to_string(),
+                function: ToolFunctionDefinition {
+                    name: "Reload".to_string(),
+                    description: "Hot-reload SA runtime state from disk without restarting the process or dropping WS connections. This reloads config-backed runtime state such as model settings, skills, permissions, MCP, and Agents.md path when the change is safe to apply in place."
+                        .to_string(),
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "properties": {}
+                    }),
+                },
+            },
         ];
 
         if runtime.allow_finish_without_output {
@@ -1839,6 +1879,10 @@ impl ToolExecutor {
                 .transfer_input(runtime, args, cancel)
                 .await
                 .map(ToolExecutionResult::Observation),
+            "Reload" => self
+                .reload(runtime, args, cancel)
+                .await
+                .map(ToolExecutionResult::Observation),
             "Wait" => self.wait(args, cancel).await,
             "GetTask" => self
                 .get_task(runtime, args, cancel)
@@ -1866,6 +1910,7 @@ impl ToolExecutor {
             "Ask" if !runtime.allow_user_ask => return false,
             "NotifyParent" if runtime.parent_agent_id.is_none() => return false,
             "TransferInput" if !runtime.is_root => return false,
+            "Reload" if !runtime.allow_runtime_reload => return false,
             _ => {}
         }
 
@@ -3130,6 +3175,32 @@ impl ToolExecutor {
         let task = runtime.get_task(args.task_id).await?;
         Ok(serde_json::to_string(&task)?)
     }
+
+    /// `Reload`: ask the backend to hot-reload runtime state from disk.
+    async fn reload(
+        &self,
+        runtime: &ToolRuntime,
+        args: serde_json::Value,
+        cancel: &CancelToken,
+    ) -> anyhow::Result<String> {
+        if cancel.is_cancelled() {
+            anyhow::bail!("Reload cancelled");
+        }
+        if !runtime.allow_runtime_reload {
+            anyhow::bail!("Reload is not available in the current runtime");
+        }
+
+        #[derive(Debug, Deserialize, Default)]
+        struct Args {}
+
+        let _: Args = serde_json::from_value(args).context("Invalid arguments for Reload")?;
+        let receipt = runtime.reload_runtime().await?;
+        Ok(serde_json::json!({
+            "reloaded": true,
+            "summary": receipt.summary,
+        })
+        .to_string())
+    }
 }
 
 /// Candidate `bash` programs to try, in order.
@@ -4221,6 +4292,48 @@ Write about $topic in session ${SA_SESSION_ID}.
         assert!(!names.iter().any(|name| name == "Send"));
         assert!(!names.iter().any(|name| name == "Show"));
         assert!(!names.iter().any(|name| name == "Ask"));
+    }
+
+    #[tokio::test]
+    async fn reload_tool_invokes_runtime_callback_and_returns_summary() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let ctx = test_context();
+        let executor = ToolExecutor::new(ctx, None);
+        let cancel = crate::cancel::cancel_pair().1;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut runtime = ToolRuntime::detached();
+        runtime.allow_runtime_reload = true;
+        runtime.reload_runtime = {
+            let calls = Arc::clone(&calls);
+            Arc::new(move || {
+                let calls = Arc::clone(&calls);
+                Box::pin(async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(ReloadRuntimeReceipt {
+                        summary: "reloaded model=test-model skills=3 mcp_servers=1".to_string(),
+                    })
+                })
+            })
+        };
+        let mut session = ToolSession::default();
+
+        let raw = executor
+            .execute(
+                &mut session,
+                &runtime,
+                "Reload",
+                serde_json::json!({}),
+                &cancel,
+            )
+            .await
+            .expect("Reload should succeed");
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let ToolExecutionResult::Observation(raw) = raw else {
+            panic!("Reload should return an observation payload");
+        };
+        assert!(raw.contains("reloaded model=test-model"));
     }
 
     #[cfg(windows)]

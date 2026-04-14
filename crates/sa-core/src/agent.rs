@@ -20,8 +20,8 @@ use crate::retry::retry_delay;
 use crate::session::SessionStore;
 use crate::skills::SkillRegistry;
 use crate::tools::{
-    AskRequest, PromptProfile, ToolControl, ToolExecutionResult, ToolExecutor, ToolRuntime,
-    ToolSession,
+    AskRequest, PromptProfile, ReloadRuntimeFn, ToolControl, ToolExecutionResult, ToolExecutor,
+    ToolRuntime, ToolSession,
 };
 use crate::ws_protocol::EventKind;
 use anyhow::Context as _;
@@ -144,6 +144,11 @@ impl AgentRunner {
             skills,
             cfg,
         }
+    }
+
+    /// Return the effective static runner configuration.
+    pub fn config(&self) -> &AgentRunnerConfig {
+        &self.cfg
     }
 
     /// Run one task until completion.
@@ -1500,6 +1505,8 @@ fn build_internal_memory_refresh_runtime(
     let get_task: GetTaskFn = Arc::new(move |_task_id| {
         Box::pin(async move { anyhow::bail!("memory refresh must not use GetTask") })
     });
+    let reload_runtime: ReloadRuntimeFn =
+        Arc::new(|| Box::pin(async { anyhow::bail!("memory refresh must not use Reload") }));
 
     ToolRuntime::new(
         task_id,
@@ -1507,6 +1514,7 @@ fn build_internal_memory_refresh_runtime(
         task_id,
         format!("memory-refresh-depth-{depth}"),
         PromptProfile::Background,
+        false,
         false,
         false,
         false,
@@ -1533,6 +1541,7 @@ fn build_internal_memory_refresh_runtime(
         transfer_input,
         start_terminal_task,
         get_task,
+        reload_runtime,
     )
 }
 

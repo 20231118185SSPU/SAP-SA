@@ -534,6 +534,7 @@ pub fn load_config_from_file(path: &Path) -> anyhow::Result<Config> {
     let mut config = toml::from_str::<Config>(&raw)
         .with_context(|| format!("Failed to parse TOML config file: {}", path.display()))?;
     let config_file_dir = resolve_config_file_dir(path)?;
+    normalize_skill_config_paths(&mut config.skills, &config_file_dir)?;
     normalize_mcp_config_paths(&mut config.mcp, &config_file_dir)?;
     validate_mcp_config(&config.mcp)?;
     Ok(config)
@@ -594,6 +595,25 @@ pub fn expand_tilde(path: &str) -> PathBuf {
 
 /// Hard safety ceiling for MCP per-tool call timeouts.
 const MCP_MAX_TOOL_TIMEOUT_SECS: u64 = 600;
+
+/// Resolve all skill scan directories into their final runtime form.
+///
+/// We intentionally allow nonexistent paths because users may preconfigure a
+/// directory before installing any skills there; the scanner already treats
+/// missing directories as empty.
+fn normalize_skill_config_paths(
+    config: &mut SkillsConfig,
+    config_file_dir: &Path,
+) -> anyhow::Result<()> {
+    for dir in &mut config.dirs {
+        let expanded = expand_tilde(dir);
+        let resolved = resolve_config_relative_path(&expanded, config_file_dir)
+            .with_context(|| format!("failed to resolve skills.dir `{dir}`"))?;
+        *dir = resolved.display().to_string();
+    }
+
+    Ok(())
+}
 
 /// Resolve all MCP filesystem paths into their final runtime form.
 ///
@@ -1275,6 +1295,42 @@ cwd = "mcp-workdir"
             load_config_from_file(&config_path).expect("config with relative cwd should load");
         assert_eq!(cfg.mcp.servers.len(), 1);
         assert_eq!(cfg.mcp.servers[0].cwd.as_deref(), Some(mcp_cwd.as_path()));
+    }
+
+    #[test]
+    fn load_config_resolves_skill_dirs_relative_to_config_file_dir() {
+        let temp = TempDir::new().expect("temp dir should be created");
+        let config_dir = temp.path().join("config");
+        let skills_dir = config_dir.join("skills");
+        fs::create_dir_all(&skills_dir).expect("skills dir should be created");
+
+        let config_path = config_dir.join("sa.toml");
+        fs::create_dir_all(&config_dir).expect("config dir should be created");
+        fs::write(
+            &config_path,
+            r#"
+[llm]
+base_url = "https://example.com/v1"
+api_key = "sk-test"
+model = "gpt-5.2"
+
+[server]
+bind = "127.0.0.1:8765"
+ws_path = "/ws"
+
+[workspace]
+root_dir = "."
+agents_md = "Agents.md"
+
+[skills]
+dirs = ["./skills"]
+"#,
+        )
+        .expect("config file should be written");
+
+        let cfg =
+            load_config_from_file(&config_path).expect("config with relative skills should load");
+        assert_eq!(cfg.skills.dirs, vec![skills_dir.display().to_string()]);
     }
 
     #[test]

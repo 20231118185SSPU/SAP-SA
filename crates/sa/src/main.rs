@@ -50,9 +50,9 @@ use sa_core::tools::{
     AgentInfo, AgentMessageReceipt, AgentMessageRequest, AgentScope, AskQuestionFn, AskRequest,
     BroadcastAgentsFn, BroadcastAgentsRequest, BroadcastReceipt, GetAgentFn, GetTaskFn,
     ListAgentsFn, ListAgentsRequest, MAX_SUBAGENT_DEPTH, MessageAgentFn, NotifyParentFn,
-    PromptProfile, RunSubAgentFn, SendMessageFn, ShowFileFn, StartTerminalTaskFn,
-    StartTerminalTaskRequest, SubAgentHandle, SubAgentRequest, TerminalTaskHandle,
-    TerminalTaskInfo, ToolContext, ToolExecutor, ToolRuntime, TransferInputFn,
+    PromptProfile, ReloadRuntimeFn, ReloadRuntimeReceipt, RunSubAgentFn, SendMessageFn, ShowFileFn,
+    StartTerminalTaskFn, StartTerminalTaskRequest, SubAgentHandle, SubAgentRequest,
+    TerminalTaskHandle, TerminalTaskInfo, ToolContext, ToolExecutor, ToolRuntime, TransferInputFn,
     TransferInputReceipt, TransferInputRequest,
 };
 use sa_core::ws_identity::{
@@ -68,6 +68,7 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{Mutex as AsyncMutex, Semaphore, broadcast, mpsc, oneshot};
 use tracing::Level;
@@ -245,6 +246,50 @@ struct RunningAgentExecution {
     cancel: CancelHandle,
 }
 
+/// Runtime components that can be replaced in place by hot reload.
+#[derive(Debug, Clone)]
+struct RuntimeReloadState {
+    /// Current agent runner (model client + tools + prompt config).
+    runner: AgentRunner,
+    /// Current workspace tool context used for skills and path resolution.
+    preload_ctx: ToolContext,
+    /// Current `Agents.md` path injected into prompts.
+    agents_md_path: PathBuf,
+    /// Current team-level runtime configuration.
+    team_cfg: TeamConfig,
+    /// Current non-interactive permission policy.
+    permissions: PermissionsConfig,
+    /// Current global concurrent model-call ceiling.
+    max_concurrent_model_calls: usize,
+}
+
+/// Fully prepared runtime returned from parsed config before the hub is
+/// started or hot-reloaded.
+#[derive(Debug, Clone)]
+struct PreparedRuntime {
+    /// Bind address selected by the config.
+    bind: String,
+    /// WS path selected by the config.
+    ws_path: String,
+    /// Canonical workspace root.
+    workspace_root: PathBuf,
+    /// Components that may be hot-swapped into an existing hub.
+    reloadable: RuntimeReloadState,
+    /// Dream scheduler manager built from the same config.
+    dream_manager: DreamManager,
+    /// Human-readable summary returned by `Reload`.
+    reload_summary: String,
+}
+
+/// One live dream scheduler task.
+#[derive(Debug)]
+struct DreamSchedulerHandle {
+    /// Cancellation handle used to stop the background loop on reload.
+    cancel: CancelHandle,
+    /// Spawned background task.
+    task: tokio::task::JoinHandle<()>,
+}
+
 /// Shared daemon state.
 ///
 /// This object is designed so:
@@ -289,7 +334,7 @@ struct Hub {
     agent_session_stores: AsyncMutex<HashMap<Uuid, Arc<SessionStore>>>,
 
     /// Limits the number of concurrent model calls across the whole runtime.
-    model_call_semaphore: Arc<Semaphore>,
+    model_call_semaphore: RwLock<Arc<Semaphore>>,
 
     /// Questions waiting for a user answer.
     pending_questions: Mutex<Vec<PendingQuestionEntry>>,
@@ -302,11 +347,20 @@ struct Hub {
     /// Durable append-only background-task audit history.
     task_audit_store: Arc<TaskAuditStore>,
 
+    /// Stable config file path used by hot reload.
+    config_path: PathBuf,
+    /// Stable bind address; changing it still requires a restart.
+    bind: String,
+    /// Stable WS path; changing it still requires a restart.
+    ws_path: String,
+    /// Stable canonical workspace root. Hot reload may not change this.
+    workspace_root: PathBuf,
+
     /// Context used for safe path resolution when preloading files.
-    preload_ctx: ToolContext,
+    preload_ctx: RwLock<ToolContext>,
 
     /// The agent runner (OpenAI + tools loop).
-    runner: AgentRunner,
+    runner: RwLock<AgentRunner>,
 
     /// Path to Agents.md (reloaded for every task).
     ///
@@ -314,7 +368,7 @@ struct Hub {
     /// - Users often edit `Agents.md` while the daemon is running.
     /// - Users may create `Agents.md` after the daemon starts.
     /// Reloading makes this behavior verifiable and fixes "Agents.md not loaded" confusion.
-    agents_md_path: PathBuf,
+    agents_md_path: RwLock<PathBuf>,
 
     /// Durable top-level conversation store rooted at `workspace/sessions/`.
     #[allow(dead_code)]
@@ -324,24 +378,26 @@ struct Hub {
     /// Current persisted team state snapshot.
     team_state: AsyncMutex<TeamState>,
     /// Team-level runtime tuning flags loaded from config.
-    team_cfg: TeamConfig,
+    team_cfg: RwLock<TeamConfig>,
     /// Non-interactive permission policy loaded from config.
-    permissions: PermissionsConfig,
+    permissions: RwLock<PermissionsConfig>,
+    /// Current dream scheduler task, if enabled.
+    dream_scheduler: Mutex<Option<DreamSchedulerHandle>>,
 }
 
 impl Hub {
     /// Create a new hub and spawn the background worker.
     fn new(
-        runner: AgentRunner,
-        agents_md_path: PathBuf,
-        preload_ctx: ToolContext,
+        config_path: PathBuf,
+        bind: String,
+        ws_path: String,
+        workspace_root: PathBuf,
+        reloadable: RuntimeReloadState,
         session_store: Arc<SessionStore>,
         interaction_store: Arc<InteractionStore>,
         task_audit_store: Arc<TaskAuditStore>,
         runtime_store: RuntimeStore,
         team_state: TeamState,
-        team_cfg: TeamConfig,
-        permissions: PermissionsConfig,
     ) -> Arc<Self> {
         // Task queue capacity (small but adequate for minimal agent).
         let (task_tx, task_rx) = mpsc::channel::<TaskRequest>(128);
@@ -355,6 +411,7 @@ impl Hub {
         let root_agent_id = team_state.root_agent_id;
         let mut session_stores = HashMap::new();
         session_stores.insert(root_agent_id, root_session_store);
+        let max_concurrent_model_calls = reloadable.max_concurrent_model_calls.max(1);
 
         // Build hub.
         let hub = Arc::new(Self {
@@ -368,21 +425,24 @@ impl Hub {
             wake_state: AsyncMutex::new(HashMap::new()),
             running_agents: AsyncMutex::new(HashMap::new()),
             agent_session_stores: AsyncMutex::new(session_stores),
-            model_call_semaphore: Arc::new(Semaphore::new(
-                team_cfg.max_concurrent_model_calls.max(1),
-            )),
+            model_call_semaphore: RwLock::new(Arc::new(Semaphore::new(max_concurrent_model_calls))),
             pending_questions: Mutex::new(Vec::new()),
             recent_shows: Mutex::new(VecDeque::new()),
             interaction_store,
             task_audit_store,
-            preload_ctx,
-            runner,
-            agents_md_path,
+            config_path,
+            bind,
+            ws_path,
+            workspace_root,
+            preload_ctx: RwLock::new(reloadable.preload_ctx),
+            runner: RwLock::new(reloadable.runner),
+            agents_md_path: RwLock::new(reloadable.agents_md_path),
             session_store,
             runtime_store,
             team_state: AsyncMutex::new(team_state),
-            team_cfg,
-            permissions,
+            team_cfg: RwLock::new(reloadable.team_cfg),
+            permissions: RwLock::new(reloadable.permissions),
+            dream_scheduler: Mutex::new(None),
         });
 
         // Spawn the durable supervisor loop.
@@ -393,6 +453,149 @@ impl Hub {
         });
 
         hub
+    }
+
+    /// Return the current hot-swappable tool context snapshot.
+    fn current_preload_ctx(&self) -> ToolContext {
+        self.preload_ctx
+            .read()
+            .expect("preload_ctx rwlock poisoned")
+            .clone()
+    }
+
+    /// Return the current hot-swappable runner snapshot.
+    fn current_runner(&self) -> AgentRunner {
+        self.runner.read().expect("runner rwlock poisoned").clone()
+    }
+
+    /// Return the current configured `Agents.md` path.
+    fn current_agents_md_path(&self) -> PathBuf {
+        self.agents_md_path
+            .read()
+            .expect("agents_md_path rwlock poisoned")
+            .clone()
+    }
+
+    /// Return the current team configuration snapshot.
+    fn current_team_cfg(&self) -> TeamConfig {
+        self.team_cfg
+            .read()
+            .expect("team_cfg rwlock poisoned")
+            .clone()
+    }
+
+    /// Return the current permission policy snapshot.
+    fn current_permissions(&self) -> PermissionsConfig {
+        self.permissions
+            .read()
+            .expect("permissions rwlock poisoned")
+            .clone()
+    }
+
+    /// Return the current model-call semaphore snapshot.
+    fn current_model_call_semaphore(&self) -> Arc<Semaphore> {
+        Arc::clone(
+            &self
+                .model_call_semaphore
+                .read()
+                .expect("model_call_semaphore rwlock poisoned"),
+        )
+    }
+
+    /// Return the current runner config snapshot.
+    fn current_runner_config(&self) -> AgentRunnerConfig {
+        self.current_runner().config().clone()
+    }
+
+    /// Replace the background dream scheduler with one built from the latest
+    /// config snapshot.
+    fn replace_dream_scheduler(self: &Arc<Self>, dream_manager: DreamManager) {
+        let mut guard = self
+            .dream_scheduler
+            .lock()
+            .expect("dream_scheduler mutex poisoned");
+
+        if let Some(existing) = guard.take() {
+            existing.cancel.cancel();
+            drop(existing.task);
+        }
+
+        if !dream_manager.config().enabled {
+            tracing::info!("Dream scheduler disabled by config.");
+            return;
+        }
+
+        let (cancel_handle, cancel_token) = cancel_pair();
+        let hub = Arc::clone(self);
+        let task = tokio::spawn(async move {
+            run_dream_scheduler(hub, dream_manager, cancel_token).await;
+        });
+        *guard = Some(DreamSchedulerHandle {
+            cancel: cancel_handle,
+            task,
+        });
+    }
+
+    /// Hot-reload the current runtime from `sa.toml` without restarting the
+    /// process or dropping existing WS connections.
+    async fn reload_runtime_from_disk(self: &Arc<Self>) -> anyhow::Result<String> {
+        let cfg = load_config_from_file(&self.config_path)?;
+        let prepared = prepare_runtime_from_config(cfg, &self.config_path).await?;
+
+        if prepared.bind != self.bind {
+            anyhow::bail!(
+                "hot reload cannot change bind address from {} to {}; restart SA instead",
+                self.bind,
+                prepared.bind
+            );
+        }
+        if prepared.ws_path != self.ws_path {
+            anyhow::bail!(
+                "hot reload cannot change ws_path from {} to {}; restart SA instead",
+                self.ws_path,
+                prepared.ws_path
+            );
+        }
+        if prepared.workspace_root != self.workspace_root {
+            anyhow::bail!(
+                "hot reload cannot change workspace root from {} to {}; restart SA instead",
+                self.workspace_root.display(),
+                prepared.workspace_root.display()
+            );
+        }
+
+        {
+            *self.runner.write().expect("runner rwlock poisoned") = prepared.reloadable.runner;
+            *self
+                .preload_ctx
+                .write()
+                .expect("preload_ctx rwlock poisoned") = prepared.reloadable.preload_ctx;
+            *self
+                .agents_md_path
+                .write()
+                .expect("agents_md_path rwlock poisoned") = prepared.reloadable.agents_md_path;
+            *self.team_cfg.write().expect("team_cfg rwlock poisoned") =
+                prepared.reloadable.team_cfg;
+            *self
+                .permissions
+                .write()
+                .expect("permissions rwlock poisoned") = prepared.reloadable.permissions;
+            *self
+                .model_call_semaphore
+                .write()
+                .expect("model_call_semaphore rwlock poisoned") = Arc::new(Semaphore::new(
+                prepared.reloadable.max_concurrent_model_calls.max(1),
+            ));
+        }
+
+        self.replace_dream_scheduler(prepared.dream_manager);
+        let root_agent_id = self.team_state.lock().await.root_agent_id;
+        self.publish(
+            EventKind::Log,
+            root_agent_id,
+            format!("Runtime hot reload applied: {}", prepared.reload_summary),
+        );
+        Ok(prepared.reload_summary)
     }
 
     /// Publish an event:
@@ -632,7 +835,7 @@ impl Hub {
             .join("agents")
             .join(agent_id.to_string());
         let store = Arc::new(SessionStore::new_in_relative_dir(
-            self.preload_ctx.workspace_root.clone(),
+            self.workspace_root.clone(),
             &relative_dir,
         )?);
 
@@ -1325,14 +1528,10 @@ impl Hub {
     /// parent-provided prompt text.
     async fn load_subagent_prompt_blocks(&self, state: &AgentState, task_id: Uuid) -> Vec<String> {
         let mut blocks = Vec::<String>::new();
+        let preload_ctx = self.current_preload_ctx();
 
         if let Some(skill_name) = state.subagent_prompt_skill.as_deref() {
-            match self
-                .preload_ctx
-                .skills
-                .load_skill_file(skill_name, None)
-                .await
-            {
+            match preload_ctx.skills.load_skill_file(skill_name, None).await {
                 Ok((path, content)) => blocks.push(format!(
                     "## 子代理主人格 Skill\n\n- 名称：`{skill_name}`\n- 文件：`{path}`\n\n{content}",
                 )),
@@ -1376,7 +1575,8 @@ impl Hub {
     /// Load one workspace text prompt file with the same workspace safety
     /// boundary used by other file tools.
     async fn load_workspace_prompt_file(&self, raw_path: &str) -> anyhow::Result<String> {
-        let path = self.preload_ctx.resolve_under_workspace(raw_path)?;
+        let preload_ctx = self.current_preload_ctx();
+        let path = preload_ctx.resolve_under_workspace(raw_path)?;
         let meta = tokio::fs::metadata(&path)
             .await
             .with_context(|| format!("Failed to stat prompt file: {}", path.display()))?;
@@ -1750,7 +1950,8 @@ impl Hub {
     /// executions.
     async fn supervisor_loop(self: Arc<Self>, mut wake_rx: mpsc::UnboundedReceiver<Uuid>) {
         while let Some(agent_id) = wake_rx.recv().await {
-            let permit = match Arc::clone(&self.model_call_semaphore).acquire_owned().await {
+            let semaphore = self.current_model_call_semaphore();
+            let permit = match semaphore.acquire_owned().await {
                 Ok(permit) => permit,
                 Err(_) => break,
             };
@@ -1915,7 +2116,7 @@ impl Hub {
             let unread_mailbox = self
                 .runtime_store
                 .read_mailbox_after(state.agent_id, state.last_mailbox_offset)?;
-            let should_resume = self.team_cfg.auto_resume
+            let should_resume = self.current_team_cfg().auto_resume
                 && !matches!(
                     state.status,
                     AgentStatus::Deleted | AgentStatus::Deleting | AgentStatus::Failed
@@ -2062,7 +2263,8 @@ impl Hub {
         state.status = AgentStatus::Running;
         self.runtime_store.save_agent_state(&state)?;
 
-        let agents_md = match load_agents_md(self.agents_md_path.clone()).await {
+        let agents_md_path = self.current_agents_md_path();
+        let agents_md = match load_agents_md(agents_md_path.clone()).await {
             Ok(agents_md) => agents_md,
             Err(err) => {
                 self.publish(
@@ -2071,7 +2273,7 @@ impl Hub {
                     format!("Failed to read Agents.md: {err}"),
                 );
                 sa_core::agents_md::AgentsMd {
-                    path: self.agents_md_path.clone(),
+                    path: agents_md_path,
                     content: String::new(),
                     found: false,
                 }
@@ -2105,8 +2307,8 @@ impl Hub {
             );
         }
 
-        let quantum = self
-            .runner
+        let runner = self.current_runner();
+        let quantum = runner
             .run_quantum(
                 work_id,
                 incoming_messages,
@@ -2143,8 +2345,9 @@ impl Hub {
                     .activated_conditional_commands()
                     .into_iter()
                     .collect::<BTreeSet<_>>();
-                let newly_activated = self.preload_ctx.skills.conditional_matches_for_paths(
-                    &self.preload_ctx.workspace_root,
+                let preload_ctx = self.current_preload_ctx();
+                let newly_activated = preload_ctx.skills.conditional_matches_for_paths(
+                    &preload_ctx.workspace_root,
                     &quantum.tool_session.touched_paths(),
                     &activated_conditional,
                 );
@@ -2440,8 +2643,9 @@ impl Hub {
         let allow_user_show = state.allow_user_show;
         let allow_user_ask = state.allow_user_ask;
         let allow_input_transfer_target = state.allow_input_transfer_target;
-        let denied_tools = self.permissions.deny_tools.clone();
-        let denied_commands = self.permissions.deny_commands.clone();
+        let permissions = self.current_permissions();
+        let denied_tools = permissions.deny_tools;
+        let denied_commands = permissions.deny_commands;
         let allowed_tool_patterns = state
             .active_command_invocations
             .iter()
@@ -2698,6 +2902,15 @@ impl Hub {
             let hub = Arc::clone(&hub_for_get_task);
             Box::pin(async move { hub.get_task_info(task_id) })
         });
+        let hub_for_reload = Arc::clone(self);
+        let reload_runtime: ReloadRuntimeFn = Arc::new(move || {
+            let hub = Arc::clone(&hub_for_reload);
+            Box::pin(async move {
+                hub.reload_runtime_from_disk()
+                    .await
+                    .map(|summary| ReloadRuntimeReceipt { summary })
+            })
+        });
 
         ToolRuntime::new(
             agent_id,
@@ -2716,6 +2929,7 @@ impl Hub {
             allow_user_show,
             allow_user_ask,
             allow_input_transfer_target,
+            is_root,
             denied_tools,
             denied_commands,
             allowed_tool_patterns,
@@ -2735,6 +2949,7 @@ impl Hub {
             transfer_input,
             start_terminal_task,
             get_task,
+            reload_runtime,
         )
     }
 
@@ -2766,7 +2981,8 @@ impl Hub {
         let prompt_skill_reminder = match request.prompt_skill.as_deref() {
             Some(raw_name) => {
                 let trimmed = raw_name.trim();
-                let Some(skill) = self.preload_ctx.skills.get(trimmed) else {
+                let preload_ctx = self.current_preload_ctx();
+                let Some(skill) = preload_ctx.skills.get(trimmed) else {
                     anyhow::bail!("SubAgent prompt_skill not found: {trimmed}");
                 };
                 Some((trimmed.to_string(), skill.reminder()))
@@ -2787,11 +3003,12 @@ impl Hub {
         let child_agent_id = request.existing_agent_id.unwrap_or_else(Uuid::new_v4);
 
         if request.existing_agent_id.is_none()
-            && self.runtime_store.list_agent_states()?.len() >= self.team_cfg.max_active_agents
+            && self.runtime_store.list_agent_states()?.len()
+                >= self.current_team_cfg().max_active_agents
         {
             anyhow::bail!(
                 "SubAgent refused because the runtime already reached max_active_agents={}",
-                self.team_cfg.max_active_agents
+                self.current_team_cfg().max_active_agents
             );
         }
 
@@ -2924,7 +3141,8 @@ impl Hub {
     /// top-level tasks. Daily memory remains on-demand via `MemorySearch` /
     /// `MemoryGet`.
     async fn memory_prompt_block(&self, task_id: Uuid) -> String {
-        match build_memory_prompt_block(&self.preload_ctx.workspace_root).await {
+        let preload_ctx = self.current_preload_ctx();
+        match build_memory_prompt_block(&preload_ctx.workspace_root).await {
             Ok(block) => block,
             Err(err) => {
                 self.publish(
@@ -3288,6 +3506,15 @@ impl Hub {
             let hub = Arc::clone(&hub_for_get_task);
             Box::pin(async move { hub.get_task_info(task_id) })
         });
+        let hub_for_reload = Arc::clone(self);
+        let reload_runtime: ReloadRuntimeFn = Arc::new(move || {
+            let hub = Arc::clone(&hub_for_reload);
+            Box::pin(async move {
+                hub.reload_runtime_from_disk()
+                    .await
+                    .map(|summary| ReloadRuntimeReceipt { summary })
+            })
+        });
 
         ToolRuntime::new(
             agent_id,
@@ -3310,6 +3537,7 @@ impl Hub {
             true,
             true,
             false,
+            depth == 0,
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -3329,6 +3557,7 @@ impl Hub {
             transfer_input,
             start_terminal_task,
             get_task,
+            reload_runtime,
         )
     }
 
@@ -3414,6 +3643,9 @@ impl Hub {
             let hub = Arc::clone(&hub_for_get_task);
             Box::pin(async move { hub.get_task_info(task_id) })
         });
+        let reload_runtime: ReloadRuntimeFn = Arc::new(move || {
+            Box::pin(async move { anyhow::bail!("background {label} task must not use Reload") })
+        });
 
         ToolRuntime::new(
             task_id,
@@ -3422,6 +3654,7 @@ impl Hub {
             label.to_string(),
             PromptProfile::Background,
             true,
+            false,
             false,
             false,
             false,
@@ -3447,6 +3680,7 @@ impl Hub {
             transfer_input,
             start_terminal_task,
             get_task,
+            reload_runtime,
         )
     }
 
@@ -3479,7 +3713,8 @@ impl Hub {
             ),
         );
 
-        let agents_md = load_agents_md(self.agents_md_path.clone())
+        let agents_md_path = self.current_agents_md_path();
+        let agents_md = load_agents_md(agents_md_path.clone())
             .await
             .context("Failed to load Agents.md for dream run")?;
 
@@ -3496,8 +3731,8 @@ impl Hub {
         let runtime = self.build_background_tool_runtime(task_id, "dream");
         let (_cancel_handle, cancel_token) = cancel_pair();
 
-        match self
-            .runner
+        let runner = self.current_runner();
+        match runner
             .run_task(
                 task_id,
                 prepared.task,
@@ -3573,7 +3808,8 @@ impl Hub {
             ),
         );
 
-        let agents_md = match load_agents_md(self.agents_md_path.clone()).await {
+        let agents_md_path = self.current_agents_md_path();
+        let agents_md = match load_agents_md(agents_md_path.clone()).await {
             Ok(a) => a,
             Err(err) => {
                 self.publish(
@@ -3582,7 +3818,7 @@ impl Hub {
                     format!("Failed to read Agents.md for subagent: {err}"),
                 );
                 sa_core::agents_md::AgentsMd {
-                    path: self.agents_md_path.clone(),
+                    path: agents_md_path,
                     content: String::new(),
                     found: false,
                 }
@@ -3614,8 +3850,8 @@ impl Hub {
         });
 
         let runtime = self.build_tool_runtime(task_id, depth);
-        let result = self
-            .runner
+        let runner = self.current_runner();
+        let result = runner
             .run_task(
                 child_work_id,
                 request.task.clone(),
@@ -3687,7 +3923,8 @@ impl Hub {
             );
 
             // Reload Agents.md for every task (see comment on `agents_md_path`).
-            let agents_md = match load_agents_md(self.agents_md_path.clone()).await {
+            let agents_md_path = self.current_agents_md_path();
+            let agents_md = match load_agents_md(agents_md_path.clone()).await {
                 Ok(a) => a,
                 Err(err) => {
                     self.publish(
@@ -3696,7 +3933,7 @@ impl Hub {
                         format!("Failed to read Agents.md: {err}"),
                     );
                     sa_core::agents_md::AgentsMd {
-                        path: self.agents_md_path.clone(),
+                        path: agents_md_path,
                         content: String::new(),
                         found: false,
                     }
@@ -3724,8 +3961,8 @@ impl Hub {
             let runtime = self.build_tool_runtime(req.task_id, 0);
 
             // Run the agent loop.
-            match self
-                .runner
+            let runner = self.current_runner();
+            match runner
                 .run_task(
                     req.task_id,
                     req.task.clone(),
@@ -3788,6 +4025,7 @@ impl Hub {
 
         let mut out = String::new();
         out.push_str("## Preloaded files (from Agents.md)\n\n");
+        let preload_ctx = self.current_preload_ctx();
 
         let mut loaded = 0usize;
         for r in refs {
@@ -3804,7 +4042,7 @@ impl Hub {
             }
 
             // Resolve safely under the workspace root.
-            let abs = match self.preload_ctx.resolve_under_workspace(&r) {
+            let abs = match preload_ctx.resolve_under_workspace(&r) {
                 Ok(p) => p,
                 Err(err) => {
                     out.push_str(&format!("- `{r}`: resolve error: {err}\n"));
@@ -3992,10 +4230,10 @@ fn build_bootstrap_state(config_path: &Path) -> anyhow::Result<BootstrapState> {
 }
 
 /// Build one fully initialized runtime from an already parsed config object.
-async fn build_runtime_from_config(
+async fn prepare_runtime_from_config(
     cfg: Config,
     config_path: &Path,
-) -> anyhow::Result<LoadedRuntime> {
+) -> anyhow::Result<PreparedRuntime> {
     let config_dir = resolve_config_file_dir(config_path)?;
     let bind = cfg.server.bind.clone();
     let ws_path = cfg.server.ws_path.clone();
@@ -4023,12 +4261,11 @@ async fn build_runtime_from_config(
     // Discover skills.
     let skill_dirs = cfg.skills.dirs_as_paths();
     let mut skills_registry = SkillRegistry::scan(&skill_dirs)?;
-    tracing::info!(
-        "Discovered {} local skill(s).",
-        skills_registry.list().len()
-    );
+    let local_skill_count = skills_registry.list().len();
+    tracing::info!("Discovered {} local skill(s).", local_skill_count);
 
     // Connect external MCP servers before freezing the tool registry.
+    let mut connected_mcp_servers = 0usize;
     let mcp_registry = if cfg.mcp.enabled && !cfg.mcp.servers.is_empty() {
         tracing::info!(
             "Initializing MCP client — {} server(s) configured",
@@ -4036,6 +4273,7 @@ async fn build_runtime_from_config(
         );
         match McpRegistry::connect_all(&cfg.mcp.servers).await {
             Ok(registry) if !registry.is_empty() => {
+                connected_mcp_servers = registry.server_count();
                 skills_registry.extend_mcp_prompts(registry.prompt_commands());
                 tracing::info!(
                     "MCP: {} tool(s) and {} prompt command(s) registered from {} server(s)",
@@ -4059,8 +4297,70 @@ async fn build_runtime_from_config(
     };
     let skills = Arc::new(skills_registry);
 
+    // Build tools.
+    let tool_ctx = ToolContext::new(workspace_root.clone(), Arc::clone(&skills))?;
+    let preload_ctx = tool_ctx.clone();
+    let tools = ToolExecutor::new(tool_ctx, mcp_registry);
+
+    // Build LLM client.
+    let system_role_name = cfg.llm.effective_system_role_name().to_string();
+    let reasoning_effort = cfg.llm.effective_reasoning_effort().map(str::to_string);
+    let reasoning_effort_summary = reasoning_effort
+        .clone()
+        .unwrap_or_else(|| "none".to_string());
+    let wire_api = cfg.llm.effective_wire_api();
+    let auth_style = cfg.llm.effective_auth_style(wire_api);
+    let llm = OpenAiClient::with_wire_api_and_auth_style(
+        cfg.llm.base_url,
+        cfg.llm.api_key,
+        wire_api,
+        auth_style,
+    )?;
+
+    // Build agent runner.
+    let runner_cfg = AgentRunnerConfig {
+        model: cfg.llm.model.clone(),
+        system_role_name: system_role_name.clone(),
+        reasoning_effort,
+        compaction: cfg.compaction,
+    };
+    let runner = AgentRunner::new(llm, tools, Arc::clone(&skills), runner_cfg);
     let dream_manager = DreamManager::new(workspace_root.clone(), cfg.dream.clone())?;
-    let runtime_store = RuntimeStore::new(workspace_root.clone())?;
+    let max_concurrent_model_calls = cfg.team.max_concurrent_model_calls;
+    let reload_summary = format!(
+        "reloaded model={} system_role={} reasoning_effort={} local_skills={} mcp_servers={} agents_md={}",
+        cfg.llm.model,
+        system_role_name,
+        reasoning_effort_summary,
+        local_skill_count,
+        connected_mcp_servers,
+        agents_md_path.display()
+    );
+
+    Ok(PreparedRuntime {
+        bind,
+        ws_path,
+        workspace_root: preload_ctx.workspace_root.clone(),
+        reloadable: RuntimeReloadState {
+            runner,
+            preload_ctx,
+            agents_md_path,
+            team_cfg: cfg.team,
+            permissions: cfg.permissions,
+            max_concurrent_model_calls,
+        },
+        dream_manager,
+        reload_summary,
+    })
+}
+
+/// Build one fully initialized runtime from an already parsed config object.
+async fn build_runtime_from_config(
+    cfg: Config,
+    config_path: &Path,
+) -> anyhow::Result<LoadedRuntime> {
+    let prepared = prepare_runtime_from_config(cfg, config_path).await?;
+    let runtime_store = RuntimeStore::new(prepared.workspace_root.clone())?;
 
     let root_agent_id = match runtime_store.load_root_marker()? {
         Some(marker) => marker.root_agent_id,
@@ -4083,7 +4383,7 @@ async fn build_runtime_from_config(
 
     if runtime_store.load_agent_state(root_agent_id)?.is_none() {
         let root_session_store = SessionStore::new_in_relative_dir(
-            workspace_root.clone(),
+            prepared.workspace_root.clone(),
             Path::new(&format!("sessions/agents/{root_agent_id}")),
         )?;
         runtime_store.save_agent_state(&AgentState::new_root(
@@ -4092,64 +4392,32 @@ async fn build_runtime_from_config(
         ))?;
     }
 
-    // Build tools.
-    let tool_ctx = ToolContext::new(workspace_root.clone(), Arc::clone(&skills))?;
-    let preload_ctx = tool_ctx.clone();
-    let session_store = Arc::new(SessionStore::new(preload_ctx.workspace_root.clone())?);
-    let interaction_store = Arc::new(InteractionStore::new(preload_ctx.workspace_root.clone())?);
-    let task_audit_store = Arc::new(TaskAuditStore::new(preload_ctx.workspace_root.clone())?);
-    let tools = ToolExecutor::new(tool_ctx, mcp_registry);
+    let session_store = Arc::new(SessionStore::new(prepared.workspace_root.clone())?);
+    let interaction_store = Arc::new(InteractionStore::new(prepared.workspace_root.clone())?);
+    let task_audit_store = Arc::new(TaskAuditStore::new(prepared.workspace_root.clone())?);
+    let config_path = std::path::absolute(config_path)
+        .with_context(|| format!("Failed to resolve config path: {}", config_path.display()))?;
 
-    // Build LLM client.
-    let system_role_name = cfg.llm.effective_system_role_name().to_string();
-    let reasoning_effort = cfg.llm.effective_reasoning_effort().map(str::to_string);
-    let wire_api = cfg.llm.effective_wire_api();
-    let auth_style = cfg.llm.effective_auth_style(wire_api);
-    let llm = OpenAiClient::with_wire_api_and_auth_style(
-        cfg.llm.base_url,
-        cfg.llm.api_key,
-        wire_api,
-        auth_style,
-    )?;
-
-    // Build agent runner.
-    let runner_cfg = AgentRunnerConfig {
-        model: cfg.llm.model,
-        system_role_name,
-        reasoning_effort,
-        compaction: cfg.compaction,
-    };
-    let runner = AgentRunner::new(llm, tools, Arc::clone(&skills), runner_cfg);
-
-    // Hub (spawns worker loop).
     let hub = Hub::new(
-        runner,
-        agents_md_path,
-        preload_ctx,
+        config_path,
+        prepared.bind.clone(),
+        prepared.ws_path.clone(),
+        prepared.workspace_root.clone(),
+        prepared.reloadable,
         session_store,
         interaction_store,
         task_audit_store,
         runtime_store,
         team_state,
-        cfg.team.clone(),
-        cfg.permissions.clone(),
     );
     hub.recover_runtime().await?;
-
-    if dream_manager.config().enabled {
-        let hub_for_dream = Arc::clone(&hub);
-        tokio::spawn(async move {
-            run_dream_scheduler(hub_for_dream, dream_manager).await;
-        });
-    } else {
-        tracing::info!("Dream scheduler disabled by config.");
-    }
+    hub.replace_dream_scheduler(prepared.dream_manager);
 
     Ok(LoadedRuntime {
         hub,
-        bind,
-        ws_path,
-        workspace_root,
+        bind: prepared.bind,
+        ws_path: prepared.ws_path,
+        workspace_root: prepared.workspace_root,
     })
 }
 
@@ -4158,10 +4426,19 @@ async fn build_runtime_from_config(
 /// Policy:
 /// - immediately attempt a catch-up run when today has not been processed yet
 /// - afterwards sleep until the next local midnight and re-check
-async fn run_dream_scheduler(hub: Arc<Hub>, dream: DreamManager) {
+async fn run_dream_scheduler(
+    hub: Arc<Hub>,
+    dream: DreamManager,
+    cancel: sa_core::cancel::CancelToken,
+) {
     tracing::info!("Dream scheduler started.");
 
     loop {
+        if cancel.is_cancelled() {
+            tracing::info!("Dream scheduler stopping after reload request.");
+            return;
+        }
+
         if let Err(err) = hub.run_background_dream(&dream).await {
             tracing::warn!("Dream run failed: {err:#}");
         }
@@ -4176,7 +4453,13 @@ async fn run_dream_scheduler(hub: Arc<Hub>, dream: DreamManager) {
             next.to_rfc3339(),
             sleep_for
         );
-        tokio::time::sleep(sleep_for).await;
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                tracing::info!("Dream scheduler cancelled before next wake.");
+                return;
+            }
+            _ = tokio::time::sleep(sleep_for) => {}
+        }
     }
 }
 
@@ -5496,16 +5779,23 @@ mod tests {
             .expect("root agent state should persist");
 
         Hub::new(
-            runner,
-            workspace.path().join("AGENTS.md"),
-            preload_ctx,
+            workspace.path().join("sa.toml"),
+            "127.0.0.1:8765".to_string(),
+            "/ws".to_string(),
+            preload_ctx.workspace_root.clone(),
+            RuntimeReloadState {
+                runner,
+                preload_ctx,
+                agents_md_path: workspace.path().join("AGENTS.md"),
+                team_cfg: TeamConfig::default(),
+                permissions: PermissionsConfig::default(),
+                max_concurrent_model_calls: TeamConfig::default().max_concurrent_model_calls,
+            },
             session_store,
             interaction_store,
             task_audit_store,
             runtime_store,
             team_state,
-            TeamConfig::default(),
-            PermissionsConfig::default(),
         )
     }
 
@@ -6463,5 +6753,141 @@ description: Teaches patiently
         assert!(rendered.contains("daily_note_lookback_days = 3"));
         assert!(rendered.contains("recent_session_segments = 6"));
         assert!(rendered.contains("recent_topic_files = 24"));
+    }
+
+    /// Write one minimal ready-runtime config used by hot-reload tests.
+    fn write_test_ready_config(
+        path: &Path,
+        model: &str,
+        skill_dirs: &[&str],
+        max_concurrent_model_calls: usize,
+        workspace_root: &str,
+    ) {
+        let skills = if skill_dirs.is_empty() {
+            "dirs = []".to_string()
+        } else {
+            format!(
+                "dirs = [{}]",
+                skill_dirs
+                    .iter()
+                    .map(|dir| format!("{dir:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        let raw = format!(
+            r#"[llm]
+base_url = "http://127.0.0.1:1/v1"
+api_key = "test-key"
+model = "{model}"
+system_role_name = "developer"
+
+[server]
+bind = "127.0.0.1:8765"
+ws_path = "/ws"
+
+[workspace]
+root_dir = {workspace_root:?}
+agents_md = "AGENTS.md"
+
+[skills]
+{skills}
+
+[dream]
+enabled = false
+
+[team]
+max_concurrent_model_calls = {max_concurrent_model_calls}
+"#
+        );
+        std::fs::write(path, raw).expect("test config should write");
+    }
+
+    #[tokio::test]
+    async fn hot_reload_refreshes_runner_and_skills_in_place() {
+        let workspace = TempDir::new().expect("temp workspace should build");
+        std::fs::write(workspace.path().join("AGENTS.md"), "root instructions")
+            .expect("AGENTS.md should write");
+        let skills_dir = workspace.path().join("skills");
+        std::fs::create_dir_all(&skills_dir).expect("skills dir should exist");
+        let config_path = workspace.path().join("sa.toml");
+        write_test_ready_config(&config_path, "model-before", &["./skills"], 2, ".");
+
+        let cfg = load_config_from_file(&config_path).expect("config should load");
+        let runtime = build_runtime_from_config(cfg, &config_path)
+            .await
+            .expect("runtime should build");
+        let hub = runtime.hub;
+
+        assert_eq!(hub.current_runner_config().model, "model-before");
+        assert!(
+            hub.current_preload_ctx()
+                .skills
+                .get("superpowers:brainstorming")
+                .is_none()
+        );
+        assert_eq!(hub.current_team_cfg().max_concurrent_model_calls, 2);
+
+        let skill_path = skills_dir.join("superpowers").join("brainstorming");
+        std::fs::create_dir_all(&skill_path).expect("nested skill dir should exist");
+        std::fs::write(
+            skill_path.join("SKILL.md"),
+            r#"---
+name: brainstorming
+description: test skill
+---
+
+test body
+"#,
+        )
+        .expect("skill should write");
+        write_test_ready_config(&config_path, "model-after", &["./skills"], 5, ".");
+
+        let summary = hub
+            .reload_runtime_from_disk()
+            .await
+            .expect("reload should succeed");
+
+        assert!(summary.contains("model-after"));
+        assert_eq!(hub.current_runner_config().model, "model-after");
+        assert!(
+            hub.current_preload_ctx()
+                .skills
+                .get("superpowers:brainstorming")
+                .is_some()
+        );
+        assert_eq!(hub.current_team_cfg().max_concurrent_model_calls, 5);
+    }
+
+    #[tokio::test]
+    async fn hot_reload_rejects_workspace_root_change() {
+        let workspace = TempDir::new().expect("temp workspace should build");
+        std::fs::write(workspace.path().join("AGENTS.md"), "root instructions")
+            .expect("AGENTS.md should write");
+        let config_path = workspace.path().join("sa.toml");
+        write_test_ready_config(&config_path, "model-before", &[], 2, ".");
+
+        let cfg = load_config_from_file(&config_path).expect("config should load");
+        let runtime = build_runtime_from_config(cfg, &config_path)
+            .await
+            .expect("runtime should build");
+        let hub = runtime.hub;
+
+        let other_root = workspace.path().join("other-workspace");
+        std::fs::create_dir_all(&other_root).expect("other workspace should exist");
+        write_test_ready_config(
+            &config_path,
+            "model-after",
+            &[],
+            2,
+            other_root.to_string_lossy().as_ref(),
+        );
+
+        let err = hub
+            .reload_runtime_from_disk()
+            .await
+            .expect_err("workspace-root hot reload must fail");
+
+        assert!(err.to_string().contains("workspace root"));
     }
 }
