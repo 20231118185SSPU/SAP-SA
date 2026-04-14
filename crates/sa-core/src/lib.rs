@@ -15,6 +15,7 @@ pub mod cancel;
 pub mod compact;
 pub mod config;
 pub mod dream;
+pub mod interaction_history;
 pub mod mcp_client;
 pub mod mcp_protocol;
 pub mod mcp_transport;

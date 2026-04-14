@@ -233,3 +233,45 @@
    - 因此同一 agent 后续再完成新的 work，也不会让更早完成的 work 丢失可观测性
 5. 新增回归测试
    - 证明 older finished work 在 newer finished work 出现后仍然可以被立即识别
+
+## 2026-04-14 交互历史独立持久化
+
+为满足“把所有直接交互单独持久化、便于 grep 与按 id 精准读取”的需求，本轮新增了 interaction history：
+
+1. 新增独立日志
+   - 路径：`interactions/history.jsonl`
+   - 与 session/runtime state 分离
+   - 按追加顺序记录全部直接交互
+2. 每条交互日志都包含：
+   - 唯一 `uuid`
+   - 带本地时区偏移的高精度本地时间戳
+   - `work_id`
+   - `agent_id`
+   - 具体交互 payload
+3. 当前已落盘的交互种类：
+   - 用户 `submit` 消息
+   - `Send`
+   - `Ask`
+   - `AskAnswer`
+   - `Show`
+4. `Show` 新增强制参数 `prompt`
+   - 必填
+   - 用于描述展示内容或展示目的
+   - 不作为常规用户文案单独展示，但会进入原始信息流与交互历史
+5. `Show` 在交互历史中会保存文件快照
+   - 文本内容直接存
+   - 二进制内容按编码后字符串存
+   - 同时保存 `path`、`file_name`、`title`、`prompt`、`media_type`、`bytes`
+6. 新增 `GetInteractionEntry` 工具
+   - 通过 `id` 获取交互条目
+   - 支持 `summary` / `full` / `slice`
+   - 避免大内容一次性塞进上下文
+   - 推荐工作流：
+     - 先直接 `grep` `interactions/history.jsonl`
+     - 找到目标 `id`
+     - 再用 `GetInteractionEntry` 做渐进式读取
+7. 新增测试覆盖：
+   - interaction store 追加/按 id 读取
+   - `Show(prompt)` 校验
+   - `GetInteractionEntry` 的 summary/full/slice
+   - `submit` / `Ask` 的真实主路径写历史

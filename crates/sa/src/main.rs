@@ -25,6 +25,7 @@ use sa_core::agents_md::{extract_markdown_file_references, load_agents_md};
 use sa_core::cancel::{CancelHandle, cancel_pair};
 use sa_core::config::{Config, TeamConfig, load_config_from_file};
 use sa_core::dream::DreamManager;
+use sa_core::interaction_history::{InteractionPayload, InteractionStore, show_payload_from_visible_file};
 use sa_core::mcp_client::McpRegistry;
 use sa_core::memory::{build_prompt_block as build_memory_prompt_block, is_memory_reference};
 use sa_core::openai::{AuthStyle, ChatMessage, OpenAiClient, WireApi};
@@ -289,6 +290,9 @@ struct Hub {
     /// Recent files explicitly shown to the user.
     recent_shows: Mutex<VecDeque<UserVisibleFile>>,
 
+    /// Durable append-only interaction history.
+    interaction_store: Arc<InteractionStore>,
+
     /// Context used for safe path resolution when preloading files.
     preload_ctx: ToolContext,
 
@@ -321,6 +325,7 @@ impl Hub {
         agents_md_path: PathBuf,
         preload_ctx: ToolContext,
         session_store: Arc<SessionStore>,
+        interaction_store: Arc<InteractionStore>,
         runtime_store: RuntimeStore,
         team_state: TeamState,
         team_cfg: TeamConfig,
@@ -355,6 +360,7 @@ impl Hub {
             )),
             pending_questions: Mutex::new(Vec::new()),
             recent_shows: Mutex::new(VecDeque::new()),
+            interaction_store,
             preload_ctx,
             runner,
             agents_md_path,
@@ -561,6 +567,19 @@ impl Hub {
         }
 
         self.broadcast_server_message(ServerMessage::Show { file });
+    }
+
+    /// Append one entry to the durable interaction history.
+    fn record_interaction(
+        &self,
+        work_id: Option<Uuid>,
+        agent_id: Option<Uuid>,
+        payload: InteractionPayload,
+    ) -> anyhow::Result<Uuid> {
+        Ok(self
+            .interaction_store
+            .append_new(work_id, agent_id, payload)?
+            .id)
     }
 
     /// Return the best current task id for user-visible events emitted by one
@@ -1433,6 +1452,17 @@ impl Hub {
             });
         }
 
+        self.record_interaction(
+            Some(work_id),
+            Some(state.agent_id),
+            InteractionPayload::Ask {
+                question_id,
+                prompt: question.prompt.clone(),
+                mode: question.mode.clone(),
+                options: question.options.clone(),
+                allow_free_text: question.allow_free_text,
+            },
+        )?;
         self.broadcast_server_message(ServerMessage::Question { question });
         Ok(())
     }
@@ -2183,6 +2213,13 @@ impl Hub {
                 } else {
                     format!("[{agent_label}] {message}")
                 };
+                hub.record_interaction(
+                    Some(work_id),
+                    Some(agent_id),
+                    InteractionPayload::Send {
+                        message: visible.clone(),
+                    },
+                )?;
                 hub.publish(EventKind::Message, work_id, visible);
                 Ok(())
             })
@@ -2207,6 +2244,11 @@ impl Hub {
                         None => format!("[{agent_label}] {}", file.path),
                     });
                 }
+                hub.record_interaction(
+                    Some(work_id),
+                    Some(agent_id),
+                    show_payload_from_visible_file(&file),
+                )?;
                 hub.publish_show(file);
                 Ok(())
             })
@@ -2595,6 +2637,16 @@ impl Hub {
                 if answer_tx.send(answer.clone()).is_err() {
                     anyhow::bail!("Question waiter dropped before receiving the answer");
                 }
+                self.record_interaction(
+                    Some(entry.work_id),
+                    Some(entry.agent_id),
+                    InteractionPayload::AskAnswer {
+                        question_id: answer.question_id,
+                        selected_option_ids: answer.selected_option_ids.clone(),
+                        selected_labels: Vec::new(),
+                        free_text: answer.free_text.clone(),
+                    },
+                )?;
                 self.broadcast_server_message(ServerMessage::QuestionResolved {
                     question_id: answer.question_id,
                 });
@@ -2649,6 +2701,17 @@ impl Hub {
                 self.wake_agent(agent_id).await?;
             }
         }
+
+        self.record_interaction(
+            Some(work_id),
+            Some(agent_id),
+            InteractionPayload::AskAnswer {
+                question_id: answer.question_id,
+                selected_option_ids: answer.selected_option_ids.clone(),
+                selected_labels,
+                free_text: answer.free_text.clone(),
+            },
+        )?;
 
         let mut pending = self
             .pending_questions
@@ -2729,6 +2792,15 @@ impl Hub {
             None,
         )
         .await?;
+        self.record_interaction(
+            Some(effective_work_id),
+            Some(owner_agent_id),
+            InteractionPayload::UserMessage {
+                submit_id: task_id,
+                input_owner_agent_id: owner_agent_id,
+                message: task.clone(),
+            },
+        )?;
 
         self.publish(
             EventKind::Log,
@@ -3676,6 +3748,7 @@ async fn build_runtime_from_config(
     let tool_ctx = ToolContext::new(workspace_root.clone(), Arc::clone(&skills))?;
     let preload_ctx = tool_ctx.clone();
     let session_store = Arc::new(SessionStore::new(preload_ctx.workspace_root.clone())?);
+    let interaction_store = Arc::new(InteractionStore::new(preload_ctx.workspace_root.clone())?);
     let tools = ToolExecutor::new(tool_ctx, mcp_registry);
 
     // Build LLM client.
@@ -3705,6 +3778,7 @@ async fn build_runtime_from_config(
         agents_md_path,
         preload_ctx,
         session_store,
+        interaction_store,
         runtime_store,
         team_state,
         cfg.team.clone(),
@@ -4166,8 +4240,8 @@ fn mirror_event_line(prefix: &str, event: &Event) {
 fn mirror_shown_file(prefix: &str, file: &UserVisibleFile) {
     let title = file.title.as_deref().unwrap_or(&file.path);
     eprintln!(
-        "{prefix}[task={}][title={}] path={} media_type={} bytes={}",
-        file.task_id, title, file.path, file.media_type, file.bytes
+        "{prefix}[task={}][title={}][prompt={}] path={} media_type={} bytes={}",
+        file.task_id, title, file.prompt, file.path, file.media_type, file.bytes
     );
     match file.encoding {
         UserVisibleFileEncoding::Utf8 => {
@@ -4815,6 +4889,7 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sa_core::interaction_history::{InteractionEntry, InteractionStore};
     use hex::encode as hex_encode;
     use sa_core::ws_identity::{
         EXPECTED_CLIENT_NAME, WS_ALLOWED_SKEW_BUCKETS, WS_HASH_ALGO, WS_PROTOCOL_ID,
@@ -4837,6 +4912,22 @@ mod tests {
         task: tokio::task::JoinHandle<()>,
     }
 
+    /// Load all durable interaction entries from the temp workspace.
+    fn load_interaction_entries(workspace: &TempDir) -> Vec<InteractionEntry> {
+        let store = InteractionStore::new(workspace.path().to_path_buf())
+            .expect("interaction store should build for test workspace");
+        let log_path = store.log_path().to_path_buf();
+        if !log_path.is_file() {
+            return Vec::new();
+        }
+        std::fs::read_to_string(&log_path)
+            .expect("interaction log should read")
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str::<InteractionEntry>(line).expect("valid interaction line"))
+            .collect()
+    }
+
     impl Drop for TestServer {
         fn drop(&mut self) {
             self.task.abort();
@@ -4852,6 +4943,10 @@ mod tests {
         let session_store = Arc::new(
             SessionStore::new(preload_ctx.workspace_root.clone())
                 .expect("session store should build for temp workspace"),
+        );
+        let interaction_store = Arc::new(
+            InteractionStore::new(preload_ctx.workspace_root.clone())
+                .expect("interaction store should build for temp workspace"),
         );
         let tools = ToolExecutor::new(tool_ctx, None);
         let llm = OpenAiClient::new("http://127.0.0.1:1".to_string(), "test-key".to_string())
@@ -4894,6 +4989,7 @@ mod tests {
             workspace.path().join("AGENTS.md"),
             preload_ctx,
             session_store,
+            interaction_store,
             runtime_store,
             team_state,
             TeamConfig::default(),
@@ -5369,6 +5465,90 @@ mod tests {
         assert_eq!(mailbox.len(), 2);
         assert_eq!(mailbox[0].work_id, Some(work_id));
         assert_eq!(mailbox[1].work_id, Some(work_id));
+    }
+
+    #[tokio::test]
+    async fn submit_task_records_user_message_interaction_history() {
+        let workspace = TempDir::new().expect("temp workspace should build");
+        let hub = build_test_hub(&workspace);
+        let submit_id = Uuid::new_v4();
+        let work_id = hub
+            .submit_task(submit_id, "请帮我整理今天的学习任务".to_string())
+            .await
+            .expect("submit should succeed");
+
+        let entries = load_interaction_entries(&workspace);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].work_id, Some(work_id));
+        match &entries[0].payload {
+            InteractionPayload::UserMessage {
+                submit_id: recorded_submit_id,
+                message,
+                ..
+            } => {
+                assert_eq!(*recorded_submit_id, submit_id);
+                assert_eq!(message, "请帮我整理今天的学习任务");
+            }
+            other => panic!("expected user_message interaction, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn persist_pending_question_records_ask_interaction_history() {
+        let workspace = TempDir::new().expect("temp workspace should build");
+        let hub = build_test_hub(&workspace);
+        let root_agent_id = hub
+            .runtime_store
+            .load_root_marker()
+            .expect("root marker should load")
+            .expect("root marker should exist")
+            .root_agent_id;
+        let mut root_state = hub
+            .runtime_store
+            .load_agent_state(root_agent_id)
+            .expect("root state should load")
+            .expect("root state should exist");
+        let work_id = Uuid::new_v4();
+        root_state.active_work_id = Some(work_id);
+        hub.runtime_store
+            .save_agent_state(&root_state)
+            .expect("root state should save");
+
+        hub.persist_pending_question(
+            &mut root_state,
+            work_id,
+            "call_ask".to_string(),
+            AskRequest {
+                prompt: "请选择接下来优先做什么".to_string(),
+                mode: QuestionMode::SingleChoice,
+                options: vec![sa_core::ws_protocol::QuestionOption {
+                    id: "math".to_string(),
+                    label: "数学".to_string(),
+                    description: None,
+                }],
+                allow_free_text: true,
+            },
+        )
+        .await
+        .expect("ask should persist");
+
+        let entries = load_interaction_entries(&workspace);
+        assert_eq!(entries.len(), 1);
+        match &entries[0].payload {
+            InteractionPayload::Ask {
+                prompt,
+                mode,
+                options,
+                allow_free_text,
+                ..
+            } => {
+                assert_eq!(prompt, "请选择接下来优先做什么");
+                assert_eq!(*mode, QuestionMode::SingleChoice);
+                assert_eq!(options.len(), 1);
+                assert!(*allow_free_text);
+            }
+            other => panic!("expected ask interaction, got {other:?}"),
+        }
     }
 
     #[tokio::test]

@@ -351,6 +351,8 @@ pub struct UserVisibleFile {
     /// Optional user-facing title.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// Concise non-user-facing description of why this file is being shown.
+    pub prompt: String,
     /// Best-effort media type hint.
     pub media_type: String,
     /// How `content` should be interpreted.
@@ -362,7 +364,7 @@ pub struct UserVisibleFile {
 }
 
 /// Encoding used for `UserVisibleFile.content`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum UserVisibleFileEncoding {
     /// UTF-8 text sent directly.

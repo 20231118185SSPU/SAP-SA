@@ -26,6 +26,9 @@
 //!   without coupling this crate to any particular transport.
 
 use crate::cancel::CancelToken;
+use crate::interaction_history::{
+    InteractionDisclosureMode, InteractionReadOptions, InteractionStore,
+};
 use crate::mcp_client::McpRegistry;
 use crate::memory::{read_markdown_memory, search_markdown_memory};
 use crate::openai::{ToolDefinition, ToolFunctionDefinition};
@@ -1141,9 +1144,45 @@ impl ToolExecutor {
                             "title": {
                                 "type": "string",
                                 "description": "Optional user-facing title shown above the file content."
+                            },
+                            "prompt": {
+                                "type": "string",
+                                "description": "Required concise internal description of what the shown file contains or why it is being shown. This is stored in interaction history and may appear in raw event streams."
                             }
                         },
-                        "required": ["path"]
+                        "required": ["path", "prompt"]
+                    }),
+                },
+            },
+            ToolDefinition {
+                kind: "function".to_string(),
+                function: ToolFunctionDefinition {
+                    name: "GetInteractionEntry".to_string(),
+                    description:
+                        "Read one entry from the durable interaction log by id with progressive disclosure. Raw log path: `interactions/history.jsonl`; grep it first, then use this tool for bounded retrieval."
+                            .to_string(),
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "id": {
+                                "type": "string",
+                                "description": "Interaction entry UUID."
+                            },
+                            "mode": {
+                                "type": "string",
+                                "enum": ["summary", "full", "slice"],
+                                "description": "Disclosure mode. Defaults to `summary`."
+                            },
+                            "offset": {
+                                "type": "integer",
+                                "description": "Optional character offset used by `slice` mode."
+                            },
+                            "limit": {
+                                "type": "integer",
+                                "description": "Optional character count used by `slice` mode."
+                            }
+                        },
+                        "required": ["id"]
                     }),
                 },
             },
@@ -1512,6 +1551,10 @@ impl ToolExecutor {
                 .map(ToolExecutionResult::Observation),
             "Show" => self
                 .show(runtime, args, cancel)
+                .await
+                .map(ToolExecutionResult::Observation),
+            "GetInteractionEntry" => self
+                .get_interaction_entry(args, cancel)
                 .await
                 .map(ToolExecutionResult::Observation),
             "Ask" => self.ask(runtime, args, cancel).await,
@@ -2112,9 +2155,13 @@ impl ToolExecutor {
         struct Args {
             path: String,
             title: Option<String>,
+            prompt: String,
         }
 
         let args: Args = serde_json::from_value(args).context("Invalid arguments for Show")?;
+        if args.prompt.trim().is_empty() {
+            anyhow::bail!("Show prompt must not be empty");
+        }
         let path = self.ctx.resolve_under_workspace(&args.path)?;
         let meta = tokio::fs::metadata(&path)
             .await
@@ -2150,6 +2197,7 @@ impl ToolExecutor {
             task_id: uuid::Uuid::nil(),
             path: path.display().to_string(),
             title: args.title.filter(|title| !title.trim().is_empty()),
+            prompt: args.prompt,
             media_type: guess_media_type(&path, &encoding),
             encoding,
             content,
@@ -2165,8 +2213,54 @@ impl ToolExecutor {
             "bytes": file.bytes,
             "media_type": file.media_type,
             "encoding": file.encoding,
+            "prompt": file.prompt,
         })
         .to_string())
+    }
+
+    /// `GetInteractionEntry`: retrieve one durable interaction-log entry by id
+    /// with progressive disclosure.
+    async fn get_interaction_entry(
+        &self,
+        args: serde_json::Value,
+        cancel: &CancelToken,
+    ) -> anyhow::Result<String> {
+        if cancel.is_cancelled() {
+            anyhow::bail!("GetInteractionEntry cancelled");
+        }
+
+        #[derive(Debug, Deserialize)]
+        struct Args {
+            id: Uuid,
+            mode: Option<String>,
+            offset: Option<usize>,
+            limit: Option<usize>,
+        }
+
+        let args: Args =
+            serde_json::from_value(args).context("Invalid arguments for GetInteractionEntry")?;
+        let mode = match args.mode.as_deref().unwrap_or("summary") {
+            "summary" => InteractionDisclosureMode::Summary,
+            "full" => InteractionDisclosureMode::Full,
+            "slice" => InteractionDisclosureMode::Slice,
+            other => anyhow::bail!(
+                "GetInteractionEntry mode must be one of `summary`, `full`, `slice`, got `{other}`"
+            ),
+        };
+        let store = InteractionStore::new(self.ctx.workspace_root.clone())?;
+        let Some(serialized) = store.serialize_entry_by_id(
+            args.id,
+            InteractionReadOptions {
+                mode,
+                offset: args.offset.unwrap_or(0),
+                limit: args.limit.unwrap_or_default(),
+            },
+        )?
+        else {
+            anyhow::bail!("Interaction entry not found: {}", args.id);
+        };
+
+        Ok(serialized)
     }
 
     /// `Ask`: block until the user answers a structured question.
@@ -2800,6 +2894,7 @@ fn guess_media_type(path: &Path, encoding: &UserVisibleFileEncoding) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::interaction_history::{InteractionPayload, InteractionStore};
     use crate::skills::SkillRegistry;
     use std::fs;
     use uuid::Uuid;
@@ -2949,5 +3044,61 @@ mod tests {
             .expect_err("second edit without reread must fail");
 
         assert!(err.to_string().contains("has been Read"));
+    }
+
+    #[tokio::test]
+    async fn show_requires_non_empty_prompt() {
+        let ctx = test_context();
+        let executor = ToolExecutor::new(ctx.clone(), None);
+        let cancel = crate::cancel::cancel_pair().1;
+
+        fs::write(ctx.workspace_root.join("note.txt"), "hello").expect("seed file");
+
+        let err = executor
+            .show(
+                &ToolRuntime::detached(),
+                serde_json::json!({
+                    "path": "note.txt",
+                    "prompt": ""
+                }),
+                &cancel,
+            )
+            .await
+            .expect_err("empty prompt must fail");
+
+        assert!(err.to_string().contains("Show prompt must not be empty"));
+    }
+
+    #[tokio::test]
+    async fn get_interaction_entry_reads_summary_from_log() {
+        let ctx = test_context();
+        let executor = ToolExecutor::new(ctx.clone(), None);
+        let cancel = crate::cancel::cancel_pair().1;
+        let store = InteractionStore::new(ctx.workspace_root.clone()).expect("store");
+        let entry = store
+            .append_new(
+                Some(Uuid::new_v4()),
+                Some(Uuid::new_v4()),
+                InteractionPayload::Send {
+                    message: "history message".to_string(),
+                },
+            )
+            .expect("entry should append");
+
+        let raw = executor
+            .get_interaction_entry(
+                serde_json::json!({
+                    "id": entry.id,
+                    "mode": "summary"
+                }),
+                &cancel,
+            )
+            .await
+            .expect("tool should read interaction entry");
+        let value: serde_json::Value =
+            serde_json::from_str(&raw).expect("tool output should be valid JSON");
+        assert_eq!(value["kind"], "send");
+        assert_eq!(value["id"], entry.id.to_string());
+        assert_eq!(value["message_preview"], "history message");
     }
 }
