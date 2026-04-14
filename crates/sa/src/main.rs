@@ -924,6 +924,7 @@ impl Hub {
         reason: &str,
     ) -> anyhow::Result<()> {
         let mut team_state = self.team_state.lock().await;
+        let previous_input_owner_agent_id = team_state.input_owner_agent_id;
         if team_state.input_owner_agent_id == Some(input_owner_agent_id) {
             return Ok(());
         }
@@ -941,6 +942,52 @@ impl Hub {
             })
             .unwrap_or(team_state.root_agent_id);
         drop(team_state);
+
+        let previous_input_owner = previous_input_owner_agent_id
+            .and_then(|agent_id| self.runtime_store.load_agent_state(agent_id).ok().flatten());
+        let new_input_owner = self.runtime_store.load_agent_state(input_owner_agent_id)?;
+
+        if let Some(previous_input_owner) = previous_input_owner.as_ref()
+            && previous_input_owner.agent_id != input_owner_agent_id
+        {
+            self.append_mailbox_message(
+                previous_input_owner.agent_id,
+                MailboxEntryKind::SystemNotice,
+                None,
+                Some("runtime".to_string()),
+                format!(
+                    "同学自由输入权限已从你这里移走，当前交给 `{}`（agent_id: {}）。后续同学输入不会再路由到你，除非主代理再次转交。",
+                    if input_owner_agent_id == previous_input_owner.root_agent_id {
+                        "学习委员".to_string()
+                    } else {
+                        new_input_owner
+                            .as_ref()
+                            .map(|state| state.label.clone())
+                            .unwrap_or_else(|| input_owner_agent_id.to_string())
+                    },
+                    input_owner_agent_id
+                ),
+                previous_input_owner.active_work_id.or(event_task_id),
+                Some(input_owner_agent_id),
+            )
+            .await?;
+        }
+
+        if let Some(new_input_owner) = new_input_owner.as_ref() {
+            self.append_mailbox_message(
+                new_input_owner.agent_id,
+                MailboxEntryKind::SystemNotice,
+                None,
+                Some("runtime".to_string()),
+                format!(
+                    "同学自由输入权限已交给你。后续同学输入会继续路由到你，直到主代理显式收回或再次转交。来源：{}。",
+                    reason
+                ),
+                new_input_owner.active_work_id.or(event_task_id),
+                previous_input_owner_agent_id.or(event_task_id),
+            )
+            .await?;
+        }
 
         self.publish(
             EventKind::Log,
@@ -6811,6 +6858,108 @@ description: Teaches patiently
             .expect("team state should load")
             .expect("team state should exist");
         assert_eq!(persisted.input_owner_agent_id, Some(child_agent_id));
+    }
+
+    #[tokio::test]
+    async fn transfer_input_notifies_both_previous_and_new_owners() {
+        let workspace = TempDir::new().expect("temp workspace should build");
+        let hub = build_test_hub(&workspace);
+        let root_agent_id = hub
+            .runtime_store
+            .load_root_marker()
+            .expect("root marker should load")
+            .expect("root marker should exist")
+            .root_agent_id;
+        let child_agent_id = Uuid::new_v4();
+        let root_work_id = Uuid::new_v4();
+        let child_work_id = Uuid::new_v4();
+
+        let mut root_state = hub
+            .runtime_store
+            .load_agent_state(root_agent_id)
+            .expect("root state should load")
+            .expect("root state should exist");
+        root_state.active_work_id = Some(root_work_id);
+        root_state.active_work_summary = Some("主代理继续工作".to_string());
+        root_state.active_started_at = Some(chrono::Utc::now());
+        hub.runtime_store
+            .save_agent_state(&root_state)
+            .expect("root state should save");
+
+        let mut child_state = AgentState::new_child(
+            child_agent_id,
+            root_agent_id,
+            root_agent_id,
+            "聊天助手".to_string(),
+            true,
+            true,
+            true,
+            true,
+            None,
+            None,
+            None,
+            "sessions/agents/child.jsonl".to_string(),
+        );
+        child_state.active_work_id = Some(child_work_id);
+        child_state.active_work_summary = Some("子代理接待同学".to_string());
+        child_state.active_started_at = Some(chrono::Utc::now());
+        hub.runtime_store
+            .save_agent_state(&child_state)
+            .expect("child state should save");
+
+        hub.set_input_owner(child_agent_id, Some(root_work_id), "test transfer to child")
+            .await
+            .expect("input owner should transfer to child");
+
+        let root_mailbox = hub
+            .runtime_store
+            .read_mailbox(root_agent_id)
+            .expect("root mailbox should load");
+        let child_mailbox = hub
+            .runtime_store
+            .read_mailbox(child_agent_id)
+            .expect("child mailbox should load");
+        assert!(
+            root_mailbox
+                .iter()
+                .any(|entry| entry.kind == MailboxEntryKind::SystemNotice
+                    && entry.message.contains("已从你这里移走")),
+            "root should receive a losing-input notice",
+        );
+        assert!(
+            child_mailbox
+                .iter()
+                .any(|entry| entry.kind == MailboxEntryKind::SystemNotice
+                    && entry.message.contains("已交给你")),
+            "child should receive a gaining-input notice",
+        );
+
+        hub.set_input_owner(root_agent_id, Some(root_work_id), "test reclaim to root")
+            .await
+            .expect("input owner should transfer back to root");
+
+        let root_mailbox = hub
+            .runtime_store
+            .read_mailbox(root_agent_id)
+            .expect("root mailbox should reload");
+        let child_mailbox = hub
+            .runtime_store
+            .read_mailbox(child_agent_id)
+            .expect("child mailbox should reload");
+        assert!(
+            root_mailbox
+                .iter()
+                .filter(|entry| entry.kind == MailboxEntryKind::SystemNotice)
+                .any(|entry| entry.message.contains("已交给你")),
+            "root should receive a gaining-input notice when reclaimed",
+        );
+        assert!(
+            child_mailbox
+                .iter()
+                .filter(|entry| entry.kind == MailboxEntryKind::SystemNotice)
+                .any(|entry| entry.message.contains("已从你这里移走")),
+            "child should receive a losing-input notice when root reclaims input",
+        );
     }
 
     #[tokio::test]
