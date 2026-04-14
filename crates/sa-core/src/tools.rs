@@ -45,6 +45,7 @@ use crate::ws_protocol::{
 };
 use anyhow::Context as _;
 use base64::Engine as _;
+use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::OsString;
@@ -85,6 +86,38 @@ pub const MAX_SUBAGENT_DEPTH: u32 = 6;
 
 /// Boxed async return type used by runtime callbacks.
 type ToolFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
+
+/// Deserialize one optional string field, treating empty/blank strings as
+/// `None`.
+fn deserialize_optional_nonempty_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    Ok(value.and_then(|raw| {
+        if raw.trim().is_empty() {
+            None
+        } else {
+            Some(raw)
+        }
+    }))
+}
+
+/// Deserialize one optional UUID field, treating empty/blank strings as
+/// `None`.
+fn deserialize_optional_uuid_or_empty<'de, D>(deserializer: D) -> Result<Option<Uuid>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    match value {
+        None => Ok(None),
+        Some(raw) if raw.trim().is_empty() => Ok(None),
+        Some(raw) => Uuid::parse_str(raw.trim())
+            .map(Some)
+            .map_err(D::Error::custom),
+    }
+}
 
 /// Callback used by `Send`.
 pub type SendMessageFn =
@@ -2901,11 +2934,15 @@ impl ToolExecutor {
 
         #[derive(Debug, Deserialize)]
         struct Args {
+            #[serde(default, deserialize_with = "deserialize_optional_nonempty_string")]
             label: Option<String>,
             task: String,
             context: String,
+            #[serde(default, deserialize_with = "deserialize_optional_nonempty_string")]
             prompt: Option<String>,
+            #[serde(default, deserialize_with = "deserialize_optional_nonempty_string")]
             prompt_file: Option<String>,
+            #[serde(default, deserialize_with = "deserialize_optional_nonempty_string")]
             prompt_skill: Option<String>,
             #[serde(default)]
             allow_user_send: bool,
@@ -2915,6 +2952,7 @@ impl ToolExecutor {
             allow_user_ask: bool,
             #[serde(default)]
             allow_input_transfer_target: bool,
+            #[serde(default, deserialize_with = "deserialize_optional_uuid_or_empty")]
             existing_agent_id: Option<Uuid>,
         }
 
@@ -4334,6 +4372,54 @@ Write about $topic in session ${SA_SESSION_ID}.
             panic!("Reload should return an observation payload");
         };
         assert!(raw.contains("reloaded model=test-model"));
+    }
+
+    #[tokio::test]
+    async fn subagent_accepts_empty_optional_fields_as_absent() {
+        let ctx = test_context();
+        let executor = ToolExecutor::new(ctx, None);
+        let cancel = crate::cancel::cancel_pair().1;
+        let mut runtime = ToolRuntime::detached();
+        runtime.run_subagent = Arc::new(|request, _cancel| {
+            Box::pin(async move {
+                assert_eq!(request.label.as_deref(), Some("chat-worker"));
+                assert_eq!(request.prompt, None);
+                assert_eq!(request.prompt_file, None);
+                assert_eq!(request.prompt_skill, None);
+                assert_eq!(request.existing_agent_id, None);
+                Ok(SubAgentHandle {
+                    agent_id: Uuid::new_v4(),
+                    work_id: Uuid::new_v4(),
+                    label: request.label.unwrap_or_else(|| "child".to_string()),
+                    status: AgentStatus::Idle,
+                })
+            })
+        });
+
+        let raw = executor
+            .subagent(
+                &runtime,
+                serde_json::json!({
+                    "label": "chat-worker",
+                    "task": "talk to the user",
+                    "context": "take over the conversation after verification",
+                    "prompt": "",
+                    "prompt_file": "",
+                    "prompt_skill": "",
+                    "existing_agent_id": "",
+                    "allow_user_send": true,
+                    "allow_user_ask": true,
+                    "allow_user_show": false,
+                    "allow_input_transfer_target": true
+                }),
+                &cancel,
+            )
+            .await
+            .expect("SubAgent should treat empty optional fields as absent");
+
+        let value: serde_json::Value =
+            serde_json::from_str(&raw).expect("tool output should be valid JSON");
+        assert_eq!(value["label"], "chat-worker");
     }
 
     #[cfg(windows)]
