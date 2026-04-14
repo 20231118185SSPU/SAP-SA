@@ -275,3 +275,25 @@
    - `Show(prompt)` 校验
    - `GetInteractionEntry` 的 summary/full/slice
    - `submit` / `Ask` 的真实主路径写历史
+
+## 2026-04-14 Ask 重连排序补丁
+
+本轮又补了一条容易在前端重连时暴露的细节问题：
+
+1. 后端 `UserQuestion` 协议新增 `created_at`
+   - 来源不是前端接收时间
+   - 而是后端真正创建 `Ask` 时的时间
+   - 对于重启恢复的 pending question，则复用 `pending_question.json` 中持久化的 `created_at`
+2. 补这个字段的原因
+   - 前端把 `Ask` 视作交互堵塞点
+   - 但在重连时，`pending_questions` 与 `history` 是分开发送的
+   - 如果没有稳定时间锚点，`Ask` 会被简单追加到 block 末尾
+   - 这样会把“更早的历史消息”错误挡在 `Ask` 后面，或者让“本该被阻塞的后续消息”跑到前面
+3. 当前前端修正策略
+   - 所有交互 block 维护内部 `sortMs`
+   - `Ask` 使用后端的 `created_at`
+   - `message` 事件使用 event timestamp
+   - reconnect / history replay 时统一按 source time 插入，而不是只按接收顺序追加
+4. 新增回归覆盖
+   - pending question reconnect 时不会再盲目 append
+   - 历史消息 replay 到已有未完成 `Ask` 前后时，会按真实时间落位

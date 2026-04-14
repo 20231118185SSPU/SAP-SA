@@ -1413,9 +1413,11 @@ impl Hub {
         request: AskRequest,
     ) -> anyhow::Result<()> {
         let question_id = Uuid::new_v4();
+        let created_at = chrono::Utc::now();
         let question = UserQuestion {
             question_id,
             task_id: work_id,
+            created_at,
             prompt: request.prompt.clone(),
             mode: request.mode.clone(),
             options: request.options.clone(),
@@ -1430,7 +1432,7 @@ impl Hub {
             mode: serde_json::to_string(&question.mode)?,
             options_json: serde_json::to_string(&question.options)?,
             allow_free_text: question.allow_free_text,
-            created_at: chrono::Utc::now(),
+            created_at,
         };
 
         self.runtime_store.save_pending_question(&question_state)?;
@@ -1717,6 +1719,7 @@ impl Hub {
                     question: UserQuestion {
                         question_id: question_state.question_id,
                         task_id: question_state.work_id,
+                        created_at: question_state.created_at,
                         prompt: question_state.prompt,
                         mode,
                         options,
@@ -2830,6 +2833,7 @@ impl Hub {
         let question = UserQuestion {
             question_id: Uuid::new_v4(),
             task_id,
+            created_at: chrono::Utc::now(),
             prompt: request.prompt,
             mode: request.mode,
             options: request.options,
@@ -5304,6 +5308,7 @@ mod tests {
             .expect("root agent state should load")
             .expect("root agent state should exist");
         let work_id = Uuid::new_v4();
+        let created_at = chrono::Utc::now();
         root_state.active_work_id = Some(work_id);
         root_state.status = AgentStatus::Running;
         hub.runtime_store
@@ -5325,7 +5330,7 @@ mod tests {
                 }])
                 .expect("options should serialize"),
                 allow_free_text: false,
-                created_at: chrono::Utc::now(),
+                created_at,
             })
             .expect("pending question should persist");
 
@@ -5335,6 +5340,7 @@ mod tests {
         assert_eq!(questions.len(), 1);
         assert_eq!(questions[0].task_id, work_id);
         assert_eq!(questions[0].prompt, "请选择");
+        assert_eq!(questions[0].created_at, created_at);
         let root_state = hub
             .runtime_store
             .load_agent_state(root_agent_id)
@@ -5386,6 +5392,7 @@ mod tests {
                 question: UserQuestion {
                     question_id,
                     task_id: work_id,
+                    created_at: chrono::Utc::now(),
                     prompt: "请选择".to_string(),
                     mode: QuestionMode::SingleChoice,
                     options: vec![sa_core::ws_protocol::QuestionOption {
@@ -5426,6 +5433,67 @@ mod tests {
         let content = last.content.as_deref().expect("tool result should contain text");
         assert!(content.contains("\"selected_option_ids\":[\"a\"]"));
         assert!(content.contains("\"selected_labels\":[\"选项A\"]"));
+    }
+
+    #[tokio::test]
+    async fn recovered_pending_question_can_still_be_answered() {
+        let workspace = TempDir::new().expect("temp workspace should build");
+        let hub = build_test_hub(&workspace);
+        let root_agent_id = hub
+            .runtime_store
+            .load_root_marker()
+            .expect("root marker should load")
+            .expect("root marker should exist")
+            .root_agent_id;
+        let question_id = Uuid::new_v4();
+        let work_id = Uuid::new_v4();
+
+        let mut root_state = hub
+            .runtime_store
+            .load_agent_state(root_agent_id)
+            .expect("root state should load")
+            .expect("root state should exist");
+        root_state.active_work_id = Some(work_id);
+        hub.runtime_store
+            .save_agent_state(&root_state)
+            .expect("root state should save");
+        hub.runtime_store
+            .save_pending_question(&PendingQuestionState {
+                agent_id: root_agent_id,
+                work_id,
+                question_id,
+                tool_call_id: "call_recovered".to_string(),
+                prompt: "恢复后的问题".to_string(),
+                mode: serde_json::to_string(&QuestionMode::SingleChoice)
+                    .expect("mode should serialize"),
+                options_json: serde_json::to_string(&vec![sa_core::ws_protocol::QuestionOption {
+                    id: "ok".to_string(),
+                    label: "继续".to_string(),
+                    description: None,
+                }])
+                .expect("options should serialize"),
+                allow_free_text: false,
+                created_at: chrono::Utc::now(),
+            })
+            .expect("pending question should persist");
+
+        hub.recover_runtime().await.expect("runtime should recover");
+        assert_eq!(hub.pending_questions_snapshot().len(), 1);
+
+        hub.answer_question(UserQuestionAnswer {
+            question_id,
+            selected_option_ids: vec!["ok".to_string()],
+            free_text: None,
+        })
+        .await
+        .expect("recovered question should be answerable");
+
+        assert!(
+            hub.runtime_store
+                .load_pending_question(root_agent_id)
+                .expect("pending question should load")
+                .is_none()
+        );
     }
 
     #[tokio::test]

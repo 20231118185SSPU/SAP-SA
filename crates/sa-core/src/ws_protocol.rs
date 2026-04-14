@@ -290,6 +290,9 @@ pub struct UserQuestion {
     pub question_id: Uuid,
     /// Top-level task id this question belongs to.
     pub task_id: Uuid,
+    /// Backend-side creation time used by reconnecting frontends to restore
+    /// the original ordering around blocking `Ask` messages.
+    pub created_at: DateTime<Utc>,
     /// User-facing prompt.
     pub prompt: String,
     /// Expected answer shape.
