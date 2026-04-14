@@ -9,7 +9,8 @@
 //! - `runtime/tasks/<task_id>.json`
 
 use crate::runtime::state::{
-    AgentState, MailboxEntry, PendingQuestionState, RuntimeTaskState, TeamState,
+    AgentState, MailboxEntry, PendingQuestionState, RuntimeTaskState, RuntimeWorkState,
+    TeamState,
 };
 use anyhow::Context as _;
 use std::collections::HashMap;
@@ -26,6 +27,8 @@ pub const RUNTIME_DIR_NAME: &str = "runtime";
 pub const RUNTIME_AGENTS_DIR_NAME: &str = "agents";
 /// Runtime task directory under `runtime/`.
 pub const RUNTIME_TASKS_DIR_NAME: &str = "tasks";
+/// Runtime work directory under `runtime/`.
+pub const RUNTIME_WORKS_DIR_NAME: &str = "works";
 /// Root marker file under `runtime/`.
 pub const ROOT_MARKER_FILE_NAME: &str = "root.json";
 /// Team state file under `runtime/`.
@@ -51,6 +54,7 @@ pub struct RuntimeStore {
     runtime_dir: PathBuf,
     agents_dir: PathBuf,
     tasks_dir: PathBuf,
+    works_dir: PathBuf,
     root_marker_path: PathBuf,
     team_state_path: PathBuf,
     mailbox_locks: Arc<Mutex<HashMap<Uuid, Arc<Mutex<()>>>>>,
@@ -69,10 +73,13 @@ impl RuntimeStore {
         let runtime_dir = workspace_root.join(RUNTIME_DIR_NAME);
         let agents_dir = runtime_dir.join(RUNTIME_AGENTS_DIR_NAME);
         let tasks_dir = runtime_dir.join(RUNTIME_TASKS_DIR_NAME);
+        let works_dir = runtime_dir.join(RUNTIME_WORKS_DIR_NAME);
         fs::create_dir_all(&agents_dir)
             .with_context(|| format!("Failed to create agents dir: {}", agents_dir.display()))?;
         fs::create_dir_all(&tasks_dir)
             .with_context(|| format!("Failed to create tasks dir: {}", tasks_dir.display()))?;
+        fs::create_dir_all(&works_dir)
+            .with_context(|| format!("Failed to create works dir: {}", works_dir.display()))?;
 
         Ok(Self {
             root_marker_path: runtime_dir.join(ROOT_MARKER_FILE_NAME),
@@ -81,6 +88,7 @@ impl RuntimeStore {
             runtime_dir,
             agents_dir,
             tasks_dir,
+            works_dir,
             mailbox_locks: Arc::new(Mutex::new(HashMap::new())),
         })
     }
@@ -131,6 +139,11 @@ impl RuntimeStore {
     /// Return the runtime task file path.
     pub fn task_state_path(&self, task_id: Uuid) -> PathBuf {
         self.tasks_dir.join(format!("{task_id}.json"))
+    }
+
+    /// Return the runtime work file path.
+    pub fn work_state_path(&self, work_id: Uuid) -> PathBuf {
+        self.works_dir.join(format!("{work_id}.json"))
     }
 
     /// Persist the root marker.
@@ -190,6 +203,32 @@ impl RuntimeStore {
     /// Load one runtime task state if it exists.
     pub fn load_task_state(&self, task_id: Uuid) -> anyhow::Result<Option<RuntimeTaskState>> {
         read_json_optional(&self.task_state_path(task_id))
+    }
+
+    /// Persist one runtime work state.
+    pub fn save_work_state(&self, work: &RuntimeWorkState) -> anyhow::Result<()> {
+        write_json_pretty(&self.work_state_path(work.work_id), work)
+    }
+
+    /// Load one runtime work state if it exists.
+    pub fn load_work_state(&self, work_id: Uuid) -> anyhow::Result<Option<RuntimeWorkState>> {
+        read_json_optional(&self.work_state_path(work_id))
+    }
+
+    /// Enumerate all persisted runtime works.
+    pub fn list_work_states(&self) -> anyhow::Result<Vec<RuntimeWorkState>> {
+        let mut out = Vec::new();
+        for entry in fs::read_dir(&self.works_dir)
+            .with_context(|| format!("Failed to read works dir: {}", self.works_dir.display()))?
+        {
+            let entry = entry?;
+            let path = entry.path();
+            if let Some(work) = read_json_optional::<RuntimeWorkState>(&path)? {
+                out.push(work);
+            }
+        }
+        out.sort_by_key(|work| work.work_id);
+        Ok(out)
     }
 
     /// Enumerate all persisted runtime tasks.

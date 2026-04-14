@@ -31,8 +31,8 @@ use sa_core::openai::{AuthStyle, ChatMessage, OpenAiClient, WireApi};
 use sa_core::runtime::state::{
     AgentKind, AgentState, MailboxEntry, MailboxEntryKind, PendingAssistantMessage,
     PendingControlAction, PendingFinishConfirmation, PendingFinishMode, PendingQuestionState,
-    RuntimeTaskKind, RuntimeTaskState, RuntimeTaskStatus, TeamState, WaitKind, WaitUntil,
-    WaitingDependency,
+    RuntimeTaskKind, RuntimeTaskState, RuntimeTaskStatus, RuntimeWorkState, RuntimeWorkStatus,
+    TeamState, WaitKind, WaitUntil, WaitingDependency,
 };
 use sa_core::runtime::store::{RootMarker, RuntimeStore};
 use sa_core::session::SessionStore;
@@ -929,11 +929,14 @@ impl Hub {
                 }
             }
             WaitKind::Work => {
-                for state in self.runtime_store.list_agent_states()? {
-                    if state.last_finished_work_id == Some(waiting_on.id) {
+                if let Some(work) = self.runtime_store.load_work_state(waiting_on.id)? {
+                    if matches!(
+                        work.status,
+                        RuntimeWorkStatus::Finished | RuntimeWorkStatus::Cancelled
+                    ) {
                         return Ok(Some(format!(
-                            "Work {} finished via agent {}.",
-                            waiting_on.id, state.agent_id
+                            "Work {} completed with status {:?}.",
+                            waiting_on.id, work.status
                         )));
                     }
                 }
@@ -1064,6 +1067,12 @@ impl Hub {
             self.runtime_store.save_agent_state(state)?;
             return Ok(None);
         };
+        let work_summary = state
+            .active_work_summary
+            .clone()
+            .unwrap_or_else(|| "(cancelled work)".to_string());
+        let started_at = state.active_started_at.unwrap_or_else(chrono::Utc::now);
+        let finished_at = chrono::Utc::now();
 
         state.status = AgentStatus::Idle;
         state.active_work_id = None;
@@ -1078,6 +1087,16 @@ impl Hub {
         state.pending_control = None;
         self.runtime_store.clear_pending_question(state.agent_id)?;
         self.runtime_store.save_agent_state(state)?;
+        self.persist_terminal_work(
+            state.agent_id,
+            state.root_agent_id,
+            work_id,
+            work_summary,
+            started_at,
+            RuntimeWorkStatus::Cancelled,
+            finished_at,
+            format!("Cancelled: {}", reason.trim()),
+        )?;
 
         self.publish(
             EventKind::Final,
@@ -1112,6 +1131,51 @@ impl Hub {
             summary.push_str("...");
         }
         summary
+    }
+
+    /// Persist one newly started work into the durable work index.
+    fn persist_started_work(
+        &self,
+        owner_agent_id: Uuid,
+        root_agent_id: Uuid,
+        work_id: Uuid,
+        summary: String,
+        started_at: chrono::DateTime<chrono::Utc>,
+    ) -> anyhow::Result<()> {
+        self.runtime_store.save_work_state(&RuntimeWorkState {
+            work_id,
+            owner_agent_id,
+            root_agent_id,
+            summary,
+            status: RuntimeWorkStatus::Running,
+            started_at,
+            finished_at: None,
+            result_summary: None,
+        })
+    }
+
+    /// Persist a terminal work state.
+    fn persist_terminal_work(
+        &self,
+        owner_agent_id: Uuid,
+        root_agent_id: Uuid,
+        work_id: Uuid,
+        summary: String,
+        started_at: chrono::DateTime<chrono::Utc>,
+        status: RuntimeWorkStatus,
+        finished_at: chrono::DateTime<chrono::Utc>,
+        result_summary: String,
+    ) -> anyhow::Result<()> {
+        self.runtime_store.save_work_state(&RuntimeWorkState {
+            work_id,
+            owner_agent_id,
+            root_agent_id,
+            summary,
+            status,
+            started_at,
+            finished_at: Some(finished_at),
+            result_summary: Some(result_summary),
+        })
     }
 
     /// Convert one durable mailbox entry into a chat-style user turn.
@@ -1426,6 +1490,11 @@ impl Hub {
         let agent_label = state.label.clone();
         let root_agent_id = state.root_agent_id;
         let finished_at = chrono::Utc::now();
+        let work_summary = state
+            .active_work_summary
+            .clone()
+            .unwrap_or_else(|| "(finished work)".to_string());
+        let started_at = state.active_started_at.unwrap_or_else(chrono::Utc::now);
 
         state.status = AgentStatus::Idle;
         state.active_work_id = None;
@@ -1444,6 +1513,16 @@ impl Hub {
         state.last_finished_at = Some(finished_at);
         self.runtime_store.clear_pending_question(agent_id)?;
         self.runtime_store.save_agent_state(state)?;
+        self.persist_terminal_work(
+            agent_id,
+            root_agent_id,
+            work_id,
+            work_summary,
+            started_at,
+            RuntimeWorkStatus::Finished,
+            finished_at,
+            effective_result.clone(),
+        )?;
 
         self.publish(
             EventKind::Final,
@@ -1577,6 +1656,21 @@ impl Hub {
 
         for mut state in self.runtime_store.list_agent_states()? {
             let _ = self.session_store_for_agent(state.agent_id).await?;
+
+            if let Some(work_id) = state.active_work_id
+                && self.runtime_store.load_work_state(work_id)?.is_none()
+            {
+                self.persist_started_work(
+                    state.agent_id,
+                    state.root_agent_id,
+                    work_id,
+                    state
+                        .active_work_summary
+                        .clone()
+                        .unwrap_or_else(|| "(recovered work)".to_string()),
+                    state.active_started_at.unwrap_or_else(chrono::Utc::now),
+                )?;
+            }
 
             if let Some(question_state) = self.runtime_store.load_pending_question(state.agent_id)? {
                 let mode = serde_json::from_str::<QuestionMode>(&question_state.mode)?;
@@ -1736,14 +1830,17 @@ impl Hub {
                 .first()
                 .map(|entry| entry.message.as_str())
                 .unwrap_or("(runtime mailbox)");
+            let started_at = chrono::Utc::now();
+            let summary = Self::summarize_work_text(summary_source);
             state.active_work_id = Some(work_id);
-            state.active_work_summary = Some(Self::summarize_work_text(summary_source));
-            state.active_started_at = Some(chrono::Utc::now());
+            state.active_work_summary = Some(summary.clone());
+            state.active_started_at = Some(started_at);
             state.work_has_user_output = false;
             state.work_has_parent_message = false;
             state.parent_work_id = None;
             state.pending_finish_confirmation = None;
             state.needs_finish_reminder = false;
+            self.persist_started_work(state.agent_id, state.root_agent_id, work_id, summary, started_at)?;
         }
 
         let work_id = state
@@ -2403,9 +2500,11 @@ impl Hub {
 
         self.sync_agent_session_paths(&mut child_state, &child_session_store)?;
         let child_work_id = Uuid::new_v4();
+        let started_at = chrono::Utc::now();
+        let summary = Self::summarize_work_text(&request.task);
         child_state.active_work_id = Some(child_work_id);
-        child_state.active_work_summary = Some(Self::summarize_work_text(&request.task));
-        child_state.active_started_at = Some(chrono::Utc::now());
+        child_state.active_work_summary = Some(summary.clone());
+        child_state.active_started_at = Some(started_at);
         child_state.work_has_user_output = false;
         child_state.work_has_parent_message = false;
         child_state.parent_work_id = Some(parent_work_id);
@@ -2414,6 +2513,13 @@ impl Hub {
         child_state.pending_control = None;
         child_state.waiting_on = None;
         child_state.status = AgentStatus::Idle;
+        self.persist_started_work(
+            child_state.agent_id,
+            child_state.root_agent_id,
+            child_work_id,
+            summary,
+            started_at,
+        )?;
 
         self.runtime_store.save_agent_state(&child_state)?;
 
@@ -2586,9 +2692,11 @@ impl Hub {
         let effective_work_id = owner_state.active_work_id.unwrap_or(task_id);
 
         if is_new_work {
+            let started_at = chrono::Utc::now();
+            let summary = Self::summarize_work_text(&task);
             owner_state.active_work_id = Some(effective_work_id);
-            owner_state.active_work_summary = Some(Self::summarize_work_text(&task));
-            owner_state.active_started_at = Some(chrono::Utc::now());
+            owner_state.active_work_summary = Some(summary.clone());
+            owner_state.active_started_at = Some(started_at);
             owner_state.work_has_user_output = false;
             owner_state.work_has_parent_message = false;
             owner_state.parent_work_id = None;
@@ -2597,6 +2705,13 @@ impl Hub {
             owner_state.pending_control = None;
             owner_state.waiting_on = None;
             owner_state.status = AgentStatus::Idle;
+            self.persist_started_work(
+                owner_state.agent_id,
+                owner_state.root_agent_id,
+                effective_work_id,
+                summary,
+                started_at,
+            )?;
         }
         self.runtime_store.save_agent_state(&owner_state)?;
         {
@@ -5254,6 +5369,69 @@ mod tests {
         assert_eq!(mailbox.len(), 2);
         assert_eq!(mailbox[0].work_id, Some(work_id));
         assert_eq!(mailbox[1].work_id, Some(work_id));
+    }
+
+    #[tokio::test]
+    async fn wait_kind_work_recognizes_older_completed_work_records() {
+        let workspace = TempDir::new().expect("temp workspace should build");
+        let hub = build_test_hub(&workspace);
+        let root_agent_id = hub
+            .runtime_store
+            .load_root_marker()
+            .expect("root marker should load")
+            .expect("root marker should exist")
+            .root_agent_id;
+        let older_work_id = Uuid::new_v4();
+        let newer_work_id = Uuid::new_v4();
+
+        hub.runtime_store
+            .save_work_state(&sa_core::runtime::state::RuntimeWorkState {
+                work_id: older_work_id,
+                owner_agent_id: root_agent_id,
+                root_agent_id,
+                summary: "older".to_string(),
+                status: sa_core::runtime::state::RuntimeWorkStatus::Finished,
+                started_at: chrono::Utc::now(),
+                finished_at: Some(chrono::Utc::now()),
+                result_summary: Some("older finished".to_string()),
+            })
+            .expect("older work should persist");
+        hub.runtime_store
+            .save_work_state(&sa_core::runtime::state::RuntimeWorkState {
+                work_id: newer_work_id,
+                owner_agent_id: root_agent_id,
+                root_agent_id,
+                summary: "newer".to_string(),
+                status: sa_core::runtime::state::RuntimeWorkStatus::Finished,
+                started_at: chrono::Utc::now(),
+                finished_at: Some(chrono::Utc::now()),
+                result_summary: Some("newer finished".to_string()),
+            })
+            .expect("newer work should persist");
+
+        let mut root_state = hub
+            .runtime_store
+            .load_agent_state(root_agent_id)
+            .expect("root agent state should load")
+            .expect("root agent state should exist");
+        root_state.last_finished_work_id = Some(newer_work_id);
+        hub.runtime_store
+            .save_agent_state(&root_state)
+            .expect("root agent state should save");
+
+        let notice = hub
+            .wait_satisfied_notice(&WaitingDependency {
+                kind: WaitKind::Work,
+                id: older_work_id,
+                until: WaitUntil::Finished,
+                timeout_at: None,
+            })
+            .expect("wait notice should compute");
+
+        assert!(notice.is_some());
+        assert!(notice
+            .expect("older work should be recognized as finished")
+            .contains(&older_work_id.to_string()));
     }
 
     #[test]

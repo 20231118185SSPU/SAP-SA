@@ -210,3 +210,26 @@
 10. 增加 control checkpoint
     - `Ask` / `Wait` / `Finish` 的控制决策会先进入 durable checkpoint
     - 重启后可以补写 assistant control message，并继续完成对应 runtime 过渡
+
+## 2026-04-14 work index 补齐
+
+为了解决“older finished work 无法再被 `Wait(kind=work)` 命中”的缺口，本轮补充了 durable work index：
+
+1. 新增 `RuntimeWorkState`
+   - 路径：`runtime/works/<work_id>.json`
+   - 状态：
+     - `running`
+     - `finished`
+     - `cancelled`
+2. work 启动时会建档
+   - root 新 work
+   - durable child 新 work
+   - 以及恢复过程中补建的 active work
+3. work 终结时会写入终态
+   - `Finish` -> `finished`
+   - `interrupt` / 显式取消 -> `cancelled`
+4. `Wait(kind=work)` 现在改为查询 durable work index
+   - 不再依赖单个 `last_finished_work_id`
+   - 因此同一 agent 后续再完成新的 work，也不会让更早完成的 work 丢失可观测性
+5. 新增回归测试
+   - 证明 older finished work 在 newer finished work 出现后仍然可以被立即识别

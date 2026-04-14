@@ -350,6 +350,40 @@ pub struct WaitingDependency {
     pub timeout_at: Option<DateTime<Utc>>,
 }
 
+/// Durable lifecycle state of one logical work item executed by an agent.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeWorkStatus {
+    /// Work is currently active.
+    Running,
+    /// Work finished normally via explicit `Finish`.
+    Finished,
+    /// Work was cancelled intentionally, for example by interrupt.
+    Cancelled,
+}
+
+/// Durable record for one logical work item so `Wait(kind=work)` can remain
+/// valid even after the owning agent starts newer work items.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeWorkState {
+    /// Stable work id.
+    pub work_id: Uuid,
+    /// Current owner agent.
+    pub owner_agent_id: Uuid,
+    /// Root tree containing this work.
+    pub root_agent_id: Uuid,
+    /// Human-readable summary captured when the work started.
+    pub summary: String,
+    /// Current lifecycle state.
+    pub status: RuntimeWorkStatus,
+    /// When the work started.
+    pub started_at: DateTime<Utc>,
+    /// When the work reached a terminal state, if applicable.
+    pub finished_at: Option<DateTime<Utc>>,
+    /// Optional human-readable outcome.
+    pub result_summary: Option<String>,
+}
+
 /// Kind of durable runtime task.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
