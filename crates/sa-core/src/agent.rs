@@ -240,6 +240,7 @@ impl AgentRunner {
         let mut system_message = ChatMessage::text(
             self.cfg.system_role_name.clone(),
             self.build_system_prompt(
+                &runtime,
                 agents_md,
                 join_extra_system_prompt(
                     extra_system_prompt,
@@ -255,10 +256,13 @@ impl AgentRunner {
 
         match maybe_compact_history(
             &self.llm,
-            &self.cfg.model,
+            runtime.model_override.as_deref().unwrap_or(&self.cfg.model),
             &system_message.role,
             &system_message,
-            self.cfg.reasoning_effort.as_deref(),
+            runtime
+                .effort_override
+                .as_deref()
+                .or(self.cfg.reasoning_effort.as_deref()),
             &mut compaction_state,
             &mut messages,
             &self.tools.tool_definitions(&runtime),
@@ -281,6 +285,7 @@ impl AgentRunner {
                     system_message = ChatMessage::text(
                         self.cfg.system_role_name.clone(),
                         self.build_system_prompt(
+                            &runtime,
                             agents_md,
                             join_extra_system_prompt(
                                 extra_system_prompt,
@@ -313,10 +318,16 @@ impl AgentRunner {
         }
 
         let req = ChatCompletionsRequest {
-            model: self.cfg.model.clone(),
+            model: runtime
+                .model_override
+                .clone()
+                .unwrap_or_else(|| self.cfg.model.clone()),
             messages: build_request_messages(&system_message, &compaction_state, &messages),
             max_tokens: None,
-            reasoning_effort: self.cfg.reasoning_effort.clone(),
+            reasoning_effort: runtime
+                .effort_override
+                .clone()
+                .or_else(|| self.cfg.reasoning_effort.clone()),
             tools: Some(self.tools.tool_definitions(&runtime)),
             tool_choice: Some(serde_json::json!("auto")),
             stream: Some(true),
@@ -357,8 +368,7 @@ impl AgentRunner {
                     }
                 }
                 Err(err) => {
-                    return Err(anyhow::Error::new(err))
-                        .context("Non-retryable model call error");
+                    return Err(anyhow::Error::new(err)).context("Non-retryable model call error");
                 }
             }
         };
@@ -427,13 +437,11 @@ impl AgentRunner {
             };
 
             let outcome = match control {
-                ToolControl::Ask(request) => {
-                    AgentQuantumOutcome::Ask {
-                        assistant_message: assistant,
-                        tool_call_id: call.id.clone(),
-                        request,
-                    }
-                }
+                ToolControl::Ask(request) => AgentQuantumOutcome::Ask {
+                    assistant_message: assistant,
+                    tool_call_id: call.id.clone(),
+                    request,
+                },
                 ToolControl::Finish(request) => AgentQuantumOutcome::Finish {
                     assistant_message: assistant,
                     reason: request.reason,
@@ -479,9 +487,7 @@ impl AgentRunner {
             {
                 Ok(ToolExecutionResult::Observation(output)) => output,
                 Ok(ToolExecutionResult::Control(_)) => {
-                    anyhow::bail!(
-                        "Control tools must be emitted in their own assistant turn"
-                    );
+                    anyhow::bail!("Control tools must be emitted in their own assistant turn");
                 }
                 Err(err) => {
                     let msg = format!("Tool `{}` failed: {err}", call.function.name);
@@ -579,6 +585,7 @@ impl AgentRunner {
         let mut system_message = ChatMessage::text(
             self.cfg.system_role_name.clone(),
             self.build_system_prompt(
+                &runtime,
                 agents_md,
                 join_extra_system_prompt(
                     extra_system_prompt,
@@ -628,10 +635,13 @@ impl AgentRunner {
 
             match maybe_compact_history(
                 &self.llm,
-                &self.cfg.model,
+                runtime.model_override.as_deref().unwrap_or(&self.cfg.model),
                 &system_message.role,
                 &system_message,
-                self.cfg.reasoning_effort.as_deref(),
+                runtime
+                    .effort_override
+                    .as_deref()
+                    .or(self.cfg.reasoning_effort.as_deref()),
                 &mut compaction_state,
                 &mut messages,
                 &self.tools.tool_definitions(&runtime),
@@ -654,6 +664,7 @@ impl AgentRunner {
                         system_message = ChatMessage::text(
                             self.cfg.system_role_name.clone(),
                             self.build_system_prompt(
+                                &runtime,
                                 agents_md,
                                 join_extra_system_prompt(
                                     extra_system_prompt,
@@ -680,15 +691,15 @@ impl AgentRunner {
                     if enable_compaction_memory_refresh {
                         match run_compaction_memory_refresh(
                             self,
-                                task_id,
-                                agents_md,
-                                extra_system_prompt,
-                                persistent_session.as_ref(),
-                                cancel,
-                                &emit,
-                                compaction_state.summary().unwrap_or_default(),
-                            )
-                            .await
+                            task_id,
+                            agents_md,
+                            extra_system_prompt,
+                            persistent_session.as_ref(),
+                            cancel,
+                            &emit,
+                            compaction_state.summary().unwrap_or_default(),
+                        )
+                        .await
                         {
                             Ok(Some(internal_notice)) => {
                                 append_message_and_persist(
@@ -740,10 +751,16 @@ impl AgentRunner {
 
             // Build the request.
             let req = ChatCompletionsRequest {
-                model: self.cfg.model.clone(),
+                model: runtime
+                    .model_override
+                    .clone()
+                    .unwrap_or_else(|| self.cfg.model.clone()),
                 messages: build_request_messages(&system_message, &compaction_state, &messages),
                 max_tokens: None,
-                reasoning_effort: self.cfg.reasoning_effort.clone(),
+                reasoning_effort: runtime
+                    .effort_override
+                    .clone()
+                    .or_else(|| self.cfg.reasoning_effort.clone()),
                 tools: Some(self.tools.tool_definitions(&runtime)),
                 tool_choice: Some(serde_json::json!("auto")),
                 // Stream provider output by default for the main agent loop.
@@ -925,9 +942,7 @@ impl AgentRunner {
                         ToolControl::Wait(request) => {
                             let msg = format!(
                                 "Wait requested for {:?} {} until {:?}, but the legacy runner has not been upgraded to durable waiting yet.",
-                                request.kind,
-                                request.id,
-                                request.until
+                                request.kind, request.id, request.until
                             );
                             (emit)(EventKind::Error, task_id, msg.clone());
                             format!("ERROR: {msg}")
@@ -961,12 +976,12 @@ impl AgentRunner {
                 )?;
             }
         }
-
     }
 
     /// Build the stable instructions block injected into the prompt.
     fn build_system_prompt(
         &self,
+        runtime: &ToolRuntime,
         agents_md: &AgentsMd,
         extra_system_prompt: Option<&str>,
     ) -> String {
@@ -977,7 +992,15 @@ impl AgentRunner {
         let mut out = String::from(STATIC_PROMPT_TEMPLATE.trim_end());
         out.push_str("\n\n");
 
-        if !self.skills.list().is_empty() {
+        let visible_commands = self.skills.list_model_invocable(
+            runtime
+                .activated_conditional_commands
+                .iter()
+                .map(String::as_str),
+            &runtime.denied_commands,
+        );
+
+        if !visible_commands.is_empty() {
             out.push_str("## 技能授权\n\n");
             out.push_str("所有已注册技能都已经过授权，可以按需使用。同学的任务如果明显需要某项技能，就直接用 `Skill` 读取它，不要凭空编造\"策略限制\"来回避。\n\n");
 
@@ -988,13 +1011,17 @@ impl AgentRunner {
                 "你不会看到技能在宿主机上的真实安装目录；只能通过技能名和技能内相对路径访问。\n\n",
             );
 
-            for item in self.skills.list() {
-                let _ = writeln!(
+            for item in visible_commands {
+                let _ = write!(
                     out,
                     "- `{}`：{}",
                     item.name,
                     normalize_skill_description(&item.description)
                 );
+                if let Some(when_to_use) = item.when_to_use.as_deref() {
+                    let _ = write!(out, "；适用时机：{}", when_to_use.trim());
+                }
+                out.push('\n');
             }
             out.push('\n');
         }
@@ -1016,7 +1043,11 @@ impl AgentRunner {
             now.format("%Z")
         );
 
-        let _ = writeln!(out, "## 运行时\n\n模型：`{}`\n", self.cfg.model);
+        let _ = writeln!(
+            out,
+            "## 运行时\n\n模型：`{}`\n",
+            runtime.model_override.as_deref().unwrap_or(&self.cfg.model)
+        );
 
         // Additional context injected by the daemon (memory, preloaded files, etc.).
         if let Some(extra) = extra_system_prompt {
@@ -1102,10 +1133,8 @@ async fn run_compaction_memory_refresh(
     let descriptor = snapshot.descriptor;
     let refresh_extra_context =
         build_compaction_memory_refresh_context(summary, &descriptor, &snapshot.messages);
-    let merged_extra_prompt = join_extra_system_prompt(
-        extra_system_prompt,
-        Some(refresh_extra_context.as_str()),
-    );
+    let merged_extra_prompt =
+        join_extra_system_prompt(extra_system_prompt, Some(refresh_extra_context.as_str()));
 
     let runtime = build_internal_memory_refresh_runtime(
         runner,
@@ -1132,29 +1161,28 @@ async fn run_compaction_memory_refresh(
     );
 
     let final_text = Box::pin(runner.run_task_inner(
-            task_id,
-            build_compaction_memory_refresh_task(&descriptor),
-            agents_md,
-            merged_extra_prompt.as_deref(),
-            None,
-            runtime,
-            cancel,
-            None,
-            refresh_emit,
-            false,
-        ))
-        .await
-        .context("Compaction memory refresh sub-agent failed")?;
+        task_id,
+        build_compaction_memory_refresh_task(&descriptor),
+        agents_md,
+        merged_extra_prompt.as_deref(),
+        None,
+        runtime,
+        cancel,
+        None,
+        refresh_emit,
+        false,
+    ))
+    .await
+    .context("Compaction memory refresh sub-agent failed")?;
 
     Ok(Some(build_memory_refresh_completion_notice(
-        &descriptor, &final_text,
+        &descriptor,
+        &final_text,
     )))
 }
 
 /// Build the compact-triggered memory-refresh task text.
-fn build_compaction_memory_refresh_task(
-    descriptor: &crate::session::SessionDescriptor,
-) -> String {
+fn build_compaction_memory_refresh_task(descriptor: &crate::session::SessionDescriptor) -> String {
     format!(
         "执行一次 compact 后的记忆整理。目标不是总结，而是把刚压缩掉的历史信号提炼进长期记忆。\
 \n\n工作要求：\
@@ -1181,8 +1209,14 @@ fn build_compaction_memory_refresh_context(
 
     let mut out = String::from("## Compact-triggered Memory Refresh Context\n\n");
     out.push_str("这是一次在 compact 成功后立即触发的后台记忆整理任务。");
-    out.push_str("目标是把刚压缩掉的高价值信息提炼进长期记忆，并减少它只停留在原始会话文件中的时间。\n\n");
-    let _ = writeln!(out, "- 当前压缩后会话文件：`{}`", descriptor.current_session_path);
+    out.push_str(
+        "目标是把刚压缩掉的高价值信息提炼进长期记忆，并减少它只停留在原始会话文件中的时间。\n\n",
+    );
+    let _ = writeln!(
+        out,
+        "- 当前压缩后会话文件：`{}`",
+        descriptor.current_session_path
+    );
     let _ = writeln!(
         out,
         "- 上一段原始会话文件：`{}`",
@@ -1191,7 +1225,11 @@ fn build_compaction_memory_refresh_context(
             .as_deref()
             .unwrap_or("(none)")
     );
-    let _ = writeln!(out, "- compact 后当前会话中保留的真实消息数：{}", kept_messages.len());
+    let _ = writeln!(
+        out,
+        "- compact 后当前会话中保留的真实消息数：{}",
+        kept_messages.len()
+    );
     out.push_str("- 这是内部运行时任务，不是同学的新请求。\n");
     out.push_str("- 你完成后，主 Agent 会收到一条内部提示消息，提醒它长期记忆可能已更新。\n\n");
     out.push_str("### 当前 compact 摘要\n\n<summary>\n");
@@ -1254,13 +1292,13 @@ fn build_internal_memory_refresh_runtime(
     emit: &EmitEventFn,
     depth: u32,
 ) -> ToolRuntime {
+    use crate::runtime::state::AgentStatus;
     use crate::tools::{
         AgentInfo, AskQuestionFn, BroadcastAgentsFn, GetAgentFn, GetTaskFn, ListAgentsFn,
-        MessageAgentFn, NotifyParentFn, RunSubAgentFn, SendMessageFn, ShowFileFn,
-        StartTerminalTaskFn, SubAgentHandle, SubAgentRequest, TransferInputFn, ToolRuntime,
-        MAX_SUBAGENT_DEPTH,
+        MAX_SUBAGENT_DEPTH, MessageAgentFn, NotifyParentFn, RunSubAgentFn, SendMessageFn,
+        ShowFileFn, StartTerminalTaskFn, SubAgentHandle, SubAgentRequest, ToolRuntime,
+        TransferInputFn,
     };
-    use crate::runtime::state::AgentStatus;
 
     let runner_for_subagent = runner.clone();
     let agents_md_for_subagent = agents_md.clone();
@@ -1381,9 +1419,8 @@ fn build_internal_memory_refresh_runtime(
     let broadcast_agents: BroadcastAgentsFn = Arc::new(move |_request| {
         Box::pin(async move { anyhow::bail!("memory refresh must not use BroadcastAgents") })
     });
-    let list_agents: ListAgentsFn = Arc::new(move |_request| {
-        Box::pin(async move { Ok(Vec::<AgentInfo>::new()) })
-    });
+    let list_agents: ListAgentsFn =
+        Arc::new(move |_request| Box::pin(async move { Ok(Vec::<AgentInfo>::new()) }));
     let get_agent: GetAgentFn = Arc::new(move |_agent_id| {
         Box::pin(async move { anyhow::bail!("memory refresh must not use GetAgent") })
     });
@@ -1409,6 +1446,13 @@ fn build_internal_memory_refresh_runtime(
         false,
         false,
         false,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        None,
+        None,
         send_message,
         ask_question,
         show_file,
@@ -1535,8 +1579,8 @@ mod tests {
     use super::*;
     use crate::agents_md::AgentsMd;
     use crate::openai::OpenAiClient;
-    use crate::skills::SkillRegistry;
     use crate::session::{SessionDescriptor, SessionSnapshot};
+    use crate::skills::SkillRegistry;
     use crate::tools::{ToolContext, ToolExecutor};
     use std::fs;
     use std::path::PathBuf;
@@ -1627,7 +1671,7 @@ mod tests {
         assert!(static_prompt.contains("memory/dreams/"));
 
         let runner = test_runner();
-        let prompt = runner.build_system_prompt(&test_agents_md(), None);
+        let prompt = runner.build_system_prompt(&ToolRuntime::detached(), &test_agents_md(), None);
         assert!(prompt.starts_with(static_prompt.trim_end()));
     }
 
@@ -1636,6 +1680,7 @@ mod tests {
     fn system_prompt_appends_runtime_sections_after_static_prompt() {
         let runner = test_runner();
         let prompt = runner.build_system_prompt(
+            &ToolRuntime::detached(),
             &test_agents_md(),
             Some("## 测试运行时上下文\n\n- dream 状态：idle"),
         );
@@ -1722,8 +1767,11 @@ mod tests {
             allow_input_transfer_target: false,
             existing_agent_id: None,
         };
-        let context =
-            build_internal_memory_refresh_subagent_context("## Base\n\n- compact 后上下文", &request, 2);
+        let context = build_internal_memory_refresh_subagent_context(
+            "## Base\n\n- compact 后上下文",
+            &request,
+            2,
+        );
 
         assert!(context.contains("Parent-provided Memory Refresh SubAgent Context"));
         assert!(context.contains("所有后代子代理都不得使用 `Ask`、`Send` 或 `Show`"));

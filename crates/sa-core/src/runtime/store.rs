@@ -9,8 +9,7 @@
 //! - `runtime/tasks/<task_id>.json`
 
 use crate::runtime::state::{
-    AgentState, MailboxEntry, PendingQuestionState, RuntimeTaskState, RuntimeWorkState,
-    TeamState,
+    AgentState, MailboxEntry, PendingQuestionState, RuntimeTaskState, RuntimeWorkState, TeamState,
 };
 use anyhow::Context as _;
 use std::collections::HashMap;
@@ -293,10 +292,12 @@ impl RuntimeStore {
             .unwrap_or(1);
         entry.offset = next_offset;
 
-        let mut line = serde_json::to_string(&entry).context("Failed to serialize mailbox entry")?;
+        let mut line =
+            serde_json::to_string(&entry).context("Failed to serialize mailbox entry")?;
         line.push('\n');
-        append_text_file(&mailbox_path, &line)
-            .with_context(|| format!("Failed to append mailbox entry: {}", mailbox_path.display()))?;
+        append_text_file(&mailbox_path, &line).with_context(|| {
+            format!("Failed to append mailbox entry: {}", mailbox_path.display())
+        })?;
         Ok(entry)
     }
 
@@ -310,7 +311,9 @@ impl RuntimeStore {
             .with_context(|| format!("Failed to read mailbox: {}", mailbox_path.display()))?;
         raw.lines()
             .filter(|line| !line.trim().is_empty())
-            .map(|line| serde_json::from_str::<MailboxEntry>(line).context("Invalid mailbox JSONL entry"))
+            .map(|line| {
+                serde_json::from_str::<MailboxEntry>(line).context("Invalid mailbox JSONL entry")
+            })
             .collect()
     }
 
@@ -351,7 +354,10 @@ fn write_json_pretty<T: serde::Serialize>(path: &Path, value: &T) -> anyhow::Res
         #[cfg(windows)]
         {
             fs::remove_file(path).with_context(|| {
-                format!("Failed to replace existing JSON state at {}", path.display())
+                format!(
+                    "Failed to replace existing JSON state at {}",
+                    path.display()
+                )
             })?;
         }
     }
@@ -376,8 +382,8 @@ fn read_json_optional<T: serde::de::DeserializeOwned>(path: &Path) -> anyhow::Re
     if !path.is_file() {
         return Ok(None);
     }
-    let raw =
-        fs::read_to_string(path).with_context(|| format!("Failed to read JSON: {}", path.display()))?;
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("Failed to read JSON: {}", path.display()))?;
     let parsed = serde_json::from_str::<T>(&raw)
         .with_context(|| format!("Failed to parse JSON: {}", path.display()))?;
     Ok(Some(parsed))
@@ -561,6 +567,8 @@ mod tests {
             current_session_path: "sessions/root.jsonl".to_string(),
             previous_session_path: None,
             tool_session_read_set: vec![],
+            active_command_invocations: vec![],
+            activated_conditional_commands: vec![],
             last_mailbox_offset: 0,
             active_work_id: None,
             active_work_summary: None,
@@ -595,7 +603,9 @@ mod tests {
         store
             .save_agent_state(&agent)
             .expect("agent state should persist");
-        store.save_task_state(&task).expect("task state should persist");
+        store
+            .save_task_state(&task)
+            .expect("task state should persist");
 
         assert_eq!(
             store

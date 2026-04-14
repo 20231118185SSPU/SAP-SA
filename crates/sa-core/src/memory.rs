@@ -535,12 +535,18 @@ mod tests {
         )
         .expect("write daily memory");
         fs::write(
-            workspace.join("memory").join("topics").join("preferences.md"),
+            workspace
+                .join("memory")
+                .join("topics")
+                .join("preferences.md"),
             "User prefers concise progress updates and clear boundaries.",
         )
         .expect("write topic memory");
         fs::write(
-            workspace.join("memory").join("dreams").join("2026-03-06.md"),
+            workspace
+                .join("memory")
+                .join("dreams")
+                .join("2026-03-06.md"),
             "Dream audit: remove stale sandbox note after policy change.",
         )
         .expect("write dream audit");
@@ -550,11 +556,16 @@ mod tests {
             .expect("memory search");
         assert!(!hits.is_empty());
         assert!(hits.iter().any(|hit| hit.path == "memory/2026-03-06.md"));
-        assert!(!hits.iter().any(|hit| hit.path == "memory/dreams/2026-03-06.md"));
+        assert!(
+            !hits
+                .iter()
+                .any(|hit| hit.path == "memory/dreams/2026-03-06.md")
+        );
 
-        let topic_hits = search_markdown_memory(&workspace, "concise progress updates", Some(5), None)
-            .await
-            .expect("topic memory search");
+        let topic_hits =
+            search_markdown_memory(&workspace, "concise progress updates", Some(5), None)
+                .await
+                .expect("topic memory search");
         assert!(
             topic_hits
                 .iter()
@@ -576,14 +587,18 @@ mod tests {
         let workspace = unique_workspace();
         fs::create_dir_all(workspace.join("memory").join("dreams")).expect("create dreams dir");
         fs::write(
-            workspace.join("memory").join("dreams").join("2026-04-13.md"),
+            workspace
+                .join("memory")
+                .join("dreams")
+                .join("2026-04-13.md"),
             "Dream audit line 1\nDream audit line 2",
         )
         .expect("write dream audit");
 
-        let result = read_markdown_memory(&workspace, "memory/dreams/2026-04-13.md", Some(1), Some(2))
-            .await
-            .expect("dream audit read should succeed");
+        let result =
+            read_markdown_memory(&workspace, "memory/dreams/2026-04-13.md", Some(1), Some(2))
+                .await
+                .expect("dream audit read should succeed");
         assert_eq!(result.path, "memory/dreams/2026-04-13.md");
         assert!(result.text.contains("Dream audit line 1"));
     }

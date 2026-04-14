@@ -7,6 +7,7 @@
 //! - restart recovery is driven from these persisted records
 
 use crate::openai::{ChatMessage, ToolCall};
+use crate::skills::ActiveCommandInvocation;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -197,7 +198,18 @@ pub struct AgentState {
     /// Previous compacted-away session file path for this agent.
     pub previous_session_path: Option<String>,
     /// Files currently eligible for `Edit` because they were freshly `Read`.
+    #[serde(default)]
     pub tool_session_read_set: Vec<String>,
+    /// Commands/skills currently active in this agent's long-lived context.
+    ///
+    /// These reminders survive restarts so command-scoped tool permissions and
+    /// prompt guidance do not silently disappear after compaction or recovery.
+    #[serde(default)]
+    pub active_command_invocations: Vec<ActiveCommandInvocation>,
+    /// Conditional commands that have already been activated by touched
+    /// workspace paths.
+    #[serde(default)]
+    pub activated_conditional_commands: Vec<String>,
     /// Last consumed mailbox offset.
     pub last_mailbox_offset: u64,
     /// Currently active work id, if any.
@@ -249,6 +261,8 @@ impl AgentState {
             current_session_path,
             previous_session_path: None,
             tool_session_read_set: Vec::new(),
+            active_command_invocations: Vec::new(),
+            activated_conditional_commands: Vec::new(),
             last_mailbox_offset: 0,
             active_work_id: None,
             active_work_summary: None,
@@ -294,6 +308,8 @@ impl AgentState {
             current_session_path,
             previous_session_path: None,
             tool_session_read_set: Vec::new(),
+            active_command_invocations: Vec::new(),
+            activated_conditional_commands: Vec::new(),
             last_mailbox_offset: 0,
             active_work_id: None,
             active_work_summary: None,
@@ -548,6 +564,9 @@ mod tests {
         assert_eq!(parsed.kind, RuntimeTaskKind::Terminal);
         assert_eq!(parsed.status, RuntimeTaskStatus::Exited);
         assert_eq!(parsed.exit_code, Some(0));
-        assert_eq!(parsed.metadata.get("key").map(String::as_str), Some("value"));
+        assert_eq!(
+            parsed.metadata.get("key").map(String::as_str),
+            Some("value")
+        );
     }
 }

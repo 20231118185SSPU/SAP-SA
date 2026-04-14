@@ -101,6 +101,111 @@ pub struct McpToolsListResult {
     pub tools: Vec<McpToolDef>,
 }
 
+/// One MCP resource definition returned by `resources/list`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpResourceDef {
+    /// Stable resource URI.
+    pub uri: String,
+    /// Human-readable name.
+    pub name: String,
+    /// Optional description.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Optional MIME type.
+    #[serde(rename = "mimeType", default, skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+}
+
+/// `resources/list` result payload.
+#[derive(Debug, Clone, Deserialize)]
+pub struct McpResourcesListResult {
+    /// Advertised resources.
+    #[serde(default)]
+    pub resources: Vec<McpResourceDef>,
+}
+
+/// One MCP prompt argument.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpPromptArgument {
+    /// Argument name.
+    pub name: String,
+    /// Optional description.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Whether this argument is required.
+    #[serde(default)]
+    pub required: bool,
+}
+
+/// One MCP prompt definition returned by `prompts/list`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpPromptDef {
+    /// Stable prompt name.
+    pub name: String,
+    /// Optional description.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Optional title.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Optional argument list.
+    #[serde(default)]
+    pub arguments: Vec<McpPromptArgument>,
+}
+
+/// `prompts/list` result payload.
+#[derive(Debug, Clone, Deserialize)]
+pub struct McpPromptsListResult {
+    /// Advertised prompts.
+    #[serde(default)]
+    pub prompts: Vec<McpPromptDef>,
+}
+
+/// One MCP prompt message returned by `prompts/get`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpPromptMessage {
+    /// Message role, if provided by the server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    /// Prompt content payload.
+    pub content: serde_json::Value,
+}
+
+/// `prompts/get` result payload.
+#[derive(Debug, Clone, Deserialize)]
+pub struct McpPromptGetResult {
+    /// Optional description.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Prompt messages.
+    #[serde(default)]
+    pub messages: Vec<McpPromptMessage>,
+}
+
+/// One resource content item returned by `resources/read`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpResourceContent {
+    /// Resource URI.
+    pub uri: String,
+    /// Optional MIME type.
+    #[serde(rename = "mimeType", default, skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    /// Optional text payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// Optional base64-encoded blob payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blob: Option<String>,
+}
+
+/// `resources/read` result payload.
+#[derive(Debug, Clone, Deserialize)]
+pub struct McpResourceReadResult {
+    /// Resource content items.
+    #[serde(default)]
+    pub contents: Vec<McpResourceContent>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -216,23 +216,41 @@ impl InteractionStore {
             .lock()
             .expect("interaction append lock poisoned");
         if let Some(parent) = self.log_path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create interaction dir: {}", parent.display()))?;
+            fs::create_dir_all(parent).with_context(|| {
+                format!("Failed to create interaction dir: {}", parent.display())
+            })?;
         }
         let mut file = fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.log_path)
-            .with_context(|| format!("Failed to open interaction log: {}", self.log_path.display()))?;
+            .with_context(|| {
+                format!(
+                    "Failed to open interaction log: {}",
+                    self.log_path.display()
+                )
+            })?;
         let mut line =
             serde_json::to_string(entry).context("Failed to serialize interaction entry")?;
         line.push('\n');
-        file.write_all(line.as_bytes())
-            .with_context(|| format!("Failed to append interaction entry: {}", self.log_path.display()))?;
-        file.flush()
-            .with_context(|| format!("Failed to flush interaction log: {}", self.log_path.display()))?;
-        file.sync_all()
-            .with_context(|| format!("Failed to sync interaction log: {}", self.log_path.display()))
+        file.write_all(line.as_bytes()).with_context(|| {
+            format!(
+                "Failed to append interaction entry: {}",
+                self.log_path.display()
+            )
+        })?;
+        file.flush().with_context(|| {
+            format!(
+                "Failed to flush interaction log: {}",
+                self.log_path.display()
+            )
+        })?;
+        file.sync_all().with_context(|| {
+            format!(
+                "Failed to sync interaction log: {}",
+                self.log_path.display()
+            )
+        })
     }
 
     /// Build and append one new interaction entry.
@@ -258,8 +276,12 @@ impl InteractionStore {
         if !self.log_path.is_file() {
             return Ok(None);
         }
-        let raw = fs::read_to_string(&self.log_path)
-            .with_context(|| format!("Failed to read interaction log: {}", self.log_path.display()))?;
+        let raw = fs::read_to_string(&self.log_path).with_context(|| {
+            format!(
+                "Failed to read interaction log: {}",
+                self.log_path.display()
+            )
+        })?;
         for line in raw.lines().filter(|line| !line.trim().is_empty()) {
             let entry = serde_json::from_str::<InteractionEntry>(line)
                 .context("Invalid interaction history JSONL entry")?;
@@ -402,7 +424,11 @@ fn serialize_full(entry: &InteractionEntry) -> anyhow::Result<Value> {
 
 /// Serialize one entry in slice mode.
 fn serialize_slice(entry: &InteractionEntry, offset: usize, limit: usize) -> anyhow::Result<Value> {
-    let limit = if limit == 0 { DEFAULT_SLICE_CHARS } else { limit };
+    let limit = if limit == 0 {
+        DEFAULT_SLICE_CHARS
+    } else {
+        limit
+    };
     match &entry.payload {
         InteractionPayload::UserMessage {
             submit_id,
@@ -574,11 +600,13 @@ mod tests {
         let value: Value = serde_json::from_str(&raw).expect("summary should be valid JSON");
         assert_eq!(value["kind"], "show");
         assert_eq!(value["prompt"], "用于展示调试视频");
-        assert!(value["content_preview"]
-            .as_str()
-            .expect("preview should be string")
-            .len()
-            < value["content_chars"].as_u64().expect("chars should exist") as usize);
+        assert!(
+            value["content_preview"]
+                .as_str()
+                .expect("preview should be string")
+                .len()
+                < value["content_chars"].as_u64().expect("chars should exist") as usize
+        );
     }
 
     #[test]

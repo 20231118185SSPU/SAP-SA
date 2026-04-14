@@ -20,15 +20,20 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use clap::Parser;
 use futures_util::{SinkExt as _, StreamExt as _};
-use sa_core::agent::{AgentQuantumOutcome, AgentRunner, AgentRunnerConfig, DrainQueuedUserMessagesFn, EmitEventFn};
+use sa_core::agent::{
+    AgentQuantumOutcome, AgentRunner, AgentRunnerConfig, DrainQueuedUserMessagesFn, EmitEventFn,
+};
 use sa_core::agents_md::{extract_markdown_file_references, load_agents_md};
 use sa_core::cancel::{CancelHandle, cancel_pair};
-use sa_core::config::{Config, TeamConfig, load_config_from_file};
+use sa_core::config::{Config, PermissionsConfig, TeamConfig, load_config_from_file};
 use sa_core::dream::DreamManager;
-use sa_core::interaction_history::{InteractionPayload, InteractionStore, show_payload_from_visible_file};
+use sa_core::interaction_history::{
+    InteractionPayload, InteractionStore, show_payload_from_visible_file,
+};
 use sa_core::mcp_client::McpRegistry;
 use sa_core::memory::{build_prompt_block as build_memory_prompt_block, is_memory_reference};
 use sa_core::openai::{AuthStyle, ChatMessage, OpenAiClient, WireApi};
+use sa_core::runtime::state::AgentStatus;
 use sa_core::runtime::state::{
     AgentKind, AgentState, MailboxEntry, MailboxEntryKind, PendingAssistantMessage,
     PendingControlAction, PendingFinishConfirmation, PendingFinishMode, PendingQuestionState,
@@ -39,15 +44,13 @@ use sa_core::runtime::store::{RootMarker, RuntimeStore};
 use sa_core::session::SessionStore;
 use sa_core::skills::SkillRegistry;
 use sa_core::tools::{
-    AgentInfo, AgentMessageReceipt, AgentMessageRequest, AgentScope, AskQuestionFn,
-    AskRequest, BroadcastAgentsFn, BroadcastAgentsRequest, BroadcastReceipt, GetAgentFn,
-    GetTaskFn, ListAgentsFn, ListAgentsRequest, MAX_SUBAGENT_DEPTH, MessageAgentFn,
-    NotifyParentFn, RunSubAgentFn, SendMessageFn, ShowFileFn, StartTerminalTaskFn,
-    SubAgentHandle, SubAgentRequest, StartTerminalTaskRequest, TerminalTaskHandle,
-    TerminalTaskInfo, ToolContext, ToolExecutor, ToolRuntime, TransferInputFn,
-    TransferInputReceipt, TransferInputRequest,
+    AgentInfo, AgentMessageReceipt, AgentMessageRequest, AgentScope, AskQuestionFn, AskRequest,
+    BroadcastAgentsFn, BroadcastAgentsRequest, BroadcastReceipt, GetAgentFn, GetTaskFn,
+    ListAgentsFn, ListAgentsRequest, MAX_SUBAGENT_DEPTH, MessageAgentFn, NotifyParentFn,
+    RunSubAgentFn, SendMessageFn, ShowFileFn, StartTerminalTaskFn, StartTerminalTaskRequest,
+    SubAgentHandle, SubAgentRequest, TerminalTaskHandle, TerminalTaskInfo, ToolContext,
+    ToolExecutor, ToolRuntime, TransferInputFn, TransferInputReceipt, TransferInputRequest,
 };
-use sa_core::runtime::state::AgentStatus;
 use sa_core::ws_identity::{
     LocalIdentity, WS_HANDSHAKE_TIMEOUT_SECS, build_hello_reject, build_server_hello,
     load_local_identity, verify_client_hello,
@@ -57,7 +60,7 @@ use sa_core::ws_protocol::{
     InitRequired, InitializeConfigRequest, QuestionMode, ServerMessage, UserQuestion,
     UserQuestionAnswer, UserVisibleFile, UserVisibleFileEncoding,
 };
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -316,6 +319,8 @@ struct Hub {
     team_state: AsyncMutex<TeamState>,
     /// Team-level runtime tuning flags loaded from config.
     team_cfg: TeamConfig,
+    /// Non-interactive permission policy loaded from config.
+    permissions: PermissionsConfig,
 }
 
 impl Hub {
@@ -329,6 +334,7 @@ impl Hub {
         runtime_store: RuntimeStore,
         team_state: TeamState,
         team_cfg: TeamConfig,
+        permissions: PermissionsConfig,
     ) -> Arc<Self> {
         // Task queue capacity (small but adequate for minimal agent).
         let (task_tx, task_rx) = mpsc::channel::<TaskRequest>(128);
@@ -368,6 +374,7 @@ impl Hub {
             runtime_store,
             team_state: AsyncMutex::new(team_state),
             team_cfg,
+            permissions,
         });
 
         // Spawn the durable supervisor loop.
@@ -444,16 +451,14 @@ impl Hub {
         if let Some(input_owner_agent_id) = team_state.input_owner_agent_id
             && input_owner_agent_id != team_state.root_agent_id
         {
-            let root_state = self.runtime_store.load_agent_state(team_state.root_agent_id)?;
+            let root_state = self
+                .runtime_store
+                .load_agent_state(team_state.root_agent_id)?;
             let input_state = self.runtime_store.load_agent_state(input_owner_agent_id)?;
-            let child_holds_task = input_state
-                .as_ref()
-                .and_then(|state| state.active_work_id)
-                == Some(task_id);
-            let root_holds_task = root_state
-                .as_ref()
-                .and_then(|state| state.active_work_id)
-                == Some(task_id);
+            let child_holds_task =
+                input_state.as_ref().and_then(|state| state.active_work_id) == Some(task_id);
+            let root_holds_task =
+                root_state.as_ref().and_then(|state| state.active_work_id) == Some(task_id);
             if root_holds_task {
                 target_agent_ids.insert(team_state.root_agent_id);
             }
@@ -512,9 +517,7 @@ impl Hub {
                     });
                 }
                 for question_id in resolved_question_ids {
-                    self.broadcast_server_message(ServerMessage::QuestionResolved {
-                        question_id,
-                    });
+                    self.broadcast_server_message(ServerMessage::QuestionResolved { question_id });
                 }
             }
 
@@ -607,7 +610,13 @@ impl Hub {
         self: &Arc<Self>,
         agent_id: Uuid,
     ) -> anyhow::Result<Arc<SessionStore>> {
-        if let Some(existing) = self.agent_session_stores.lock().await.get(&agent_id).cloned() {
+        if let Some(existing) = self
+            .agent_session_stores
+            .lock()
+            .await
+            .get(&agent_id)
+            .cloned()
+        {
             return Ok(existing);
         }
 
@@ -620,7 +629,10 @@ impl Hub {
         )?);
 
         let mut guard = self.agent_session_stores.lock().await;
-        Ok(guard.entry(agent_id).or_insert_with(|| Arc::clone(&store)).clone())
+        Ok(guard
+            .entry(agent_id)
+            .or_insert_with(|| Arc::clone(&store))
+            .clone())
     }
 
     /// Synchronize the persisted session-path metadata recorded inside one
@@ -710,9 +722,7 @@ impl Hub {
         self.publish(
             EventKind::Log,
             task_id,
-            format!(
-                "Input ownership moved to agent {input_owner_agent_id} ({reason})."
-            ),
+            format!("Input ownership moved to agent {input_owner_agent_id} ({reason})."),
         );
         Ok(())
     }
@@ -867,7 +877,9 @@ impl Hub {
             if parent_id == ancestor_id {
                 return true;
             }
-            cursor = states.get(&parent_id).and_then(|state| state.parent_agent_id);
+            cursor = states
+                .get(&parent_id)
+                .and_then(|state| state.parent_agent_id);
         }
         false
     }
@@ -921,7 +933,10 @@ impl Hub {
 
     /// Return a human-readable notice when a wait dependency is already
     /// satisfied.
-    fn wait_satisfied_notice(&self, waiting_on: &WaitingDependency) -> anyhow::Result<Option<String>> {
+    fn wait_satisfied_notice(
+        &self,
+        waiting_on: &WaitingDependency,
+    ) -> anyhow::Result<Option<String>> {
         let now = chrono::Utc::now();
         if let Some(timeout_at) = waiting_on.timeout_at
             && timeout_at <= now
@@ -1257,6 +1272,36 @@ impl Hub {
             blocks.push(self.memory_prompt_block(task_id).await);
         }
         blocks.push(self.preload_agents_md_references(agents_md).await);
+        if !state.active_command_invocations.is_empty() {
+            let mut block = String::from("## 已激活命令上下文\n\n");
+            block.push_str(
+                "以下命令已经在当前代理上下文中激活。相关要求、作用域工具限制、模型覆盖会继续生效，直到后续工作自然脱离这些上下文。\n\n",
+            );
+            for command in &state.active_command_invocations {
+                block.push_str(&format!(
+                    "- `{}`：{}\n",
+                    command.name,
+                    command.description.trim()
+                ));
+                if let Some(when_to_use) = command.when_to_use.as_deref() {
+                    block.push_str(&format!("  适用时机：{}\n", when_to_use.trim()));
+                }
+                if !command.allowed_tools.is_empty() {
+                    block.push_str(&format!(
+                        "  当前允许工具：{}\n",
+                        command.allowed_tools.join(", ")
+                    ));
+                }
+                if let Some(model) = command.model_override.as_deref() {
+                    block.push_str(&format!("  当前模型覆盖：`{model}`\n"));
+                }
+                if let Some(effort) = command.effort_override.as_deref() {
+                    block.push_str(&format!("  当前思维深度覆盖：`{effort}`\n"));
+                }
+            }
+            block.push_str("\n如果这些命令带有明确步骤、限制或输出要求，你必须继续遵守。");
+            blocks.push(block);
+        }
 
         if let Some(reminder) = Self::temporary_runtime_reminder_block(state) {
             blocks.push(reminder);
@@ -1324,8 +1369,13 @@ impl Hub {
                     options: serde_json::from_str(&options_json)?,
                     allow_free_text,
                 };
-                self.persist_pending_question(state, state.active_work_id.unwrap_or(state.agent_id), tool_call_id, request)
-                    .await?;
+                self.persist_pending_question(
+                    state,
+                    state.active_work_id.unwrap_or(state.agent_id),
+                    tool_call_id,
+                    request,
+                )
+                .await?;
                 let mut refreshed = self.load_agent_state_required(state.agent_id)?;
                 refreshed.pending_control = None;
                 self.runtime_store.save_agent_state(&refreshed)?;
@@ -1348,8 +1398,9 @@ impl Hub {
                         WaitKind::Work => WaitUntil::Finished,
                         WaitKind::Task => WaitUntil::Exited,
                     }),
-                    timeout_at: timeout_seconds
-                        .map(|seconds| chrono::Utc::now() + chrono::Duration::seconds(seconds as i64)),
+                    timeout_at: timeout_seconds.map(|seconds| {
+                        chrono::Utc::now() + chrono::Duration::seconds(seconds as i64)
+                    }),
                 };
 
                 if let Some(notice) = self.wait_satisfied_notice(&waiting_on)? {
@@ -1704,12 +1755,13 @@ impl Hub {
                 )?;
             }
 
-            if let Some(question_state) = self.runtime_store.load_pending_question(state.agent_id)? {
+            if let Some(question_state) =
+                self.runtime_store.load_pending_question(state.agent_id)?
+            {
                 let mode = serde_json::from_str::<QuestionMode>(&question_state.mode)?;
-                let options =
-                    serde_json::from_str::<Vec<sa_core::ws_protocol::QuestionOption>>(
-                        &question_state.options_json,
-                    )?;
+                let options = serde_json::from_str::<Vec<sa_core::ws_protocol::QuestionOption>>(
+                    &question_state.options_json,
+                )?;
                 state.status = AgentStatus::WaitingUser;
                 self.runtime_store.save_agent_state(&state)?;
                 restored_questions.push(PendingQuestionEntry {
@@ -1814,7 +1866,10 @@ impl Hub {
         self.sync_agent_session_paths(&mut state, &session_store)?;
         self.runtime_store.save_agent_state(&state)?;
 
-        if let Some(rerun) = self.apply_pending_control(&mut state, &session_store).await? {
+        if let Some(rerun) = self
+            .apply_pending_control(&mut state, &session_store)
+            .await?
+        {
             return Ok(rerun);
         }
 
@@ -1840,7 +1895,11 @@ impl Hub {
         }
 
         if matches!(state.status, AgentStatus::WaitingUser) {
-            if self.runtime_store.load_pending_question(agent_id)?.is_some() {
+            if self
+                .runtime_store
+                .load_pending_question(agent_id)?
+                .is_some()
+            {
                 return Ok(false);
             }
             state.status = AgentStatus::Idle;
@@ -1873,7 +1932,13 @@ impl Hub {
             state.parent_work_id = None;
             state.pending_finish_confirmation = None;
             state.needs_finish_reminder = false;
-            self.persist_started_work(state.agent_id, state.root_agent_id, work_id, summary, started_at)?;
+            self.persist_started_work(
+                state.agent_id,
+                state.root_agent_id,
+                work_id,
+                summary,
+                started_at,
+            )?;
         }
 
         let work_id = state
@@ -1905,7 +1970,9 @@ impl Hub {
                 }
             }
         };
-        let extra_prompt = self.build_agent_extra_prompt(&state, work_id, &agents_md).await;
+        let extra_prompt = self
+            .build_agent_extra_prompt(&state, work_id, &agents_md)
+            .await;
 
         let hub_for_emit = Arc::clone(self);
         let emit: EmitEventFn = Arc::new(move |kind, task_id, message| {
@@ -1914,8 +1981,11 @@ impl Hub {
         let holds_input_ownership =
             self.team_state.lock().await.input_owner_agent_id == Some(agent_id);
         let runtime = self.build_agent_tool_runtime(&state, work_id, holds_input_ownership);
-        let tool_session =
-            sa_core::tools::ToolSession::from_readable_paths(state.tool_session_read_set.iter().map(PathBuf::from));
+        let tool_session = sa_core::tools::ToolSession::from_state(
+            state.tool_session_read_set.iter().map(PathBuf::from),
+            state.active_command_invocations.clone(),
+            state.activated_conditional_commands.clone(),
+        );
         let (cancel_handle, cancel_token) = cancel_pair();
         {
             let mut running_agents = self.running_agents.lock().await;
@@ -1958,6 +2028,22 @@ impl Hub {
                     .into_iter()
                     .map(|path| path.display().to_string())
                     .collect();
+                state.active_command_invocations =
+                    quantum.tool_session.active_command_invocations();
+
+                let mut activated_conditional = quantum
+                    .tool_session
+                    .activated_conditional_commands()
+                    .into_iter()
+                    .collect::<BTreeSet<_>>();
+                let newly_activated = self.preload_ctx.skills.conditional_matches_for_paths(
+                    &self.preload_ctx.workspace_root,
+                    &quantum.tool_session.touched_paths(),
+                    &activated_conditional,
+                );
+                activated_conditional.extend(newly_activated);
+                state.activated_conditional_commands =
+                    activated_conditional.into_iter().collect::<Vec<_>>();
 
                 match quantum.outcome {
                     AgentQuantumOutcome::Ask {
@@ -2020,7 +2106,9 @@ impl Hub {
                         let rerun = self
                             .apply_pending_control(&mut state, &session_store)
                             .await?
-                            .ok_or_else(|| anyhow::anyhow!("Pending Finish control was not applied"))?;
+                            .ok_or_else(|| {
+                                anyhow::anyhow!("Pending Finish control was not applied")
+                            })?;
                         Ok(rerun && !had_pending_finish_confirmation)
                     }
                 }
@@ -2046,11 +2134,7 @@ impl Hub {
 
                 state.status = AgentStatus::Failed;
                 self.runtime_store.save_agent_state(&state)?;
-                self.publish(
-                    EventKind::Error,
-                    work_id,
-                    format!("Task crashed: {err:#}"),
-                );
+                self.publish(EventKind::Error, work_id, format!("Task crashed: {err:#}"));
                 Ok(false)
             }
         }
@@ -2140,7 +2224,10 @@ impl Hub {
                 .wake_waiters_for_dependency(
                     WaitKind::Task,
                     task_id,
-                    format!("Runtime task {task_id} completed with status {:?}.", state.status),
+                    format!(
+                        "Runtime task {task_id} completed with status {:?}.",
+                        state.status
+                    ),
                 )
                 .await
             {
@@ -2198,6 +2285,25 @@ impl Hub {
         let allow_user_show = state.allow_user_show;
         let allow_user_ask = state.allow_user_ask;
         let allow_input_transfer_target = state.allow_input_transfer_target;
+        let denied_tools = self.permissions.deny_tools.clone();
+        let denied_commands = self.permissions.deny_commands.clone();
+        let allowed_tool_patterns = state
+            .active_command_invocations
+            .iter()
+            .flat_map(|invocation| invocation.allowed_tools.iter().cloned())
+            .collect::<Vec<_>>();
+        let active_command_invocations = state.active_command_invocations.clone();
+        let activated_conditional_commands = state.activated_conditional_commands.clone();
+        let model_override = state
+            .active_command_invocations
+            .iter()
+            .rev()
+            .find_map(|invocation| invocation.model_override.clone());
+        let effort_override = state
+            .active_command_invocations
+            .iter()
+            .rev()
+            .find_map(|invocation| invocation.effort_override.clone());
         let runtime_label = state.label.clone();
         let show_agent_label = state.label.clone();
         let notify_parent_label = state.label.clone();
@@ -2230,7 +2336,9 @@ impl Hub {
 
         let ask_question: AskQuestionFn = Arc::new(move |_request: AskRequest, _cancel| {
             Box::pin(async move {
-                anyhow::bail!("Ask is handled as a durable control tool and must not call the runtime callback directly")
+                anyhow::bail!(
+                    "Ask is handled as a durable control tool and must not call the runtime callback directly"
+                )
             })
         });
 
@@ -2260,7 +2368,10 @@ impl Hub {
         let hub_for_subagent = Arc::clone(self);
         let run_subagent: RunSubAgentFn = Arc::new(move |request: SubAgentRequest, cancel| {
             let hub = Arc::clone(&hub_for_subagent);
-            Box::pin(async move { hub.run_durable_subagent(agent_id, work_id, request, cancel).await })
+            Box::pin(async move {
+                hub.run_durable_subagent(agent_id, work_id, request, cancel)
+                    .await
+            })
         });
 
         let hub_for_notify_parent = Arc::clone(self);
@@ -2384,43 +2495,42 @@ impl Hub {
         });
 
         let hub_for_transfer_input = Arc::clone(self);
-        let transfer_input: TransferInputFn =
-            Arc::new(move |request: TransferInputRequest| {
-                let hub = Arc::clone(&hub_for_transfer_input);
-                Box::pin(async move {
-                    let requester = hub.load_agent_state_required(agent_id)?;
-                    if requester.parent_agent_id.is_some() {
-                        anyhow::bail!("TransferInput is only available to the root agent");
-                    }
-                    let target_agent_id = match request.target_agent_id {
-                        Some(target_agent_id) => {
-                            let target = hub.load_agent_state_required(target_agent_id)?;
-                            if target.root_agent_id != requester.root_agent_id {
-                                anyhow::bail!("TransferInput target is outside the current root tree");
-                            }
-                            if !hub.agent_can_hold_input(&target) {
-                                anyhow::bail!(
-                                    "Target agent is not currently eligible to hold input: {}",
-                                    target.agent_id
-                                );
-                            }
-                            if !target.allow_input_transfer_target {
-                                anyhow::bail!(
-                                    "Target agent is not allowed to hold free-form input: {}",
-                                    target.agent_id
-                                );
-                            }
-                            target.agent_id
+        let transfer_input: TransferInputFn = Arc::new(move |request: TransferInputRequest| {
+            let hub = Arc::clone(&hub_for_transfer_input);
+            Box::pin(async move {
+                let requester = hub.load_agent_state_required(agent_id)?;
+                if requester.parent_agent_id.is_some() {
+                    anyhow::bail!("TransferInput is only available to the root agent");
+                }
+                let target_agent_id = match request.target_agent_id {
+                    Some(target_agent_id) => {
+                        let target = hub.load_agent_state_required(target_agent_id)?;
+                        if target.root_agent_id != requester.root_agent_id {
+                            anyhow::bail!("TransferInput target is outside the current root tree");
                         }
-                        None => requester.agent_id,
-                    };
-                    hub.set_input_owner(target_agent_id, Some(work_id), "TransferInput tool")
-                        .await?;
-                    Ok(TransferInputReceipt {
-                        input_owner_agent_id: target_agent_id,
-                    })
+                        if !hub.agent_can_hold_input(&target) {
+                            anyhow::bail!(
+                                "Target agent is not currently eligible to hold input: {}",
+                                target.agent_id
+                            );
+                        }
+                        if !target.allow_input_transfer_target {
+                            anyhow::bail!(
+                                "Target agent is not allowed to hold free-form input: {}",
+                                target.agent_id
+                            );
+                        }
+                        target.agent_id
+                    }
+                    None => requester.agent_id,
+                };
+                hub.set_input_owner(target_agent_id, Some(work_id), "TransferInput tool")
+                    .await?;
+                Ok(TransferInputReceipt {
+                    input_owner_agent_id: target_agent_id,
                 })
-            });
+            })
+        });
 
         let hub_for_terminal_task = Arc::clone(self);
         let start_terminal_task: StartTerminalTaskFn = Arc::new(move |request, _cancel| {
@@ -2446,6 +2556,13 @@ impl Hub {
             allow_user_show,
             allow_user_ask,
             allow_input_transfer_target,
+            denied_tools,
+            denied_commands,
+            allowed_tool_patterns,
+            active_command_invocations,
+            activated_conditional_commands,
+            model_override,
+            effort_override,
             send_message,
             ask_question,
             show_file,
@@ -2498,7 +2615,9 @@ impl Hub {
                     anyhow::bail!("SubAgent target belongs to a different root tree");
                 }
                 if existing.parent_agent_id != Some(parent_agent_id) {
-                    anyhow::bail!("SubAgent may only reuse a direct child agent owned by the caller");
+                    anyhow::bail!(
+                        "SubAgent may only reuse a direct child agent owned by the caller"
+                    );
                 }
                 if !matches!(existing.kind, AgentKind::Worker) {
                     anyhow::bail!("SubAgent may only reuse normal worker agents");
@@ -2509,7 +2628,10 @@ impl Hub {
                 if existing.active_work_id.is_some()
                     || existing.waiting_on.is_some()
                     || existing.pending_finish_confirmation.is_some()
-                    || self.runtime_store.load_pending_question(existing.agent_id)?.is_some()
+                    || self
+                        .runtime_store
+                        .load_pending_question(existing.agent_id)?
+                        .is_some()
                 {
                     anyhow::bail!("SubAgent may not reuse a busy or suspended agent");
                 }
@@ -2518,7 +2640,9 @@ impl Hub {
                     || existing.allow_user_ask != request.allow_user_ask
                     || existing.allow_input_transfer_target != request.allow_input_transfer_target
                 {
-                    anyhow::bail!("SubAgent may not reuse an agent with different capability settings");
+                    anyhow::bail!(
+                        "SubAgent may not reuse an agent with different capability settings"
+                    );
                 }
                 if let Some(label) = request.label.as_deref()
                     && existing.label != label
@@ -2944,9 +3068,8 @@ impl Hub {
         let broadcast_agents: BroadcastAgentsFn = Arc::new(move |_request| {
             Box::pin(async move { anyhow::bail!("BroadcastAgents is not wired in the legacy hub") })
         });
-        let list_agents: ListAgentsFn = Arc::new(move |_request| {
-            Box::pin(async move { Ok(Vec::<AgentInfo>::new()) })
-        });
+        let list_agents: ListAgentsFn =
+            Arc::new(move |_request| Box::pin(async move { Ok(Vec::<AgentInfo>::new()) }));
         let get_agent: GetAgentFn = Arc::new(move |_agent_id| {
             Box::pin(async move { anyhow::bail!("GetAgent is not wired in the legacy hub") })
         });
@@ -2980,6 +3103,13 @@ impl Hub {
             true,
             true,
             false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            None,
             send_message,
             ask_question,
             show_file,
@@ -3010,7 +3140,9 @@ impl Hub {
         label: &'static str,
     ) -> ToolRuntime {
         let notify_parent: NotifyParentFn = Arc::new(move |_message: String| {
-            Box::pin(async move { anyhow::bail!("background {label} task must not use NotifyParent") })
+            Box::pin(
+                async move { anyhow::bail!("background {label} task must not use NotifyParent") },
+            )
         });
         let hub_for_send = Arc::clone(self);
         let send_message: SendMessageFn = Arc::new(move |message: String| {
@@ -3026,9 +3158,7 @@ impl Hub {
         });
 
         let ask_question: AskQuestionFn = Arc::new(move |_request: AskRequest, _cancel| {
-            Box::pin(async move {
-                anyhow::bail!("background {label} task must not use Ask")
-            })
+            Box::pin(async move { anyhow::bail!("background {label} task must not use Ask") })
         });
 
         let hub_for_show = Arc::clone(self);
@@ -3045,28 +3175,27 @@ impl Hub {
         });
 
         let run_subagent: RunSubAgentFn = Arc::new(move |_request: SubAgentRequest, _cancel| {
-            Box::pin(async move {
-                anyhow::bail!("background {label} task must not use SubAgent")
-            })
+            Box::pin(async move { anyhow::bail!("background {label} task must not use SubAgent") })
         });
         let message_agent: MessageAgentFn = Arc::new(move |_request| {
-            Box::pin(async move { anyhow::bail!("background {label} task must not use MessageAgent") })
+            Box::pin(
+                async move { anyhow::bail!("background {label} task must not use MessageAgent") },
+            )
         });
         let broadcast_agents: BroadcastAgentsFn = Arc::new(move |_request| {
             Box::pin(async move {
                 anyhow::bail!("background {label} task must not use BroadcastAgents")
             })
         });
-        let list_agents: ListAgentsFn = Arc::new(move |_request| {
-            Box::pin(async move { Ok(Vec::<AgentInfo>::new()) })
-        });
+        let list_agents: ListAgentsFn =
+            Arc::new(move |_request| Box::pin(async move { Ok(Vec::<AgentInfo>::new()) }));
         let get_agent: GetAgentFn = Arc::new(move |_agent_id| {
             Box::pin(async move { anyhow::bail!("background {label} task must not use GetAgent") })
         });
         let transfer_input: TransferInputFn = Arc::new(move |_request| {
-            Box::pin(async move {
-                anyhow::bail!("background {label} task must not use TransferInput")
-            })
+            Box::pin(
+                async move { anyhow::bail!("background {label} task must not use TransferInput") },
+            )
         });
         let hub_for_terminal_task = Arc::clone(self);
         let start_terminal_task: StartTerminalTaskFn = Arc::new(move |request, _cancel| {
@@ -3091,6 +3220,13 @@ impl Hub {
             false,
             false,
             false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            None,
             send_message,
             ask_question,
             show_file,
@@ -3684,8 +3820,11 @@ async fn build_runtime_from_config(
 
     // Discover skills.
     let skill_dirs = cfg.skills.dirs_as_paths();
-    let skills = Arc::new(SkillRegistry::scan(&skill_dirs)?);
-    tracing::info!("Discovered {} skill(s).", skills.list().len());
+    let mut skills_registry = SkillRegistry::scan(&skill_dirs)?;
+    tracing::info!(
+        "Discovered {} local skill(s).",
+        skills_registry.list().len()
+    );
 
     // Connect external MCP servers before freezing the tool registry.
     let mcp_registry = if cfg.mcp.enabled && !cfg.mcp.servers.is_empty() {
@@ -3695,9 +3834,11 @@ async fn build_runtime_from_config(
         );
         match McpRegistry::connect_all(&cfg.mcp.servers).await {
             Ok(registry) if !registry.is_empty() => {
+                skills_registry.extend_mcp_prompts(registry.prompt_commands());
                 tracing::info!(
-                    "MCP: {} tool(s) registered from {} server(s)",
+                    "MCP: {} tool(s) and {} prompt command(s) registered from {} server(s)",
                     registry.tool_count(),
+                    registry.prompt_commands().len(),
                     registry.server_count()
                 );
                 Some(Arc::new(registry))
@@ -3714,6 +3855,7 @@ async fn build_runtime_from_config(
     } else {
         None
     };
+    let skills = Arc::new(skills_registry);
 
     let dream_manager = DreamManager::new(workspace_root.clone(), cfg.dream.clone())?;
     let runtime_store = RuntimeStore::new(workspace_root.clone())?;
@@ -3786,6 +3928,7 @@ async fn build_runtime_from_config(
         runtime_store,
         team_state,
         cfg.team.clone(),
+        cfg.permissions.clone(),
     );
     hub.recover_runtime().await?;
 
@@ -3977,10 +4120,7 @@ fn render_initial_config_toml(
     let team = sa_core::config::TeamConfig::default();
     out.push_str("\n[team]\n");
     out.push_str(&format!("auto_resume = {}\n", team.auto_resume));
-    out.push_str(&format!(
-        "max_active_agents = {}\n",
-        team.max_active_agents
-    ));
+    out.push_str(&format!("max_active_agents = {}\n", team.max_active_agents));
     out.push_str(&format!(
         "max_concurrent_model_calls = {}\n",
         team.max_concurrent_model_calls
@@ -4110,9 +4250,14 @@ async fn run_background_bash_command(
 
         match tokio::time::timeout(timeout, cmd.output()).await {
             Ok(Ok(output)) => {
-                let mut file = tokio::fs::File::create(output_path).await.with_context(|| {
-                    format!("Failed to create background task log: {}", output_path.display())
-                })?;
+                let mut file = tokio::fs::File::create(output_path)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "Failed to create background task log: {}",
+                            output_path.display()
+                        )
+                    })?;
                 file.write_all(&output.stdout).await.with_context(|| {
                     format!("Failed to write stdout log: {}", output_path.display())
                 })?;
@@ -4125,7 +4270,10 @@ async fn run_background_bash_command(
                     format!("Failed to write stderr log: {}", output_path.display())
                 })?;
                 file.flush().await.with_context(|| {
-                    format!("Failed to flush background task log: {}", output_path.display())
+                    format!(
+                        "Failed to flush background task log: {}",
+                        output_path.display()
+                    )
                 })?;
                 return Ok(output.status.code().unwrap_or(-1));
             }
@@ -4893,8 +5041,8 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sa_core::interaction_history::{InteractionEntry, InteractionStore};
     use hex::encode as hex_encode;
+    use sa_core::interaction_history::{InteractionEntry, InteractionStore};
     use sa_core::ws_identity::{
         EXPECTED_CLIENT_NAME, WS_ALLOWED_SKEW_BUCKETS, WS_HASH_ALGO, WS_PROTOCOL_ID,
         WS_TIME_STEP_SECS, build_client_hello, current_time_bucket,
@@ -4928,7 +5076,9 @@ mod tests {
             .expect("interaction log should read")
             .lines()
             .filter(|line| !line.trim().is_empty())
-            .map(|line| serde_json::from_str::<InteractionEntry>(line).expect("valid interaction line"))
+            .map(|line| {
+                serde_json::from_str::<InteractionEntry>(line).expect("valid interaction line")
+            })
             .collect()
     }
 
@@ -4997,6 +5147,7 @@ mod tests {
             runtime_store,
             team_state,
             TeamConfig::default(),
+            PermissionsConfig::default(),
         )
     }
 
@@ -5430,7 +5581,10 @@ mod tests {
         let last = snapshot.messages.last().expect("tool result should exist");
         assert_eq!(last.role, "tool");
         assert_eq!(last.tool_call_id.as_deref(), Some("call_answer"));
-        let content = last.content.as_deref().expect("tool result should contain text");
+        let content = last
+            .content
+            .as_deref()
+            .expect("tool result should contain text");
         assert!(content.contains("\"selected_option_ids\":[\"a\"]"));
         assert!(content.contains("\"selected_labels\":[\"选项A\"]"));
     }
@@ -5677,9 +5831,11 @@ mod tests {
             .expect("wait notice should compute");
 
         assert!(notice.is_some());
-        assert!(notice
-            .expect("older work should be recognized as finished")
-            .contains(&older_work_id.to_string()));
+        assert!(
+            notice
+                .expect("older work should be recognized as finished")
+                .contains(&older_work_id.to_string())
+        );
     }
 
     #[test]

@@ -270,8 +270,8 @@ impl SessionStore {
                 workspace_root.display()
             )
         })?;
-        let sessions_relative_dir =
-            validate_session_relative_dir(sessions_relative_dir).context("Invalid session directory override")?;
+        let sessions_relative_dir = validate_session_relative_dir(sessions_relative_dir)
+            .context("Invalid session directory override")?;
         let sessions_dir = workspace_root.join(&sessions_relative_dir);
         fs::create_dir_all(&sessions_dir).with_context(|| {
             format!(

@@ -74,9 +74,6 @@ system_role_name = "developer"
 # Leave it empty / unset to omit the field completely.
 # reasoning_effort = "high"
 
-# Safety cap: maximum reasoning / tool-call steps per task.
-max_steps = 32
-
 [compaction]
 # Whether SA should automatically compress long-running conversation history.
 enabled = true
@@ -132,6 +129,34 @@ agents_md = "Agents.md"
 # `~` is expanded to the user home directory by SA.
 dirs = ["~/.codex/skills", "~/.agents/skills"]
 
+[permissions]
+# Non-interactive permission mode.
+#
+# Current supported value:
+# - "bypass"
+#
+# `bypass` means:
+# - SA never opens an approval dialog
+# - execution is still constrained by explicit deny rules and command-scoped
+#   `allowed-tools`
+mode = "bypass"
+
+# Optional global deny rules for tools.
+#
+# Examples:
+# deny_tools = ["Show", "mcp__playwright__*", "Bash(rm -rf *)"]
+deny_tools = []
+
+# Optional global deny rules for skills / commands.
+#
+# Matching commands:
+# - are hidden from the model-visible command list
+# - cannot be read/invoked through `Skill`
+#
+# Examples:
+# deny_commands = ["dangerous-*", "mcp__internal__*"]
+deny_commands = []
+
 [mcp]
 # Enable external MCP (Model Context Protocol) tool servers.
 enabled = false
@@ -165,3 +190,9 @@ enabled = false
 # transport = "sse"
 # url = "https://example.com/mcp/sse"
 # tool_timeout_secs = 180
+
+# Connected MCP tools are exposed to the model as:
+# - `mcp__<server>__<tool>`
+#
+# Example:
+# - `mcp__filesystem__read_file`

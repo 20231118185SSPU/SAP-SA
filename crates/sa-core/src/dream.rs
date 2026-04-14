@@ -179,7 +179,10 @@ impl DreamManager {
             .write(true)
             .open(&self.lock_path)
             .with_context(|| {
-                format!("Failed to open dream lock file: {}", self.lock_path.display())
+                format!(
+                    "Failed to open dream lock file: {}",
+                    self.lock_path.display()
+                )
             })?;
 
         let acquired = file.try_lock_exclusive().with_context(|| {
@@ -225,7 +228,10 @@ impl DreamManager {
             }),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(DreamState::default()),
             Err(err) => Err(err).with_context(|| {
-                format!("Failed to read dream state file: {}", self.state_path.display())
+                format!(
+                    "Failed to read dream state file: {}",
+                    self.state_path.display()
+                )
             }),
         }
     }
@@ -235,8 +241,7 @@ impl DreamManager {
         self.ensure_layout()?;
 
         let sources = self.collect_sources(now)?;
-        let report_relative_path =
-            format!("{DREAM_AUDIT_DIR}/{}.md", now.format("%Y-%m-%d"));
+        let report_relative_path = format!("{DREAM_AUDIT_DIR}/{}.md", now.format("%Y-%m-%d"));
         let extra_system_prompt =
             self.build_runtime_context_block(now, &sources, &report_relative_path);
         let task = format!(
@@ -259,13 +264,14 @@ impl DreamManager {
                 self.workspace_root.display()
             )
         })?;
-        fs::create_dir_all(self.workspace_root.join(DREAM_TOPIC_MEMORY_DIR))
-            .with_context(|| {
+        fs::create_dir_all(self.workspace_root.join(DREAM_TOPIC_MEMORY_DIR)).with_context(
+            || {
                 format!(
                     "Failed to create topic memory directory under {}",
                     self.workspace_root.display()
                 )
-            })?;
+            },
+        )?;
         fs::create_dir_all(self.workspace_root.join(DREAM_AUDIT_DIR)).with_context(|| {
             format!(
                 "Failed to create dream audit directory under {}",
@@ -280,7 +286,10 @@ impl DreamManager {
         self.ensure_layout()?;
         let raw = serde_json::to_string_pretty(state).context("Failed to serialize dream state")?;
         let mut file = File::create(&self.state_path).with_context(|| {
-            format!("Failed to write dream state file: {}", self.state_path.display())
+            format!(
+                "Failed to write dream state file: {}",
+                self.state_path.display()
+            )
         })?;
         file.write_all(raw.as_bytes())
             .context("Failed to write dream state contents")?;
@@ -343,7 +352,9 @@ impl DreamManager {
         let mut out = String::new();
         out.push_str("## Dream Runtime\n\n");
         out.push_str("你当前执行的是后台 dream 记忆提炼任务。\n");
-        out.push_str("dream 的目标不是普通摘要，而是长期记忆治理：去噪、去重、修正冲突、抽象经验。\n");
+        out.push_str(
+            "dream 的目标不是普通摘要，而是长期记忆治理：去噪、去重、修正冲突、抽象经验。\n",
+        );
         out.push_str("这是后台任务：不要使用 `Send`、`Ask`、`Show` 或 `SubAgent`。如需查看文件，请使用 `Read`；如需局部搜索原始会话，请优先用 `Bash` 做只读 grep/find/cat，再用 `Read` 精确读取。\n\n");
 
         out.push_str("### 写入目标\n\n");
@@ -365,7 +376,9 @@ impl DreamManager {
         out.push_str("3. 删除一次性噪声、过时信息与互相冲突的旧记忆。\n");
         out.push_str("4. 把真正稳定、可复用的知识提炼到 `MEMORY.md` 或 `memory/topics/*.md`。\n");
         out.push_str("5. 在审计文件中记录：看了哪些来源、提升了哪些记忆、合并了哪些重复项、删除了哪些噪声、修正了哪些冲突。\n");
-        out.push_str("6. 如果没有需要调整的内容，也要在审计文件中写明“本次未发现值得更新的长期记忆”。\n\n");
+        out.push_str(
+            "6. 如果没有需要调整的内容，也要在审计文件中写明“本次未发现值得更新的长期记忆”。\n\n",
+        );
 
         out.push_str("### 质量要求\n\n");
         out.push_str("- 不要把一次性任务细节、临时错误日志或短期中间状态直接塞进长期记忆。\n");
@@ -457,7 +470,12 @@ fn list_recent_markdown_files(
             .unwrap_or(path)
             .to_string_lossy()
             .replace('\\', "/");
-        files.push((metadata.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH), relative));
+        files.push((
+            metadata
+                .modified()
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+            relative,
+        ));
     }
 
     files.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
@@ -494,7 +512,12 @@ fn list_recent_session_segments(
                 .ok()?
                 .to_string_lossy()
                 .replace('\\', "/");
-            Some((metadata.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH), relative))
+            Some((
+                metadata
+                    .modified()
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+                relative,
+            ))
         })
         .collect::<Vec<_>>();
 
@@ -529,7 +552,10 @@ mod tests {
 
         let next = manager.next_run_after(now);
 
-        assert_eq!(next.date_naive(), NaiveDate::from_ymd_opt(2026, 4, 14).unwrap());
+        assert_eq!(
+            next.date_naive(),
+            NaiveDate::from_ymd_opt(2026, 4, 14).unwrap()
+        );
         assert_eq!(next.time().hour(), 0);
         assert_eq!(next.time().minute(), 0);
     }
@@ -538,8 +564,8 @@ mod tests {
     fn should_run_now_is_false_after_same_day_completion() {
         let workspace = temp_workspace();
         let manager = manager(&workspace);
-        let now = resolve_local_time(NaiveDate::from_ymd_opt(2026, 4, 13).unwrap())
-            + Duration::hours(9);
+        let now =
+            resolve_local_time(NaiveDate::from_ymd_opt(2026, 4, 13).unwrap()) + Duration::hours(9);
 
         manager
             .mark_completed(now.date_naive(), now, "memory/dreams/2026-04-13.md")
@@ -553,7 +579,9 @@ mod tests {
         let workspace = temp_workspace();
         let manager = manager(&workspace);
 
-        let first = manager.try_acquire_lock().expect("lock attempt should succeed");
+        let first = manager
+            .try_acquire_lock()
+            .expect("lock attempt should succeed");
         assert!(first.is_some());
         let second = manager
             .try_acquire_lock()
@@ -569,7 +597,10 @@ mod tests {
         fs::create_dir_all(workspace.path().join(DREAM_SESSIONS_DIR)).unwrap();
         fs::write(workspace.path().join("MEMORY.md"), "long-term memory").unwrap();
         fs::write(
-            workspace.path().join(DREAM_TOPIC_MEMORY_DIR).join("preferences.md"),
+            workspace
+                .path()
+                .join(DREAM_TOPIC_MEMORY_DIR)
+                .join("preferences.md"),
             "topic memory",
         )
         .unwrap();
@@ -579,14 +610,17 @@ mod tests {
         )
         .unwrap();
         fs::write(
-            workspace.path().join(DREAM_SESSIONS_DIR).join("session-2026-04-13-a.jsonl"),
+            workspace
+                .path()
+                .join(DREAM_SESSIONS_DIR)
+                .join("session-2026-04-13-a.jsonl"),
             "{}\n",
         )
         .unwrap();
 
         let manager = manager(&workspace);
-        let now = resolve_local_time(NaiveDate::from_ymd_opt(2026, 4, 13).unwrap())
-            + Duration::hours(8);
+        let now =
+            resolve_local_time(NaiveDate::from_ymd_opt(2026, 4, 13).unwrap()) + Duration::hours(8);
         let prepared = manager.prepare_run(now).expect("dream run should prepare");
 
         assert_eq!(prepared.report_relative_path, "memory/dreams/2026-04-13.md");
@@ -612,7 +646,15 @@ mod tests {
                 .iter()
                 .any(|path| path == "sessions/session-2026-04-13-a.jsonl")
         );
-        assert!(prepared.extra_system_prompt.contains("去噪、去重、修正冲突"));
-        assert!(prepared.extra_system_prompt.contains("memory/dreams/2026-04-13.md"));
+        assert!(
+            prepared
+                .extra_system_prompt
+                .contains("去噪、去重、修正冲突")
+        );
+        assert!(
+            prepared
+                .extra_system_prompt
+                .contains("memory/dreams/2026-04-13.md")
+        );
     }
 }

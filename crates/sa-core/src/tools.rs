@@ -33,14 +33,14 @@ use crate::mcp_client::McpRegistry;
 use crate::memory::{read_markdown_memory, search_markdown_memory};
 use crate::openai::{ToolDefinition, ToolFunctionDefinition};
 use crate::runtime::state::{AgentStatus, RuntimeTaskStatus, WaitKind, WaitUntil};
-use crate::skills::SkillRegistry;
+use crate::skills::{ActiveCommandInvocation, SkillRegistry, matches_command_patterns};
 use crate::ws_protocol::{
     QuestionMode, QuestionOption, UserQuestionAnswer, UserVisibleFile, UserVisibleFileEncoding,
 };
 use anyhow::Context as _;
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::ffi::OsString;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -105,9 +105,8 @@ pub type RunSubAgentFn = Arc<
 >;
 
 /// Callback used by `NotifyParent`.
-pub type NotifyParentFn = Arc<
-    dyn Fn(String) -> ToolFuture<anyhow::Result<AgentMessageReceipt>> + Send + Sync + 'static,
->;
+pub type NotifyParentFn =
+    Arc<dyn Fn(String) -> ToolFuture<anyhow::Result<AgentMessageReceipt>> + Send + Sync + 'static>;
 
 /// Callback used by `MessageAgent`.
 pub type MessageAgentFn = Arc<
@@ -127,10 +126,7 @@ pub type BroadcastAgentsFn = Arc<
 
 /// Callback used by `ListAgents`.
 pub type ListAgentsFn = Arc<
-    dyn Fn(ListAgentsRequest) -> ToolFuture<anyhow::Result<Vec<AgentInfo>>>
-        + Send
-        + Sync
-        + 'static,
+    dyn Fn(ListAgentsRequest) -> ToolFuture<anyhow::Result<Vec<AgentInfo>>> + Send + Sync + 'static,
 >;
 
 /// Callback used by `GetAgent`.
@@ -154,9 +150,8 @@ pub type StartTerminalTaskFn = Arc<
 >;
 
 /// Callback used by `GetTask`.
-pub type GetTaskFn = Arc<
-    dyn Fn(Uuid) -> ToolFuture<anyhow::Result<TerminalTaskInfo>> + Send + Sync + 'static,
->;
+pub type GetTaskFn =
+    Arc<dyn Fn(Uuid) -> ToolFuture<anyhow::Result<TerminalTaskInfo>> + Send + Sync + 'static>;
 
 /// Structured request emitted by the `Ask` tool.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -521,6 +516,20 @@ pub struct ToolRuntime {
     pub allow_user_ask: bool,
     /// Whether root may transfer input ownership to this agent.
     pub allow_input_transfer_target: bool,
+    /// Glob-style tool deny patterns that are always enforced.
+    pub denied_tools: Vec<String>,
+    /// Glob-style command/skill deny patterns.
+    pub denied_commands: Vec<String>,
+    /// Command-scoped allowlist patterns currently active for this agent.
+    pub allowed_tool_patterns: Vec<String>,
+    /// Commands currently active in this agent's durable context.
+    pub active_command_invocations: Vec<ActiveCommandInvocation>,
+    /// Conditional commands that have already been activated by touched paths.
+    pub activated_conditional_commands: Vec<String>,
+    /// Effective model override produced by active commands, if any.
+    pub model_override: Option<String>,
+    /// Effective reasoning-effort override produced by active commands, if any.
+    pub effort_override: Option<String>,
     /// Non-blocking "tell the user" channel.
     send_message: SendMessageFn,
     /// Blocking "ask the user" channel.
@@ -562,6 +571,13 @@ impl ToolRuntime {
         allow_user_show: bool,
         allow_user_ask: bool,
         allow_input_transfer_target: bool,
+        denied_tools: Vec<String>,
+        denied_commands: Vec<String>,
+        allowed_tool_patterns: Vec<String>,
+        active_command_invocations: Vec<ActiveCommandInvocation>,
+        activated_conditional_commands: Vec<String>,
+        model_override: Option<String>,
+        effort_override: Option<String>,
         send_message: SendMessageFn,
         ask_question: AskQuestionFn,
         show_file: ShowFileFn,
@@ -587,6 +603,13 @@ impl ToolRuntime {
             allow_user_show,
             allow_user_ask,
             allow_input_transfer_target,
+            denied_tools,
+            denied_commands,
+            allowed_tool_patterns,
+            active_command_invocations,
+            activated_conditional_commands,
+            model_override,
+            effort_override,
             send_message,
             ask_question,
             show_file,
@@ -655,6 +678,13 @@ impl ToolRuntime {
             true,
             true,
             false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            None,
             send_message,
             ask_question,
             show_file,
@@ -720,10 +750,7 @@ impl ToolRuntime {
     }
 
     /// Invoke the `ListAgents` callback.
-    pub async fn list_agents(
-        &self,
-        request: ListAgentsRequest,
-    ) -> anyhow::Result<Vec<AgentInfo>> {
+    pub async fn list_agents(&self, request: ListAgentsRequest) -> anyhow::Result<Vec<AgentInfo>> {
         (self.list_agents)(request).await
     }
 
@@ -836,14 +863,38 @@ impl ToolContext {
 pub struct ToolSession {
     /// Canonical file paths that are currently eligible for `Edit`.
     readable_for_edit: HashSet<PathBuf>,
+    /// Commands that remain active for future turns.
+    active_command_invocations: Vec<ActiveCommandInvocation>,
+    /// Conditional commands already unlocked by touched paths.
+    activated_conditional_commands: BTreeSet<String>,
+    /// Workspace paths touched during the current quantum.
+    touched_paths: BTreeSet<PathBuf>,
 }
 
 impl ToolSession {
-    /// Restore one tool session from a persisted list of canonical paths.
-    pub fn from_readable_paths(paths: impl IntoIterator<Item = PathBuf>) -> Self {
+    /// Restore one tool session from persisted durable state.
+    pub fn from_state(
+        paths: impl IntoIterator<Item = PathBuf>,
+        active_command_invocations: impl IntoIterator<Item = ActiveCommandInvocation>,
+        activated_conditional_commands: impl IntoIterator<Item = String>,
+    ) -> Self {
         Self {
             readable_for_edit: paths.into_iter().collect(),
+            active_command_invocations: active_command_invocations.into_iter().collect(),
+            activated_conditional_commands: activated_conditional_commands.into_iter().collect(),
+            touched_paths: BTreeSet::new(),
         }
+    }
+
+    /// Restore one tool session from a persisted list of canonical paths.
+    ///
+    /// This helper keeps older unit tests concise.
+    pub fn from_readable_paths(paths: impl IntoIterator<Item = PathBuf>) -> Self {
+        Self::from_state(
+            paths,
+            Vec::<ActiveCommandInvocation>::new(),
+            Vec::<String>::new(),
+        )
     }
 
     /// Export the current "freshly read" set for persistence.
@@ -851,9 +902,28 @@ impl ToolSession {
         self.readable_for_edit.iter().cloned().collect()
     }
 
+    /// Export the active command reminder set for persistence.
+    pub fn active_command_invocations(&self) -> Vec<ActiveCommandInvocation> {
+        self.active_command_invocations.clone()
+    }
+
+    /// Export the activated conditional command names for persistence.
+    pub fn activated_conditional_commands(&self) -> Vec<String> {
+        self.activated_conditional_commands
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    /// Export the paths touched during the just-finished quantum.
+    pub fn touched_paths(&self) -> Vec<PathBuf> {
+        self.touched_paths.iter().cloned().collect()
+    }
+
     /// Mark that a file has just been read in this session.
     fn note_read(&mut self, path: PathBuf) {
-        self.readable_for_edit.insert(path);
+        self.readable_for_edit.insert(path.clone());
+        self.note_touched_path(path);
     }
 
     /// Enforce the "must read before edit" rule.
@@ -871,6 +941,23 @@ impl ToolSession {
     /// After an edit, the caller must re-read the file before the next edit.
     fn invalidate_after_edit(&mut self, path: &Path) {
         self.readable_for_edit.remove(path);
+    }
+
+    /// Record that one workspace path participated in the current quantum.
+    fn note_touched_path(&mut self, path: PathBuf) {
+        self.touched_paths.insert(path);
+    }
+
+    /// Activate or refresh one command reminder.
+    fn note_command_invocation(&mut self, invocation: ActiveCommandInvocation) {
+        self.active_command_invocations
+            .retain(|existing| existing.name != invocation.name);
+        self.active_command_invocations.push(invocation);
+    }
+
+    /// Mark a conditional command as activated for future prompt visibility.
+    pub fn activate_conditional_command(&mut self, name: impl Into<String>) {
+        self.activated_conditional_commands.insert(name.into());
     }
 }
 
@@ -1284,21 +1371,67 @@ impl ToolExecutor {
                 function: ToolFunctionDefinition {
                     name: "Skill".to_string(),
                     description:
-                        "Read `SKILL.md` or another skill-relative text file from a named installed skill without exposing the real host path."
+                        "Invoke one registered command/skill, or read one local skill-relative file without exposing the real host path."
                             .to_string(),
                     parameters: serde_json::json!({
                         "type": "object",
                         "properties": {
+                            "action": {
+                                "type": "string",
+                                "enum": ["invoke", "read"],
+                                "description": "Whether to invoke the command or read one local skill file. Defaults to `invoke`."
+                            },
                             "name": {
                                 "type": "string",
-                                "description": "Skill name from the prompt's skill metadata list."
+                                "description": "Command/skill name from the prompt's command metadata list."
+                            },
+                            "args": {
+                                "type": "string",
+                                "description": "Optional raw argument string used when `action = invoke`."
                             },
                             "path": {
                                 "type": "string",
-                                "description": "Optional skill-relative path. Defaults to `SKILL.md`."
+                                "description": "Optional skill-relative path used when `action = read`. Defaults to `SKILL.md`."
                             }
                         },
                         "required": ["name"]
+                    }),
+                },
+            },
+            ToolDefinition {
+                kind: "function".to_string(),
+                function: ToolFunctionDefinition {
+                    name: "ListMcpResources".to_string(),
+                    description: "List resources exposed by connected MCP servers.".to_string(),
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "server": {
+                                "type": "string",
+                                "description": "Optional server name filter."
+                            }
+                        }
+                    }),
+                },
+            },
+            ToolDefinition {
+                kind: "function".to_string(),
+                function: ToolFunctionDefinition {
+                    name: "ReadMcpResource".to_string(),
+                    description: "Read one resource from a connected MCP server by URI.".to_string(),
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "server": {
+                                "type": "string",
+                                "description": "MCP server name."
+                            },
+                            "uri": {
+                                "type": "string",
+                                "description": "Resource URI returned by `ListMcpResources`."
+                            }
+                        },
+                        "required": ["server", "uri"]
                     }),
                 },
             },
@@ -1501,6 +1634,9 @@ impl ToolExecutor {
         }
 
         definitions
+            .into_iter()
+            .filter(|definition| self.tool_is_model_visible(runtime, &definition.function.name))
+            .collect()
     }
 
     /// Execute one tool call.
@@ -1512,13 +1648,15 @@ impl ToolExecutor {
         args: serde_json::Value,
         cancel: &CancelToken,
     ) -> anyhow::Result<ToolExecutionResult> {
+        self.ensure_tool_allowed(runtime, name, &args)?;
+
         match name {
             "Read" => self
                 .read(session, args, cancel)
                 .await
                 .map(ToolExecutionResult::Observation),
             "Write" => self
-                .write(args, cancel)
+                .write(session, args, cancel)
                 .await
                 .map(ToolExecutionResult::Observation),
             "Edit" => self
@@ -1550,7 +1688,7 @@ impl ToolExecutor {
                 .await
                 .map(ToolExecutionResult::Observation),
             "Show" => self
-                .show(runtime, args, cancel)
+                .show(session, runtime, args, cancel)
                 .await
                 .map(ToolExecutionResult::Observation),
             "GetInteractionEntry" => self
@@ -1559,7 +1697,15 @@ impl ToolExecutor {
                 .map(ToolExecutionResult::Observation),
             "Ask" => self.ask(runtime, args, cancel).await,
             "Skill" => self
-                .skill(args, cancel)
+                .skill(session, runtime, args, cancel)
+                .await
+                .map(ToolExecutionResult::Observation),
+            "ListMcpResources" => self
+                .list_mcp_resources(args, cancel)
+                .await
+                .map(ToolExecutionResult::Observation),
+            "ReadMcpResource" => self
+                .read_mcp_resource(args, cancel)
                 .await
                 .map(ToolExecutionResult::Observation),
             "SubAgent" => self
@@ -1609,6 +1755,54 @@ impl ToolExecutor {
                 anyhow::bail!("Unknown tool: {name}")
             }
         }
+    }
+
+    /// Whether a tool should be visible in the advertised model tool list.
+    fn tool_is_model_visible(&self, runtime: &ToolRuntime, tool_name: &str) -> bool {
+        if matches_tool_patterns(tool_name, None, &runtime.denied_tools) {
+            return false;
+        }
+
+        if runtime.allowed_tool_patterns.is_empty() {
+            return true;
+        }
+
+        runtime
+            .allowed_tool_patterns
+            .iter()
+            .map(|pattern| pattern.trim())
+            .filter(|pattern| !pattern.is_empty())
+            .any(|pattern| pattern_allows_tool_visibility(pattern, tool_name))
+    }
+
+    /// Enforce the current runtime permission policy for one concrete tool call.
+    fn ensure_tool_allowed(
+        &self,
+        runtime: &ToolRuntime,
+        tool_name: &str,
+        args: &serde_json::Value,
+    ) -> anyhow::Result<()> {
+        let bash_command = extract_bash_command(tool_name, args);
+        if matches_tool_patterns(tool_name, bash_command.as_deref(), &runtime.denied_tools) {
+            anyhow::bail!("Tool `{tool_name}` is denied by the current permission policy");
+        }
+
+        if runtime.allowed_tool_patterns.is_empty() {
+            return Ok(());
+        }
+
+        if matches_tool_patterns(
+            tool_name,
+            bash_command.as_deref(),
+            &runtime.allowed_tool_patterns,
+        ) {
+            return Ok(());
+        }
+
+        anyhow::bail!(
+            "Tool `{tool_name}` is not allowed by the current command scope; allowed patterns: {}",
+            runtime.allowed_tool_patterns.join(", ")
+        );
     }
 
     /// `Read`: read a UTF-8 text file and mark it as eligible for `Edit`.
@@ -1662,7 +1856,12 @@ impl ToolExecutor {
     }
 
     /// `Write`: create a new file and refuse to overwrite an existing one.
-    async fn write(&self, args: serde_json::Value, cancel: &CancelToken) -> anyhow::Result<String> {
+    async fn write(
+        &self,
+        session: &mut ToolSession,
+        args: serde_json::Value,
+        cancel: &CancelToken,
+    ) -> anyhow::Result<String> {
         if cancel.is_cancelled() {
             anyhow::bail!("Write cancelled");
         }
@@ -1692,6 +1891,7 @@ impl ToolExecutor {
         tokio::fs::write(&path, args.content.as_bytes())
             .await
             .with_context(|| format!("Failed to write file: {}", path.display()))?;
+        session.note_touched_path(path.clone());
 
         Ok(serde_json::json!({
             "created": true,
@@ -1757,6 +1957,7 @@ impl ToolExecutor {
             .with_context(|| format!("Failed to write edited file: {}", path.display()))?;
 
         session.invalidate_after_edit(&path);
+        session.note_touched_path(path.clone());
 
         Ok(serde_json::json!({
             "edited": true,
@@ -2140,6 +2341,7 @@ impl ToolExecutor {
     /// `Show`: transport a file payload to the user-facing frontend.
     async fn show(
         &self,
+        session: &mut ToolSession,
         runtime: &ToolRuntime,
         args: serde_json::Value,
         cancel: &CancelToken,
@@ -2205,6 +2407,7 @@ impl ToolExecutor {
         };
 
         runtime.show_file(file.clone()).await?;
+        session.note_touched_path(path.clone());
 
         Ok(serde_json::json!({
             "shown": true,
@@ -2298,36 +2501,145 @@ impl ToolExecutor {
         Ok(ToolExecutionResult::Control(ToolControl::Ask(request)))
     }
 
-    /// `Skill`: read `SKILL.md` or another skill-relative file by skill name.
-    async fn skill(&self, args: serde_json::Value, cancel: &CancelToken) -> anyhow::Result<String> {
+    /// `Skill`: invoke one registered command or read one local skill file.
+    async fn skill(
+        &self,
+        session: &mut ToolSession,
+        runtime: &ToolRuntime,
+        args: serde_json::Value,
+        cancel: &CancelToken,
+    ) -> anyhow::Result<String> {
         if cancel.is_cancelled() {
             anyhow::bail!("Skill cancelled");
         }
 
         #[derive(Debug, Deserialize)]
         struct Args {
+            #[serde(default = "default_skill_action")]
+            action: String,
             name: String,
+            args: Option<String>,
             path: Option<String>,
+            session_id: Option<String>,
+        }
+
+        fn default_skill_action() -> String {
+            "invoke".to_string()
         }
 
         let args: Args = serde_json::from_value(args).context("Invalid arguments for Skill")?;
+        if matches_command_patterns(&args.name, &runtime.denied_commands) {
+            anyhow::bail!(
+                "Command `{}` is denied by the current permission policy",
+                args.name
+            );
+        }
         let Some(skill) = self.ctx.skills.get(&args.name) else {
             anyhow::bail!("Skill not found: {}", args.name);
         };
 
-        let (path, content) = self
-            .ctx
-            .skills
-            .load_skill_file(&args.name, args.path.as_deref())
-            .await?;
+        match args.action.as_str() {
+            "read" => {
+                let (path, content) = self
+                    .ctx
+                    .skills
+                    .load_skill_file(&args.name, args.path.as_deref())
+                    .await?;
 
-        Ok(serde_json::json!({
-            "name": skill.name,
-            "description": skill.description,
-            "path": path,
-            "content": content,
-        })
-        .to_string())
+                Ok(serde_json::json!({
+                    "name": skill.name,
+                    "description": skill.description,
+                    "path": path,
+                    "content": content,
+                })
+                .to_string())
+            }
+            "invoke" => {
+                if skill.disable_model_invocation {
+                    anyhow::bail!(
+                        "Command `{}` is not model-invocable and must not be invoked automatically",
+                        skill.name
+                    );
+                }
+
+                let instructions = if let Some(prompt) = skill.mcp_prompt() {
+                    let Some(registry) = &self.mcp_registry else {
+                        anyhow::bail!("No MCP registry is configured for MCP prompt invocation");
+                    };
+                    registry
+                        .expand_prompt(
+                            &prompt.server_name,
+                            &prompt.prompt_name,
+                            &prompt.arguments,
+                            args.args.as_deref(),
+                        )
+                        .await?
+                } else {
+                    let session_id = args
+                        .session_id
+                        .clone()
+                        .unwrap_or_else(|| runtime.agent_id.to_string());
+                    skill
+                        .expand_invocation(args.args.as_deref(), &session_id)?
+                        .instructions
+                };
+
+                session.note_command_invocation(skill.reminder());
+
+                Ok(instructions)
+            }
+            other => anyhow::bail!("Skill action must be `invoke` or `read`, got `{other}`"),
+        }
+    }
+
+    /// `ListMcpResources`: enumerate connected MCP resources.
+    async fn list_mcp_resources(
+        &self,
+        args: serde_json::Value,
+        cancel: &CancelToken,
+    ) -> anyhow::Result<String> {
+        if cancel.is_cancelled() {
+            anyhow::bail!("ListMcpResources cancelled");
+        }
+
+        #[derive(Debug, Deserialize)]
+        struct Args {
+            server: Option<String>,
+        }
+
+        let args: Args =
+            serde_json::from_value(args).context("Invalid arguments for ListMcpResources")?;
+        let Some(registry) = &self.mcp_registry else {
+            anyhow::bail!("No MCP registry is configured");
+        };
+
+        registry.list_resources(args.server.as_deref()).await
+    }
+
+    /// `ReadMcpResource`: read one resource payload from a connected MCP
+    /// server.
+    async fn read_mcp_resource(
+        &self,
+        args: serde_json::Value,
+        cancel: &CancelToken,
+    ) -> anyhow::Result<String> {
+        if cancel.is_cancelled() {
+            anyhow::bail!("ReadMcpResource cancelled");
+        }
+
+        #[derive(Debug, Deserialize)]
+        struct Args {
+            server: String,
+            uri: String,
+        }
+
+        let args: Args =
+            serde_json::from_value(args).context("Invalid arguments for ReadMcpResource")?;
+        let Some(registry) = &self.mcp_registry else {
+            anyhow::bail!("No MCP registry is configured");
+        };
+
+        registry.read_resource(&args.server, &args.uri).await
     }
 
     /// `SubAgent`: delegate a focused sub-task to a nested agent.
@@ -2408,7 +2720,9 @@ impl ToolExecutor {
             anyhow::bail!("FinishWithoutOutput cancelled");
         }
 
-        Ok(ToolExecutionResult::Control(ToolControl::FinishWithoutOutput))
+        Ok(ToolExecutionResult::Control(
+            ToolControl::FinishWithoutOutput,
+        ))
     }
 
     /// `NotifyParent`: convenience one-way message to the current parent.
@@ -2891,6 +3205,88 @@ fn guess_media_type(path: &Path, encoding: &UserVisibleFileEncoding) -> String {
     }
 }
 
+/// Extract the raw Bash command string when the current call targets `Bash`.
+fn extract_bash_command<'a>(tool_name: &str, args: &'a serde_json::Value) -> Option<&'a str> {
+    if tool_name != "Bash" {
+        return None;
+    }
+
+    args.get("command")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+}
+
+/// Decide whether one allow/deny pattern should keep a tool visible in the
+/// model-facing tool list.
+///
+/// Visibility is intentionally approximate for argument-scoped rules such as
+/// `Bash(git:*)`: the model still needs to see `Bash`, while concrete command
+/// enforcement happens later in [`matches_tool_patterns`].
+fn pattern_allows_tool_visibility(pattern: &str, tool_name: &str) -> bool {
+    if let Some((pattern_tool_name, _)) = split_tool_scope_pattern(pattern) {
+        return pattern_tool_name == tool_name;
+    }
+
+    matches_command_patterns(tool_name, &[pattern.to_string()])
+}
+
+/// Match concrete tool calls against plain tool patterns and `Bash(...)`
+/// command-prefix patterns.
+fn matches_tool_patterns(tool_name: &str, bash_command: Option<&str>, patterns: &[String]) -> bool {
+    patterns
+        .iter()
+        .map(|pattern| pattern.trim())
+        .filter(|pattern| !pattern.is_empty())
+        .any(|pattern| {
+            if let Some((pattern_tool_name, scoped_pattern)) = split_tool_scope_pattern(pattern) {
+                if pattern_tool_name != tool_name {
+                    return false;
+                }
+                return match (pattern_tool_name, bash_command) {
+                    ("Bash", Some(command)) => matches_bash_scoped_pattern(command, scoped_pattern),
+                    _ => false,
+                };
+            }
+
+            matches_command_patterns(tool_name, &[pattern.to_string()])
+        })
+}
+
+/// Parse `ToolName(scope-pattern)` forms used by command-scoped allowlists.
+fn split_tool_scope_pattern(pattern: &str) -> Option<(&str, &str)> {
+    let open = pattern.find('(')?;
+    let close = pattern.rfind(')')?;
+    if close <= open {
+        return None;
+    }
+
+    let tool_name = pattern[..open].trim();
+    let scoped_pattern = pattern[open + 1..close].trim();
+    if tool_name.is_empty() || scoped_pattern.is_empty() {
+        return None;
+    }
+
+    Some((tool_name, scoped_pattern))
+}
+
+/// Match one Bash command against the scoped pattern syntax used by
+/// `allowed-tools`, for example `git:*`.
+///
+/// The `:<star>` suffix is treated as a shell-command prefix rule rather than
+/// a literal colon match, so `git:*` means "the command starts with `git`".
+fn matches_bash_scoped_pattern(command: &str, pattern: &str) -> bool {
+    let command = command.trim();
+    let pattern = pattern.trim();
+
+    if let Some(prefix) = pattern.strip_suffix(":*").map(str::trim) {
+        return command == prefix
+            || command.starts_with(&format!("{prefix} "))
+            || command.starts_with(&format!("{prefix}\t"));
+    }
+
+    matches_command_patterns(command, &[pattern.to_string()])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2909,6 +3305,16 @@ mod tests {
     /// Create a minimal tool context rooted at a fresh temp directory.
     fn test_context() -> ToolContext {
         ToolContext::new(unique_temp_dir(), Arc::new(SkillRegistry::default())).expect("context")
+    }
+
+    /// Create a tool context with one local skill directory already scanned.
+    fn test_context_with_skill(skill_name: &str, skill_markdown: &str) -> ToolContext {
+        let root = unique_temp_dir();
+        let skill_dir = root.join(skill_name);
+        fs::create_dir_all(&skill_dir).expect("create skill dir");
+        fs::write(skill_dir.join("SKILL.md"), skill_markdown).expect("write SKILL.md");
+        let registry = Arc::new(SkillRegistry::scan(&[root]).expect("scan skills"));
+        ToolContext::new(unique_temp_dir(), registry).expect("context")
     }
 
     #[test]
@@ -2957,11 +3363,13 @@ mod tests {
     async fn write_refuses_existing_file() {
         let ctx = test_context();
         let executor = ToolExecutor::new(ctx.clone(), None);
+        let mut session = ToolSession::default();
         let path = ctx.workspace_root.join("already.txt");
         fs::write(&path, "hello").expect("seed file");
 
         let err = executor
             .write(
+                &mut session,
                 serde_json::json!({
                     "path": "already.txt",
                     "content": "new",
@@ -3050,12 +3458,14 @@ mod tests {
     async fn show_requires_non_empty_prompt() {
         let ctx = test_context();
         let executor = ToolExecutor::new(ctx.clone(), None);
+        let mut session = ToolSession::default();
         let cancel = crate::cancel::cancel_pair().1;
 
         fs::write(ctx.workspace_root.join("note.txt"), "hello").expect("seed file");
 
         let err = executor
             .show(
+                &mut session,
                 &ToolRuntime::detached(),
                 serde_json::json!({
                     "path": "note.txt",
@@ -3100,5 +3510,194 @@ mod tests {
         assert_eq!(value["kind"], "send");
         assert_eq!(value["id"], entry.id.to_string());
         assert_eq!(value["message_preview"], "history message");
+    }
+
+    #[tokio::test]
+    async fn skill_invoke_expands_inline_command_body() {
+        let ctx = test_context_with_skill(
+            "writer",
+            r#"---
+name: writer
+description: Writes polished reports
+arguments:
+  - topic
+---
+
+Write about $topic in session ${SA_SESSION_ID}.
+"#,
+        );
+        let executor = ToolExecutor::new(ctx, None);
+        let cancel = crate::cancel::cancel_pair().1;
+        let runtime = ToolRuntime::detached();
+        let mut session = ToolSession::default();
+
+        let raw = executor
+            .skill(
+                &mut session,
+                &runtime,
+                serde_json::json!({
+                    "action": "invoke",
+                    "name": "writer",
+                    "args": "study-notes",
+                    "session_id": "session-test"
+                }),
+                &cancel,
+            )
+            .await
+            .expect("skill invoke should succeed");
+
+        assert!(raw.contains("study-notes"));
+        assert!(raw.contains("session-test"));
+        assert!(!raw.contains("\"path\""));
+    }
+
+    #[test]
+    fn tool_definitions_include_mcp_resource_tools_and_skill_action_schema() {
+        let ctx = test_context();
+        let executor = ToolExecutor::new(ctx, None);
+        let runtime = ToolRuntime::detached();
+        let definitions = executor.tool_definitions(&runtime);
+
+        let skill = definitions
+            .iter()
+            .find(|definition| definition.function.name == "Skill")
+            .expect("Skill definition should exist");
+        assert!(
+            skill.function.parameters["properties"]
+                .get("action")
+                .is_some()
+        );
+
+        assert!(
+            definitions
+                .iter()
+                .any(|definition| definition.function.name == "ListMcpResources")
+        );
+        assert!(
+            definitions
+                .iter()
+                .any(|definition| definition.function.name == "ReadMcpResource")
+        );
+    }
+
+    /// Build one detached runtime and override the permission fields relevant
+    /// to these unit tests.
+    fn detached_runtime_with_permissions(
+        deny_tools: &[&str],
+        deny_commands: &[&str],
+        allowed_tool_patterns: &[&str],
+    ) -> ToolRuntime {
+        let mut runtime = ToolRuntime::detached();
+        runtime.denied_tools = deny_tools
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect();
+        runtime.denied_commands = deny_commands
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect();
+        runtime.allowed_tool_patterns = allowed_tool_patterns
+            .iter()
+            .map(|value| (*value).to_string())
+            .collect();
+        runtime
+    }
+
+    #[test]
+    fn matches_tool_patterns_supports_bash_scope_rules() {
+        assert!(matches_tool_patterns(
+            "Bash",
+            Some("git status"),
+            &[String::from("Bash(git:*)")]
+        ));
+        assert!(!matches_tool_patterns(
+            "Bash",
+            Some("cargo test"),
+            &[String::from("Bash(git:*)")]
+        ));
+        assert!(matches_tool_patterns(
+            "mcp__playwright__navigate",
+            None,
+            &[String::from("mcp__playwright__*")]
+        ));
+    }
+
+    #[test]
+    fn tool_definitions_hide_denied_and_out_of_scope_tools() {
+        let ctx = test_context();
+        let executor = ToolExecutor::new(ctx, None);
+        let runtime = detached_runtime_with_permissions(&["Show"], &[], &["Read", "Bash(git:*)"]);
+        let definitions = executor.tool_definitions(&runtime);
+        let names = definitions
+            .iter()
+            .map(|definition| definition.function.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(names.contains(&"Read"));
+        assert!(names.contains(&"Bash"));
+        assert!(!names.contains(&"Show"));
+        assert!(!names.contains(&"Send"));
+    }
+
+    #[tokio::test]
+    async fn execute_rejects_denied_tool_before_running_it() {
+        let ctx = test_context();
+        fs::write(ctx.workspace_root.join("note.txt"), "hello").expect("seed file");
+        let executor = ToolExecutor::new(ctx, None);
+        let runtime = detached_runtime_with_permissions(&["Read"], &[], &[]);
+        let cancel = crate::cancel::cancel_pair().1;
+        let mut session = ToolSession::default();
+
+        let err = executor
+            .execute(
+                &mut session,
+                &runtime,
+                "Read",
+                serde_json::json!({ "path": "note.txt" }),
+                &cancel,
+            )
+            .await
+            .expect_err("denied tool must fail");
+
+        assert!(
+            err.to_string()
+                .contains("denied by the current permission policy")
+        );
+    }
+
+    #[tokio::test]
+    async fn skill_respects_denied_commands() {
+        let ctx = test_context_with_skill(
+            "writer",
+            r#"---
+name: writer
+description: Writes polished reports
+---
+
+Write the report.
+"#,
+        );
+        let executor = ToolExecutor::new(ctx, None);
+        let runtime = detached_runtime_with_permissions(&[], &["writer"], &[]);
+        let cancel = crate::cancel::cancel_pair().1;
+        let mut session = ToolSession::default();
+
+        let err = executor
+            .skill(
+                &mut session,
+                &runtime,
+                serde_json::json!({
+                    "action": "invoke",
+                    "name": "writer"
+                }),
+                &cancel,
+            )
+            .await
+            .expect_err("denied command must fail");
+
+        assert!(
+            err.to_string()
+                .contains("denied by the current permission policy")
+        );
     }
 }

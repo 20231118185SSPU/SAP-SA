@@ -45,7 +45,6 @@
 - `auth_style`
 - `system_role_name`
 - `reasoning_effort`
-- `max_steps`
 
 其中 `system_role_name` 用于兼容一些只接受 `developer` 而不是 `system` 的渠道。
 `reasoning_effort` 用于给支持的 GPT 推理模型设置思维深度，常见值包括：
@@ -143,7 +142,8 @@
 - 具体 server 使用 `[mcp.<name>]` 命名子表
 - 启动时连接所有配置的 MCP server
 - 成功连接后，把它们暴露的工具自动注册进 Agent 工具表
-- 工具名会带服务器前缀，格式为：`<server>__<tool>`
+- 工具名会带固定前缀，格式为：`mcp__<server>__<tool>`
+- MCP prompt 也会并入统一命令注册表，允许通过 `Skill(action="invoke")` 触发
 
 配置风格参考 Codex，但根表简化为 `mcp`：
 
@@ -154,8 +154,8 @@
 
 例如：
 
-- `filesystem__read_file`
-- `browser__navigate`
+- `mcp__filesystem__read_file`
+- `mcp__browser__navigate`
 
 连接失败不会阻止 `SA` 启动；失败的 MCP server 会被记录日志并跳过。
 
@@ -214,6 +214,29 @@
 - 模型调用失败后的无限重试退避
 - 主会话 JSONL 持久化与重启恢复
 
+### 8. 非交互权限系统
+
+`SA` 当前采用非交互执行模型，不弹批准框，但仍支持显式限制：
+
+- `[permissions].mode = "bypass"`
+  - 表示没有 approval UI
+  - 但并不意味着无限制执行
+- `[permissions].deny_tools`
+  - 全局禁止某些工具
+  - 例如：`Show`、`mcp__playwright__*`
+- `[permissions].deny_commands`
+  - 全局禁止某些技能/命令
+  - 命中的命令既不会出现在 prompt 的模型可见命令列表里，也不能通过 `Skill` 读取或调用
+- 命令前置元数据中的 `allowed-tools`
+  - 会在命令激活后成为该代理的作用域工具白名单
+  - 支持诸如 `Bash(git:*)` 这类约束
+
+这套约束是持久化的：
+
+- 命令激活状态会随 agent state 一起保存
+- compact 后不会丢
+- 程序重启恢复后不会丢
+
 ## 内置工具
 
 当前内置工具如下：
@@ -246,6 +269,12 @@
   - 启动一个子代理并返回其最终结果
 
 此外，如果配置了 MCP server，工具表中还会出现动态注册的 MCP 工具。
+
+其中：
+
+- MCP tool 以 `mcp__<server>__<tool>` 出现
+- MCP resource 通过 `ListMcpResources` / `ReadMcpResource` 暴露
+- MCP prompt 通过统一命令系统暴露，使用 `Skill(action="invoke")` 调用
 
 ## 目录结构
 
@@ -331,6 +360,15 @@ command = "npx"
 args = ["-y", "@modelcontextprotocol/server-filesystem", "."]
 cwd = "."
 tool_timeout_secs = 180
+```
+
+如果要启用非交互权限限制，可以继续配置：
+
+```toml
+[permissions]
+mode = "bypass"
+deny_tools = ["Show", "mcp__playwright__*"]
+deny_commands = ["dangerous-*"]
 ```
 
 nightly dream 默认启用；如需手动调整可继续配置：
@@ -422,7 +460,7 @@ cargo build --release
 - dream 当前仍基于文件搜索与提炼，不是 embedding / 向量记忆系统
 - `SubAgent` 有递归深度上限，避免无限递归
 - CLI 只是过渡性的测试前端，不是最终产品形态
-- 当前只接入了 MCP 的 tool 能力，还没有接入 MCP resources / prompts
+- `allowed-tools` 当前只实现了工具名通配与 `Bash(...)` 这类命令前缀限制，尚未扩展到更细粒度参数审计
 
 ## 版本节点
 

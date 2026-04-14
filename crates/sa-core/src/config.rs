@@ -46,6 +46,10 @@ pub struct Config {
     #[serde(default)]
     pub mcp: McpConfig,
 
+    /// Non-interactive permission policy (`[permissions]`).
+    #[serde(default)]
+    pub permissions: PermissionsConfig,
+
     /// Durable multi-agent runtime configuration (`[team]`).
     #[serde(default)]
     pub team: TeamConfig,
@@ -116,7 +120,6 @@ pub struct LlmConfig {
     /// If this field is absent or blank, we omit it from the request body.
     #[serde(default)]
     pub reasoning_effort: Option<String>,
-
 }
 
 /// Durable multi-agent runtime configuration (`[team]` section).
@@ -133,6 +136,47 @@ pub struct TeamConfig {
     /// Maximum concurrent model calls shared by all agents.
     #[serde(default = "default_team_max_concurrent_model_calls")]
     pub max_concurrent_model_calls: usize,
+}
+
+/// High-level permission mode.
+///
+/// SA currently keeps the model in a fully non-interactive posture, so the
+/// practical behavior is:
+/// - `bypass`: no approval prompts; only explicit deny rules and command-scope
+///   allowlists apply
+///
+/// The enum still exists so the config format remains explicit and can grow
+/// later without another breaking TOML change.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionMode {
+    /// No approval UI. Global deny rules and command-scoped restrictions still
+    /// apply.
+    #[default]
+    Bypass,
+}
+
+/// Non-interactive permission controls (`[permissions]` section).
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct PermissionsConfig {
+    /// High-level mode. Defaults to `bypass`.
+    #[serde(default)]
+    pub mode: PermissionMode,
+
+    /// Glob-style tool deny patterns applied before every execution.
+    ///
+    /// Examples:
+    /// - `Bash`
+    /// - `mcp__playwright__*`
+    #[serde(default)]
+    pub deny_tools: Vec<String>,
+
+    /// Glob-style command/skill deny patterns.
+    ///
+    /// These hide matching commands from the prompt and also block
+    /// `Skill(action="read"|"invoke")` for those names.
+    #[serde(default)]
+    pub deny_commands: Vec<String>,
 }
 
 impl Default for TeamConfig {
@@ -672,7 +716,7 @@ fn validate_mcp_config(config: &McpConfig) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Config, LlmConfig, McpConfig, McpServerConfig, McpTransport, TeamConfig,
+        Config, LlmConfig, McpConfig, McpServerConfig, McpTransport, PermissionMode, TeamConfig,
         load_config_from_file, validate_mcp_config,
     };
     use crate::openai::{AuthStyle, WireApi};
@@ -821,6 +865,64 @@ agents_md = "Agents.md"
     }
 
     #[test]
+    fn permissions_defaults_load_when_section_is_missing() {
+        let raw = r#"
+[llm]
+base_url = "https://example.com/v1"
+api_key = "sk-test"
+model = "gpt-5.2"
+
+[server]
+bind = "127.0.0.1:8765"
+ws_path = "/ws"
+
+[workspace]
+root_dir = "."
+agents_md = "Agents.md"
+"#;
+
+        let cfg =
+            toml::from_str::<Config>(raw).expect("config without permissions section should parse");
+        assert_eq!(cfg.permissions.mode, PermissionMode::Bypass);
+        assert!(cfg.permissions.deny_tools.is_empty());
+        assert!(cfg.permissions.deny_commands.is_empty());
+    }
+
+    #[test]
+    fn permissions_section_parses_explicit_deny_lists() {
+        let raw = r#"
+[llm]
+base_url = "https://example.com/v1"
+api_key = "sk-test"
+model = "gpt-5.2"
+
+[server]
+bind = "127.0.0.1:8765"
+ws_path = "/ws"
+
+[workspace]
+root_dir = "."
+agents_md = "Agents.md"
+
+[permissions]
+mode = "bypass"
+deny_tools = ["Show", "mcp__playwright__*"]
+deny_commands = ["dangerous-*", "mcp__internal__*"]
+"#;
+
+        let cfg = toml::from_str::<Config>(raw).expect("permissions section should parse");
+        assert_eq!(cfg.permissions.mode, PermissionMode::Bypass);
+        assert_eq!(
+            cfg.permissions.deny_tools,
+            vec!["Show".to_string(), "mcp__playwright__*".to_string()]
+        );
+        assert_eq!(
+            cfg.permissions.deny_commands,
+            vec!["dangerous-*".to_string(), "mcp__internal__*".to_string()]
+        );
+    }
+
+    #[test]
     fn team_partial_override_preserves_other_defaults() {
         let raw = r#"
 [llm]
@@ -928,8 +1030,8 @@ enabled = true
 recent_session_segments = 9
 "#;
 
-        let cfg = toml::from_str::<Config>(raw)
-            .expect("config with partial dream override should parse");
+        let cfg =
+            toml::from_str::<Config>(raw).expect("config with partial dream override should parse");
         assert!(cfg.dream.enabled);
         assert_eq!(cfg.dream.daily_note_lookback_days, 3);
         assert_eq!(cfg.dream.recent_session_segments, 9);
