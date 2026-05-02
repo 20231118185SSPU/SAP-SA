@@ -1,21 +1,46 @@
-# Rust build output.
+# === Build Output ===
 /target/
+/dist/
+node_modules/
 
-# Editor / OS noise.
+# === OS/Editor ===
 .DS_Store
 Thumbs.db
+*.swp
+*.swo
+*~
 
-# Local configuration containing secrets (API keys, etc.).
+# === Secrets ===
 sa.toml
 claw.toml
+.env
+.env.*
+!.env.example
 
-# Local memory files (often sensitive; still kept local).
+# === Local State ===
 MEMORY.md
 memory/
-
-# Local agent state (persistent memory, caches, etc.).
 .sa/
 .claw/
-
-# Optional local logs.
 *.log
+
+# === Backup Files ===
+*.bak
+*.bak2
+*.bak3
+*.bak_*
+*.backup_*
+*.backup
+
+# === Temp Files ===
+*.tmp
+.tmp-*
+
+# === IDE ===
+.vscode/
+.idea/
+*.iml
+
+# === Test Coverage ===
+coverage/
+*.lcov
