@@ -127,6 +127,23 @@ struct CommandFrontmatter {
     paths: Option<StringOrVec>,
     hooks: Option<Value>,
     shell: Option<String>,
+    #[serde(default)]
+    triggers: Option<StringOrVec>,
+    #[serde(default)]
+    orchestration: Option<OrchestrationConfig>,
+}
+
+/// Orchestration configuration for skill execution.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct OrchestrationConfig {
+    /// Execution mode: "sequential" | "parallel" | "loop"
+    pub mode: Option<String>,
+    /// Whether to enable verification loop
+    pub verify: Option<bool>,
+    /// Maximum retry count
+    pub max_retries: Option<u32>,
+    /// Model routing category
+    pub category: Option<String>,
 }
 
 /// Helper that accepts either one string or a list of strings.
@@ -197,6 +214,10 @@ pub struct CommandSpec {
     pub hooks: Option<Value>,
     /// Optional shell hint preserved for future prompt-shell execution.
     pub shell: Option<String>,
+    /// Natural language triggers for skill activation.
+    pub triggers: Vec<String>,
+    /// Orchestration configuration.
+    pub orchestration: Option<OrchestrationConfig>,
     /// Backing source category.
     pub source: CommandSource,
     /// Backing content loader.
@@ -360,6 +381,8 @@ impl CommandRegistry {
                 paths: Vec::new(),
                 hooks: None,
                 shell: None,
+                triggers: Vec::new(),
+                orchestration: None,
                 source: CommandSource::McpPrompt,
                 content: CommandContent::McpPrompt(prompt),
             });
@@ -372,6 +395,14 @@ impl CommandRegistry {
         items.sort_by(|a, b| a.name.cmp(&b.name));
         items
     }
+
+    /// Return all registered commands with full metadata (for skills browser).
+    pub fn list_full(&self) -> Vec<(&str, &CommandSpec)> {
+        let mut items: Vec<_> = self.by_name.iter().map(|(k, v)| (k.as_str(), v)).collect();
+        items.sort_by(|a, b| a.0.cmp(b.0));
+        items
+    }
+
 
     /// Return model-visible commands in stable order.
     ///
@@ -490,6 +521,15 @@ impl CommandRegistry {
         matches.sort();
         matches
     }
+
+    /// Match user message against skill triggers.
+    /// Returns the first matching skill with triggers.
+    pub fn match_triggers(&self, user_message: &str) -> Option<&CommandSpec> {
+        let lower = user_message.to_lowercase();
+        self.by_name.values().find(|cmd| {
+            !cmd.triggers.is_empty() && cmd.triggers.iter().any(|t| lower.contains(&t.to_lowercase()))
+        })
+    }
 }
 
 /// Load one local or bundled markdown command.
@@ -555,6 +595,11 @@ fn load_markdown_command(
             .unwrap_or_default(),
         hooks: frontmatter.hooks,
         shell: normalize_optional(frontmatter.shell),
+        triggers: frontmatter
+            .triggers
+            .map(StringOrVec::into_vec)
+            .unwrap_or_default(),
+        orchestration: frontmatter.orchestration,
         source,
         content: CommandContent::Markdown {
             root_dir,

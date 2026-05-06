@@ -24,7 +24,7 @@
 //! - If the process crashed in the middle of a tool-calling turn, we truncate
 //!   the incomplete suffix so the restored history is replayable.
 
-use crate::openai::{ChatMessage, ChatUsage, ResponsesInputItem, ToolCall};
+use crate::openai::{ChatMessage, ChatUsage, MessageContent, ResponsesInputItem, ToolCall};
 use anyhow::Context as _;
 use chrono::{DateTime, Utc};
 use fs4::fs_std::FileExt as _;
@@ -206,8 +206,11 @@ struct SessionMessageEntry {
 struct StoredChatMessage {
     /// Message role (`user`, `assistant`, `tool`, ...).
     role: String,
-    /// Optional text content.
-    content: Option<String>,
+    /// Optional text or multimodal content.
+    ///
+    /// Uses `#[serde(untagged)]` via `MessageContent` so that existing on-disk
+    /// sessions containing a plain JSON string deserialise transparently.
+    content: Option<MessageContent>,
     /// Optional assistant tool calls.
     tool_calls: Option<Vec<ToolCall>>,
     /// Tool-result correlation id.
@@ -900,29 +903,112 @@ fn resolve_session_segment_path(
 }
 
 /// Acquire one exclusive lock for the whole persistent session directory.
+///
+/// If the lock is held by a process that is no longer running (stale lock),
+/// the lock file is removed and acquisition is retried once.
 fn acquire_session_store_lock(sessions_dir: &Path) -> anyhow::Result<File> {
     let lock_path = sessions_dir.join(SESSION_STORE_LOCK_FILE_NAME);
+
+    // First attempt: try to acquire the lock normally.
+    match try_lock_file(&lock_path) {
+        Ok(file) => return Ok(file),
+        Err(_) => {}
+    }
+
+    // Lock held — check if it's a stale lock from a dead process.
+    if is_stale_lock(&lock_path) {
+        eprintln!(
+            "Session lock is stale (owner process dead). Removing lock file: {}",
+            lock_path.display()
+        );
+        let _ = fs::remove_file(&lock_path);
+
+        // Retry after removing stale lock.
+        return try_lock_file(&lock_path).with_context(|| {
+            format!(
+                "Failed to acquire session storage lock for {} even after removing stale lock",
+                sessions_dir.display()
+            )
+        });
+    }
+
+    anyhow::bail!(
+        "Another SA backend instance is already using session storage under {}",
+        sessions_dir.display()
+    )
+}
+
+/// Try to open and exclusively lock the lock file, writing the current PID on success.
+fn try_lock_file(lock_path: &Path) -> anyhow::Result<File> {
     let lock_file = OpenOptions::new()
         .create(true)
         .read(true)
         .write(true)
-        .open(&lock_path)
+        .open(lock_path)
         .with_context(|| format!("Failed to open session lock file: {}", lock_path.display()))?;
 
     let acquired = lock_file.try_lock_exclusive().with_context(|| {
         format!(
-            "Failed to acquire session storage lock for {}",
-            sessions_dir.display()
+            "Failed to acquire session storage lock: {}",
+            lock_path.display()
         )
     })?;
     if !acquired {
-        anyhow::bail!(
-            "Another SA backend instance is already using session storage under {}",
-            sessions_dir.display()
-        );
+        anyhow::bail!("Lock not acquired");
+    }
+
+    // Write current PID so future instances can detect stale locks.
+    {
+        let _ = lock_file.set_len(0);
+        let mut writer = std::io::BufWriter::new(&lock_file);
+        let _ = write!(writer, "{}", std::process::id());
+        let _ = writer.flush();
     }
 
     Ok(lock_file)
+}
+
+/// Check if the lock file belongs to a process that is no longer running.
+fn is_stale_lock(lock_path: &Path) -> bool {
+    let Ok(content) = fs::read_to_string(lock_path) else {
+        // Can't read the lock file — treat as stale so we can try removing it.
+        return true;
+    };
+    let pid_str = content.trim();
+    let Ok(pid) = pid_str.parse::<u32>() else {
+        // PID not parseable — treat as stale.
+        return true;
+    };
+
+    is_process_dead(pid)
+}
+
+/// Check if a process with the given PID is no longer running.
+/// Uses OS-specific commands to avoid adding new dependencies.
+fn is_process_dead(pid: u32) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        // `tasklist` returns the PID if it exists, empty otherwise.
+        std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+            .output()
+            .map(|output| {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                // If the process exists, the output contains the PID number.
+                // If not, it says "No tasks are running" or similar.
+                !stdout.contains(&pid.to_string())
+            })
+            .unwrap_or(true) // If we can't check, assume dead to allow recovery.
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        // On Unix, use `kill -0` to check process existence.
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .output()
+            .map(|output| !output.status.success()) // success means process exists
+            .unwrap_or(true)
+    }
 }
 
 /// Reject symbolic links for security-sensitive session metadata paths.

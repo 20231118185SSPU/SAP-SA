@@ -37,9 +37,13 @@ read_when:
 
 在此记录你的环境独有的信息：
 
-- 设备名称、路径别名
-- SSH 主机和配置
-- 任何环境相关的信息
+- **操作系统：** Windows
+- **Rust 工具链：** 已安装
+  - `rustc 1.93.0 (254b59607 2026-01-19)`
+  - `cargo 1.93.0 (083ac5135 2025-12-15)`
+  - 路径：`C:\Users\MoYeR\.cargo\bin\`
+  - rustup toolchain：`C:\Users\MoYeR\.rustup\toolchains\stable-x86_64-pc-windows-msvc\bin\`
+- **设备路径：** `E:\SA\SAP-6.2\sa`（SA 工作区根目录）
 
 ## 为什么要分开？
 

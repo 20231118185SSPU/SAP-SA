@@ -6,7 +6,7 @@
 //! - background terminal jobs also become first-class runtime tasks
 //! - restart recovery is driven from these persisted records
 
-use crate::openai::{ChatMessage, ToolCall};
+use crate::openai::{ChatMessage, MessageContent, ToolCall};
 use crate::skills::ActiveCommandInvocation;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -105,8 +105,8 @@ pub enum PendingFinishMode {
 pub struct PendingAssistantMessage {
     /// Assistant role name.
     pub role: String,
-    /// Optional text content.
-    pub content: Option<String>,
+    /// Optional text or multimodal content.
+    pub content: Option<MessageContent>,
     /// Optional tool calls emitted by the assistant.
     pub tool_calls: Option<Vec<ToolCall>>,
     /// Optional tool-call id for tool-result messages.

@@ -1,0 +1,10 @@
+{
+  "work_id": "3750a743-940c-4058-9d92-a0462f7ad247",
+  "owner_agent_id": "3ab442b5-7b4b-4e42-9bf4-b142ef793940",
+  "root_agent_id": "3ab442b5-7b4b-4e42-9bf4-b142ef793940",
+  "summary": "对了，请你调用记忆功能把今天的对话内容提炼记住有价值的内容把",
+  "status": "finished",
+  "started_at": "2026-05-04T18:34:21.972385Z",
+  "finished_at": "2026-05-05T15:31:57.627531100Z",
+  "result_summary": "已告知用户当前处于Plan模式"
+}

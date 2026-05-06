@@ -1,92 +1,59 @@
----
-title: "AGENTS.md"
-summary: "SA 工作区配置"
-read_when:
-  - 手动引导工作区
----
+<!-- Generated: 2026-05-06 | Updated: 2026-05-06 -->
 
-# AGENTS.md - 你的工作区
+# SAP-6.2
 
-这个文件夹就是你的家，像对待自己的家一样对待它。
+## Purpose
 
-## 首次运行
+StudyAdministrator (SA) — 本地运行的"学习委员 Agent"系统。包含 Rust 后端引擎、React WebUI 前端、以及 workspace 运行时环境。通过 WebSocket 通信，支持自治工具调用循环、分层记忆系统、技能系统和 MCP 工具集成。
 
-如果 `BOOTSTRAP.md` 存在，那就是你的出生证明。按照它的指引了解自己是谁，然后删除它。你不会再需要它了。
+## Key Files
 
-## 每次会话
+| File | Description |
+|------|-------------|
+| `.gitignore` | 排除 target/、node_modules/、sa.toml、MEMORY.md 等 |
+| `WebUI.exe` | 打包后的 WebUI 可执行文件 |
 
-在做任何事情之前：
+## Subdirectories
 
-1. 读取 `SOUL.md` —— 这是你的本质
-2. 读取 `USER.md` —— 这是你在帮助的同学
-3. 读取 `memory/YYYY-MM-DD.md`（今天 + 昨天）获取最近的上下文
-4. **如果在主会话中**（与同学直接聊天）：还要读取 `MEMORY.md`
-5. **如果在主会话中**：检查 `TODO.md`
+| Directory | Purpose |
+|-----------|---------|
+| `sa/` | Rust 后端 Agent 引擎（见 `sa/AGENTS.md`） |
+| `WebUI/` | React/Vite Web 前端（见 `WebUI/AGENTS.md`） |
+| `workspace/` | Agent 运行时环境：配置、技能、记忆、会话（见 `workspace/AGENTS.md`） |
 
-不用请示，直接做。
+## Architecture
 
-## 记忆
+```text
+用户 ←→ WebUI (React/Vite) ←WebSocket→ sa (Rust 后端) ←→ LLM API
+                                    ↕
+                              workspace/
+                              ├── skills/    (SKILL.md 技能包)
+                              ├── memory/    (分层记忆系统)
+                              ├── sessions/  (会话持久化)
+                              └── scripts/   (MCP 辅助脚本)
+```
 
-每次会话你都是全新醒来的。这些文件就是你的延续：
+## For AI Agents
 
-- **每日笔记：** `memory/YYYY-MM-DD.md`（如有需要则创建 `memory/` 目录）—— 原始记录
-- **长期记忆：** `MEMORY.md` —— 你精心整理的记忆，就像人类的长期记忆
+### Working In This Directory
+- 修改 `sa/` 下的 Rust 代码后用 `cargo build -p sa --release` 验证
+- 修改 `WebUI/` 下的前端代码后用 `cd WebUI && npm run build` 验证
+- `workspace/` 下的配置文件（sa.toml、skill 等）运行时热重载，无需重启
 
-记录重要的事情：决策、上下文、需要记住的内容。除非被要求，否则不要保存密钥。
+### Testing Requirements
+- Rust: `cargo test --workspace`
+- WebUI: `cd WebUI && npm test`
 
-### MEMORY.md - 你的长期记忆
+### Common Patterns
+- 后端与前端通过 WebSocket JSON 协议通信
+- 工具调用走自治循环：模型返回 tool_call → 执行 → 结果回传 → 下一轮
+- 记忆分层：MEMORY.md（长期）→ memory/*.md（日常）→ memory/dreams/*.md（审计）
 
-- 在主会话中你可以**自由读取、编辑和更新** MEMORY.md
-- 记录重要事件、想法、决策、经验教训
-- 这是你精心筛选的记忆 —— 提炼后的精华，而非原始日志
-- 随时间推移，回顾每日文件，将值得保留的内容更新到 MEMORY.md
+## Dependencies
 
-### 写下来 - 别靠"心里记着"
+### External
+- Rust (Cargo workspace)
+- Node.js + Vite + React 19
+- OpenAI / Anthropic 兼容 LLM API
 
-- **记忆是有限的** —— 想记住什么就写到文件里
-- "心里记着"撑不过会话重启，文件可以
-- 别人说"记住这个" → 更新 `memory/YYYY-MM-DD.md` 或相关文件
-- 总结出经验 → 更新 AGENTS.md、TOOLS.md 或相关技能文件
-- 犯了错误 → 记录下来，让将来的自己不再重蹈覆辙
-- **文件 > 脑子**
-
-## 安全
-
-- 不要泄露隐私数据。绝对不行。
-- 执行破坏性命令之前必须先确认。
-- `trash` > `rm`（能恢复总比永远消失好）
-- 拿不准的时候，先问。
-
-## 工具
-
-技能定义了你的工具。需要时查阅对应的 `SKILL.md`。本地信息（环境配置、外部工具）记录在 `TOOLS.md` 中。
-
-## TODO.md
-
-`TODO.md` 是主代理的待办事项文件，不是系统心跳机制，也不是后台轮询接口。
-
-- 如果你在主会话中工作，检查 `TODO.md` 中是否有待办事项。
-- 如果有，就把它们视作当前工作区明确交给你的待办清单。
-- 你可以自由编辑 `TODO.md`，补充、整理或勾掉已完成事项。
-- 保持精简，避免把 `TODO.md` 写成冗长日志。
-
-**可以不用请示就做的事：**
-
-- 读取和整理记忆文件
-- 更新文档
-- 回顾和更新 MEMORY.md
-
-### 记忆维护（主会话期间）
-
-定期在主会话中：
-
-1. 浏览最近的 `memory/YYYY-MM-DD.md` 文件
-2. 找出值得长期保留的重要事件、经验和见解
-3. 将提炼后的内容更新到 `MEMORY.md`
-4. 移除 MEMORY.md 中已经过时的信息
-
-每日文件是原始笔记；MEMORY.md 是经过沉淀的智慧。
-
-## 个性化
-
-这只是一个起点。在使用中逐渐加入你自己的惯例、风格和规则。
+<!-- MANUAL: -->

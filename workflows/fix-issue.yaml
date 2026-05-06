@@ -1,0 +1,42 @@
+name: fix-issue
+description: 问题修复工作流：分析→定位→修复→测试→审查
+default_model: deepseek-v4-flash
+nodes:
+  - id: analyze
+    node_type: prompt
+    prompt: "分析以下问题，找出根因：{{issue_description}}"
+    model: deepseek-v4-flash
+    label: 问题分析
+
+  - id: locate
+    node_type: prompt
+    depends_on: [analyze]
+    prompt: "定位需要修改的文件和代码位置"
+    model: deepseek-v4-flash
+    label: 代码定位
+
+  - id: plan-fix
+    node_type: prompt
+    depends_on: [locate]
+    prompt: "制定修复方案，列出需要的改动"
+    model: deepseek-v4-flash
+    label: 修复方案
+
+  - id: implement
+    node_type: prompt
+    depends_on: [plan-fix]
+    prompt: "执行修复代码"
+    model: sensenova-6.7-flash-lite
+    label: 实施修复
+
+  - id: test
+    node_type: bash
+    depends_on: [implement]
+    command: "cargo test --workspace 2>&1 || true"
+    label: 测试验证
+
+  - id: review
+    node_type: approval
+    depends_on: [test]
+    prompt: "请审查修复结果，确认问题已解决"
+    label: 审查确认

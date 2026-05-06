@@ -1,0 +1,80 @@
+[llm]
+base_url = "https://api.deepseek.com"
+api_key = "sk-814ac4dcfd2d4ad1bdf3703cfee3e660"
+model = "deepseek-v4-flash"
+wire_api = "chat_completions"
+auth_style = "bearer"
+
+# 推理强度: none / minimal / low / medium / high / xhigh
+reasoning_effort = "high"
+
+# 采样参数
+temperature = 0.3
+top_p = 0.9
+max_output_tokens = 16384
+
+[server]
+bind = "127.0.0.1:8765"
+ws_path = "/ws"
+
+[workspace]
+root_dir = "."
+agents_md = "Agents.md"
+
+[skills]
+dirs = [
+    'C:\Users\杨先生\.codex\skills',
+    'C:\Users\杨先生\.agents\skills',
+    'E:\SA\SAP-6.2\workspace\skills',
+]
+
+[compaction]
+enabled = true
+trigger_tokens = 180000
+keep_recent_tokens = 8000
+reserve_summary_tokens = 4096
+min_messages_to_compact = 8
+
+[dream]
+enabled = true
+daily_note_lookback_days = 3
+recent_session_segments = 6
+recent_topic_files = 24
+
+[mcp]
+enabled = true
+
+[mcp.fileanalyzer]
+command = 'C:\Users\杨先生\.workbuddy\binaries\python\envs\default\Scripts\python.exe'
+args = ["scripts/mcp_fileanalyzer.py"]
+cwd = 'E:\SA\SAP-6.2\workspace'
+tool_timeout_secs = 60
+
+[mcp.imageproc]
+command = 'C:\Users\杨先生\.workbuddy\binaries\python\envs\default\Scripts\python.exe'
+args = ["scripts/mcp_imageproc.py"]
+cwd = 'E:\SA\SAP-6.2\workspace'
+tool_timeout_secs = 60
+
+[mcp.ocr]
+command = 'C:\Users\杨先生\.workbuddy\binaries\python\envs\default\Scripts\python.exe'
+args = ["scripts/mcp_ocr.py"]
+cwd = 'E:\SA\SAP-6.2\workspace'
+tool_timeout_secs = 120
+
+[permissions]
+mode = "bypass"
+deny_tools = []
+deny_commands = []
+
+[team]
+auto_resume = true
+max_active_agents = 4096
+max_concurrent_model_calls = 8
+
+[cache]
+enabled = true
+model = "v4_flash"
+max_history_size = 1000
+log_stats = true
+cost_tracking = true

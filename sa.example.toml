@@ -108,6 +108,121 @@ recent_session_segments = 6
 # Maximum number of topic memory files (`memory/topics/*.md`) listed in dream context.
 recent_topic_files = 24
 
+[working_memory]
+# Working memory hot buffer 鈥?a short-term structured cache that sits
+# between the agent's in-memory messages and the long-term Markdown files.
+#
+# The buffer has three segments:
+#   hot_buffer  鈥?recent messages with importance scores
+#   pinned_slots 鈥?model-controlled entries that are never evicted
+#   scratchpad  鈥?internal reasoning (discardable)
+
+# Maximum number of messages held in the hot buffer.
+# When exceeded, oldest non-pinned messages are evicted or summarized.
+hot_buffer_max_messages = 12
+
+# Maximum total characters across all hot buffer messages.
+hot_buffer_max_chars = 8000
+
+# Importance score threshold for marking consolidation candidates (0.0 鈥?1.0).
+# Messages scoring above this are flagged for the dream pipeline.
+importance_threshold = 0.6
+
+# Fraction of the oldest hot buffer messages to compress when overflow occurs.
+# e.g. 0.33 = compress the oldest 1/3 into a summary at the buffer head.
+overflow_compress_fraction = 0.33
+
+# Whether overflow summarization is enabled.
+# When disabled, excess messages are simply evicted rather than summarized.
+enable_summarization = true
+
+[working_memory.noise]
+# Noise assessment configuration — measures context window noise to optimize agent efficiency.
+enabled = true
+
+# Threshold for "high noise" warning (0.0-1.0).
+# When noise ratio exceeds this, suggestions are generated.
+high_noise_threshold = 0.4
+
+# Maximum age (in days) before content is considered stale.
+stale_after_days = 7
+
+# Minimum importance score to not be considered noise (0.0-1.0).
+min_importance = 0.3
+
+# Similarity threshold for duplicate detection (0.0-1.0).
+duplicate_similarity = 0.8
+
+[memory_pointer]
+# Memory pointer system — MEMORY.md only stores pointers, actual content in sub-files.
+enabled = true
+
+# Whether to auto-create directory structure for pointer-based memory.
+auto_create_structure = true
+
+# Whether to include pointer summary in prompt injection.
+include_summary = true
+
+# Whether to resolve and include pointer target content.
+resolve_targets = true
+
+[memory_metabolism]
+# Memory metabolism — automatic lifecycle management for memories.
+enabled = true
+
+# Days without access before memory is considered for archival.
+archive_after_days = 30
+
+# Minimum importance score to avoid archival (0.0-1.0).
+min_importance_threshold = 0.3
+
+# Days to keep deprecated memories before hard-delete.
+deprecated_retention_days = 90
+
+# Maximum number of memories to archive per run.
+max_archive_per_run = 10
+
+# Whether to auto-promote frequently accessed memories.
+enable_promotion = true
+
+# Access count threshold for promotion.
+promotion_access_threshold = 10
+
+[timeline_retrieval]
+# Timeline retrieval — time-based memory search and filtering.
+enabled = true
+
+# Maximum number of results per query.
+max_results = 50
+
+# Default date format for parsing.
+date_format = "%Y-%m-%d"
+
+# Whether to include time-of-day in results.
+include_time = false
+
+[skill_metabolism]
+# Skill metabolism — automatic lifecycle management for skills.
+enabled = true
+
+# Minimum usage count to remain active.
+min_usage_threshold = 5
+
+# Days without use before considering elimination.
+inactive_days_threshold = 90
+
+# Similarity threshold for merging (0.0-1.0).
+merge_similarity_threshold = 0.8
+
+# Maximum number of skills to eliminate per run.
+max_eliminations_per_run = 5
+
+# Whether to auto-merge similar skills.
+enable_auto_merge = true
+
+# Whether to auto-eliminate low-frequency skills.
+enable_auto_eliminate = true
+
 [server]
 # Where the daemon listens.
 bind = "127.0.0.1:8765"
@@ -196,3 +311,48 @@ enabled = false
 #
 # Example:
 # - `mcp__filesystem__read_file`
+
+[semantic_memory]
+# Enable the semantic fact table (lightweight knowledge graph).
+# Facts are extracted from daily notes and dream consolidations as
+# (subject, predicate, object, confidence) tuples in SQLite.
+enabled = true
+# SQLite database path (relative to workspace root).
+db_path = "memory/semantic.db"
+# Minimum confidence threshold for a fact to be stored (0.0 鈥?1.0).
+min_confidence = 0.3
+# Daily exponential decay rate for fact confidence (位 in e^(-位路days)).
+# 0.01 鈫?~1% per day; set 0.0 to disable decay.
+decay_rate = 0.01
+
+[procedure]
+# Auto-discovery of procedural skills from repeated tool-call patterns.
+#
+# SA scans `sessions/*.jsonl` after each successful dream run and detects
+# sequences of tool calls (e.g. Read 鈫扙dit 鈫払ash) that appear
+# repeatedly with high success rates.
+#
+# Discovered skills land in `memory/procedures/` as Markdown files.
+
+# Minimum number of occurrences before a sequence becomes a skill (default 5).
+min_occurrences = 5
+# Minimum success rate (0.0 鈥?1.0) for a sequence to qualify (default 0.8).
+min_success_rate = 0.8
+# Shortest tool-call sequence to consider (default 2).
+min_sequence_length = 2
+# Longest tool-call sequence to consider (default 5).
+max_sequence_length = 5
+# Output directory under workspace root (default "memory/procedures").
+output_dir = "memory/procedures"
+
+[field_encryption]
+# Field-level AES-256-GCM encryption for sensitive memory content.
+# When enabled, values marked for encryption are stored as
+# `ENC:<base64(nonce||ciphertext)>` and never written in plaintext.
+#
+# The key can be set here (hex-encoded 64 hex chars) or via the
+# `SA_FIELD_KEY` environment variable.
+enabled = false
+# Hex-encoded 32-byte AES-256 key (64 hex chars).
+# Generate with: openssl rand -hex 32
+master_key_hex = ""

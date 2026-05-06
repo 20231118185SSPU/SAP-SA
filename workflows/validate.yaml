@@ -1,0 +1,32 @@
+name: validate
+description: 代码验证工作流：编译→测试→Lint
+nodes:
+  - id: check
+    node_type: bash
+    command: "cargo check --workspace 2>&1"
+    label: 编译检查
+
+  - id: test
+    node_type: bash
+    depends_on: [check]
+    command: "cargo test --workspace 2>&1"
+    label: 单元测试
+
+  - id: clippy
+    node_type: bash
+    depends_on: [check]
+    command: "cargo clippy --workspace -- -D warnings 2>&1 || true"
+    label: Clippy Lint
+
+  - id: format-check
+    node_type: bash
+    depends_on: [check]
+    command: "cargo fmt --check 2>&1 || true"
+    label: 格式检查
+
+  - id: summary
+    node_type: prompt
+    depends_on: [test, clippy, format-check]
+    trigger_rule: none_failed
+    prompt: "汇总验证结果，输出报告"
+    label: 汇总报告

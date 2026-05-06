@@ -1,0 +1,28 @@
+name: plan-to-pr
+description: 执行已有计划，逐步实现并提交
+default_model: deepseek-v4-flash
+nodes:
+  - id: parse-plan
+    node_type: prompt
+    prompt: "解析以下计划，拆分为可执行的步骤：{{plan_content}}"
+    model: deepseek-v4-flash
+    label: 解析计划
+
+  - id: execute-steps
+    node_type: prompt
+    depends_on: [parse-plan]
+    prompt: "按计划逐步执行每个任务"
+    model: sensenova-6.7-flash-lite
+    label: 逐步执行
+
+  - id: verify
+    node_type: bash
+    depends_on: [execute-steps]
+    command: "cargo check --workspace 2>&1 || true"
+    label: 编译验证
+
+  - id: approve
+    node_type: approval
+    depends_on: [verify]
+    prompt: "计划执行完成，请确认是否提交 PR"
+    label: 审批提交

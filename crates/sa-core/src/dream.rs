@@ -41,7 +41,7 @@ const DREAM_STATE_FILE: &str = "memory/.dream-state.json";
 const DREAM_LOCK_FILE: &str = "memory/.dream.lock";
 
 /// Nightly dream configuration (`[dream]` in `sa.toml`).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DreamConfig {
     /// Master kill-switch.
@@ -399,6 +399,7 @@ impl DreamManager {
 
         out.push_str("### 质量要求\n\n");
         out.push_str("- 不要把一次性任务细节、临时错误日志或短期中间状态直接塞进长期记忆。\n");
+        out.push_str("- **严格排除 agent 自评价**：不要把 agent 对自身能力的评价、自我反思、主观判断写入长期记忆。只记录客观事实和可复用模式。\n");
         out.push_str("- 相对时间要尽量转成绝对日期，避免过几天后无法理解。\n");
         out.push_str("- 长期记忆追求高密度、高稳定性，而不是数量。\n");
         out.push_str(&format!("- 当前本地日期：`{}`\n", now.format("%Y-%m-%d")));

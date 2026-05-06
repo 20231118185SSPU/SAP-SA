@@ -1,0 +1,29 @@
+name: code-review
+description: 代码审查工作流：静态分析→安全检查→质量评估→报告
+default_model: deepseek-v4-flash
+nodes:
+  - id: diff
+    node_type: bash
+    command: "git diff --stat HEAD~1..HEAD 2>/dev/null || echo 'No git history available'"
+    label: 查看变更
+
+  - id: security
+    node_type: prompt
+    depends_on: [diff]
+    prompt: "检查代码变更中的安全漏洞、敏感信息泄露和常见安全问题"
+    model: deepseek-v4-flash
+    label: 安全检查
+
+  - id: quality
+    node_type: prompt
+    depends_on: [diff]
+    prompt: "评估代码质量：可读性、可维护性、错误处理、性能"
+    model: deepseek-v4-flash
+    label: 质量评估
+
+  - id: report
+    node_type: prompt
+    depends_on: [security, quality]
+    prompt: "汇总安全检查和质量评估结果，生成结构化的代码审查报告"
+    model: sensenova-6.7-flash-lite
+    label: 审查报告

@@ -1,0 +1,36 @@
+{
+  "run_id": "9fb2e12e-a20a-44da-adbe-a9e20fc9e0d1",
+  "workflow_name": "rust_project_analysis",
+  "status": "running",
+  "nodes": [
+    {
+      "node_id": "analyze_directory_structure",
+      "status": "running",
+      "output": null,
+      "started_at": "2026-05-05T14:56:55.003507700Z",
+      "completed_at": null,
+      "error": null
+    },
+    {
+      "node_id": "count_rust_files",
+      "status": "running",
+      "output": null,
+      "started_at": "2026-05-05T14:56:55.003553500Z",
+      "completed_at": null,
+      "error": null
+    },
+    {
+      "node_id": "generate_report",
+      "status": "pending",
+      "output": null,
+      "started_at": null,
+      "completed_at": null,
+      "error": null
+    }
+  ],
+  "inputs": {
+    "user_request": "帮我分析当前项目的目录结构，列出所有 Rust 源文件数量，并生成一份简短的项目概览报告"
+  },
+  "created_at": "2026-05-05T14:56:55.003290800Z",
+  "completed_at": null
+}

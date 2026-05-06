@@ -1,0 +1,27 @@
+name: architect
+description: 架构分析工作流：扫描项目结构、依赖关系和模块职责
+default_model: sensenova-6.7-flash-lite
+nodes:
+  - id: scan-structure
+    node_type: bash
+    command: "find . -name '*.rs' -o -name '*.ts' -o -name '*.tsx' | head -100 | sort"
+    label: 扫描文件结构
+
+  - id: analyze-deps
+    node_type: bash
+    depends_on: [scan-structure]
+    command: "cat Cargo.toml 2>/dev/null; echo '---'; cat WebUI/package.json 2>/dev/null"
+    label: 分析依赖
+
+  - id: architecture-report
+    node_type: prompt
+    depends_on: [analyze-deps]
+    prompt: "基于扫描结果，生成架构分析报告，包含模块职责、依赖关系和改进建议"
+    model: deepseek-v4-flash
+    label: 架构报告
+
+  - id: review
+    node_type: approval
+    depends_on: [architecture-report]
+    prompt: "架构分析完成，请审阅报告"
+    label: 审阅报告

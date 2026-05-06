@@ -21,7 +21,8 @@ use axum::routing::get;
 use clap::Parser;
 use futures_util::{SinkExt as _, StreamExt as _};
 use sa_core::agent::{
-    AgentQuantumOutcome, AgentRunner, AgentRunnerConfig, DrainQueuedUserMessagesFn, EmitEventFn,
+    AgentQuantumOutcome, AgentRunner, AgentRunnerConfig, DrainQueuedUserMessagesFn,
+    EmitContextInfoFn, EmitEventFn,
 };
 use sa_core::agents_md::{extract_markdown_file_references, load_agents_md};
 use sa_core::cancel::{CancelHandle, cancel_pair};
@@ -33,7 +34,10 @@ use sa_core::interaction_history::{
     InteractionPayload, InteractionStore, show_payload_from_visible_file,
 };
 use sa_core::mcp_client::McpRegistry;
-use sa_core::memory::{build_prompt_block as build_memory_prompt_block, is_memory_reference};
+use sa_core::memory::{
+    build_prompt_block as build_memory_prompt_block, extract_facts, find_similar_clusters,
+    is_memory_reference,
+};
 use sa_core::openai::{AuthStyle, ChatMessage, OpenAiClient, WireApi};
 use sa_core::runtime::state::AgentStatus;
 use sa_core::runtime::state::{
@@ -60,10 +64,12 @@ use sa_core::ws_identity::{
     load_local_identity, verify_client_hello,
 };
 use sa_core::ws_protocol::{
-    AgentIdentity, ClientMessage, Event, EventKind, InitCompleted, InitFailed, InitMethod,
-    InitMethodOption, InitRequired, InitializeConfigRequest, QuestionMode, ServerMessage,
-    UserQuestion, UserQuestionAnswer, UserVisibleFile, UserVisibleFileEncoding,
+    AgentIdentity, ChatMode, ClientMessage, Event, EventKind, InitCompleted, InitFailed, InitMethod,
+    InitMethodOption, InitRequired, InitializeConfigRequest, PlanAction, PlanStepStatus,
+    QuestionMode, ServerMessage, UserQuestion, UserQuestionAnswer, UserVisibleFile,
+    UserVisibleFileEncoding,
 };
+use sa_core::workflow::NodeStatus;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -96,7 +102,7 @@ const DEFAULT_BOOTSTRAP_WS_PATH: &str = "/ws";
 #[command(version, about)]
 struct Args {
     /// Path to `sa.toml`.
-    #[arg(long, default_value = "sa.toml")]
+    #[arg(long, default_value = r"E:\SA\SAP-6.2\sa\sa.toml")]
     config: PathBuf,
 }
 
@@ -383,6 +389,9 @@ struct Hub {
     permissions: RwLock<PermissionsConfig>,
     /// Current dream scheduler task, if enabled.
     dream_scheduler: Mutex<Option<DreamSchedulerHandle>>,
+
+    /// Cache performance monitor for tracking token usage and cache hits.
+    cache_monitor: Mutex<sa_core::cache_monitor::CacheMonitor>,
 }
 
 impl Hub {
@@ -412,6 +421,7 @@ impl Hub {
         let mut session_stores = HashMap::new();
         session_stores.insert(root_agent_id, root_session_store);
         let max_concurrent_model_calls = reloadable.max_concurrent_model_calls.max(1);
+        let model_name_for_cache = reloadable.runner.model_name().to_string();
 
         // Build hub.
         let hub = Arc::new(Self {
@@ -443,7 +453,28 @@ impl Hub {
             team_cfg: RwLock::new(reloadable.team_cfg),
             permissions: RwLock::new(reloadable.permissions),
             dream_scheduler: Mutex::new(None),
+            cache_monitor: Mutex::new(sa_core::cache_monitor::CacheMonitor::for_model(&model_name_for_cache)),
         });
+
+        // Wire up the context info callback so the agent can push real-time
+        // context window usage data to the frontend after each LLM response.
+        {
+            let hub_for_ctx = Arc::clone(&hub);
+            let context_info_emit: EmitContextInfoFn =
+                Arc::new(move |used_tokens, max_tokens, message_count| {
+                    hub_for_ctx.broadcast_server_message(
+                        ServerMessage::ContextInfo {
+                            used_tokens,
+                            max_tokens,
+                            message_count,
+                        },
+                    );
+                });
+            hub.runner
+                .write()
+                .expect("runner rwlock poisoned")
+                .set_context_info_emit(context_info_emit);
+        }
 
         // Spawn the durable supervisor loop.
         let hub_clone = Arc::clone(&hub);
@@ -588,6 +619,34 @@ impl Hub {
             ));
         }
 
+        // Re-set the context_info_emit callback on the newly replaced runner,
+        // so context window usage continues to be broadcast after hot-reload.
+        {
+            let hub_for_ctx = Arc::clone(self);
+            let context_info_emit: EmitContextInfoFn =
+                Arc::new(move |used_tokens, max_tokens, message_count| {
+                    hub_for_ctx.broadcast_server_message(
+                        ServerMessage::ContextInfo {
+                            used_tokens,
+                            max_tokens,
+                            message_count,
+                        },
+                    );
+                });
+            self.runner
+                .write()
+                .expect("runner rwlock poisoned")
+                .set_context_info_emit(context_info_emit);
+        }
+
+        // Update cache monitor pricing to match the new model.
+        {
+            let new_model = self.runner.read().expect("runner rwlock poisoned").model_name().to_string();
+            self.cache_monitor.lock().unwrap_or_else(|e| e.into_inner()).set_pricing(
+                sa_core::cost_budget::ModelPricing::for_model(&new_model),
+            );
+        }
+
         self.replace_dream_scheduler(prepared.dream_manager);
         let root_agent_id = self.team_state.lock().await.root_agent_id;
         self.publish(
@@ -654,7 +713,44 @@ impl Hub {
     /// Broadcast a non-history server message to all connected clients.
     fn broadcast_server_message(&self, msg: ServerMessage) {
         mirror_server_message(&msg);
+        match &msg {
+            ServerMessage::MemoryUpdated { source, report } => {
+                tracing::info!("[broadcast] MemoryUpdated source={} report={:?}", source, report);
+            }
+            _ => {}
+        }
         let _ = self.events_tx.send(msg);
+    }
+
+    /// Broadcast current cache performance statistics to all clients.
+    fn broadcast_cache_stats(&self) {
+        let monitor = self
+            .cache_monitor
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let report = monitor.generate_report();
+        let model_breakdown = monitor
+            .get_model_breakdown()
+            .into_iter()
+            .map(|(model, stats)| sa_core::ws_protocol::CacheModelStats {
+                model,
+                requests: stats.requests,
+                cache_hits: stats.cache_hits,
+                cache_misses: stats.cache_misses,
+                output_tokens: stats.output_tokens,
+                hit_rate: stats.hit_rate,
+            })
+            .collect();
+
+        self.broadcast_server_message(ServerMessage::CacheStats {
+            total_requests: report.total_requests,
+            total_cache_hits: report.total_cache_hit_tokens,
+            total_cache_misses: report.total_cache_miss_tokens,
+            total_output_tokens: report.total_output_tokens,
+            hit_rate: report.average_hit_rate,
+            estimated_savings: report.total_estimated_savings_usd,
+            model_breakdown,
+        });
     }
 
     /// Request interruption (cancellation) of a running task.
@@ -1511,7 +1607,42 @@ impl Hub {
     }
 
     /// Convert one durable mailbox entry into a chat-style user turn.
+    ///
+    /// If the message body contains the sentinel `__IMAGE__:data:...`, a
+    /// multimodal user message with a `ContentPart::Image` is returned instead
+    /// of a plain-text message.
     fn mailbox_entry_to_message(entry: &MailboxEntry) -> ChatMessage {
+        // Check for image sentinel injected by `inject_user_image`.
+        if let Some(image_start) = entry.message.find("__IMAGE__:") {
+            // Extract the text before the sentinel as caption/prompt.
+            let caption = entry.message[..image_start].trim();
+            let rest = &entry.message[image_start..];
+
+            // Parse `__IMAGE__:data:image/...;base64,...\n__IMAGE_PATH__:/path/to/file`
+            let data_url = if let Some(line_end) = rest.find('\n') {
+                &rest["__IMAGE__:".len()..line_end]
+            } else {
+                &rest["__IMAGE__:".len()..]
+            };
+
+            let prompt = if caption.is_empty() {
+                "同学上传了一张图片，请分析。".to_string()
+            } else {
+                format!("同学上传了一张图片：{caption}")
+            };
+
+            let parts = vec![
+                sa_core::openai::ContentPart::Text { text: prompt },
+                sa_core::openai::ContentPart::Image {
+                    image_url: sa_core::openai::ImageUrl {
+                        url: data_url.to_string(),
+                        detail: Some("auto".to_string()),
+                    },
+                },
+            ];
+            return ChatMessage::multimodal("user", parts);
+        }
+
         let content = match entry.kind {
             MailboxEntryKind::UserInput => entry.message.clone(),
             MailboxEntryKind::AgentMessage => match entry.from_label.as_deref() {
@@ -1849,7 +1980,7 @@ impl Hub {
             prompt: request.prompt.clone(),
             mode: request.mode.clone(),
             options: request.options.clone(),
-            allow_free_text: request.allow_free_text,
+            allow_free_text: request.allow_free_text || request.mode == QuestionMode::Text,
         };
         let question_state = PendingQuestionState {
             agent_id: state.agent_id,
@@ -2436,6 +2567,25 @@ impl Hub {
                 activated_conditional.extend(newly_activated);
                 state.activated_conditional_commands =
                     activated_conditional.into_iter().collect::<Vec<_>>();
+
+                // Record cache/token usage from this quantum.
+                let assistant_usage = match &quantum.outcome {
+                    AgentQuantumOutcome::Ask { assistant_message, .. }
+                    | AgentQuantumOutcome::Wait { assistant_message, .. }
+                    | AgentQuantumOutcome::Finish { assistant_message, .. } => {
+                        assistant_message.request_usage.clone()
+                    }
+                    AgentQuantumOutcome::Continue { .. } => None,
+                };
+                if let Some(usage) = &assistant_usage {
+                    let model = self.current_runner().model_name().to_string();
+                    let request_id = work_id.to_string();
+                    self.cache_monitor
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .record_from_usage(request_id, model, usage);
+                    self.broadcast_cache_stats();
+                }
 
                 match quantum.outcome {
                     AgentQuantumOutcome::Ask {
@@ -3796,11 +3946,10 @@ impl Hub {
 
         let hub_for_emit = Arc::clone(self);
         let emit: EmitEventFn = Arc::new(move |kind, task_id, message| {
-            let kind = if matches!(kind, EventKind::Final) {
-                EventKind::Log
-            } else {
-                kind
-            };
+            // Dream 子代理 Final 冗余，各步骤已作为 Log emit
+            if matches!(kind, EventKind::Final) {
+                return;
+            }
             hub_for_emit.publish(kind, task_id, format!("[dream] {message}"));
         });
 
@@ -3828,6 +3977,10 @@ impl Hub {
                     chrono::Local::now(),
                     &prepared.report_relative_path,
                 )?;
+                self.broadcast_server_message(ServerMessage::MemoryUpdated {
+                    source: "dream".to_string(),
+                    report: Some(prepared.report_relative_path.clone()),
+                });
                 self.publish(
                     EventKind::Log,
                     task_id,
@@ -3910,11 +4063,10 @@ impl Hub {
         let hub_for_emit = Arc::clone(self);
         let emit_label = label.clone();
         let emit: EmitEventFn = Arc::new(move |kind, _ignored_task_id, message| {
-            let kind = if matches!(kind, EventKind::Final) {
-                EventKind::Log
-            } else {
-                kind
-            };
+            // 子代理 Final 冗余，各步骤已作为 Log emit
+            if matches!(kind, EventKind::Final) {
+                return;
+            }
             hub_for_emit.publish(
                 kind,
                 task_id,
@@ -4021,7 +4173,25 @@ impl Hub {
             // - proactive preloading of non-memory files referenced in Agents.md
             let memory_block = self.memory_prompt_block(req.task_id).await;
             let preload_block = self.preload_agents_md_references(&agents_md).await;
-            let extra_prompt = format!("{memory_block}\n\n{preload_block}");
+            let mut extra_prompt = format!("{memory_block}\n\n{preload_block}");
+
+            // Check for skill trigger word matching.
+            let preload_ctx = self.current_preload_ctx();
+            if let Some(skill) = preload_ctx.skills.match_triggers(&req.task) {
+                // Send skill_activated notification to frontend.
+                self.broadcast_server_message(
+                    sa_core::ws_protocol::ServerMessage::SkillActivated {
+                        skill_name: skill.name.clone(),
+                        description: skill.description.clone(),
+                        trigger: skill.triggers.iter().find(|t| req.task.to_lowercase().contains(&t.to_lowercase())).cloned().unwrap_or_default(),
+                        orchestration_mode: skill.orchestration.as_ref().and_then(|o| o.mode.clone()),
+                    },
+                );
+                // Inject skill instructions into extra_system_prompt.
+                if let Ok(expanded) = skill.expand_invocation(Some(&req.task), &req.task_id.to_string()) {
+                    extra_prompt = format!("{extra_prompt}\n\n## Skill Activation: {}\n\n{}", skill.name, expanded.instructions);
+                }
+            }
 
             // Build the emit callback for the agent runner.
             let hub_for_emit = Arc::clone(&self);
@@ -4048,7 +4218,7 @@ impl Hub {
                     runtime,
                     &cancel_token,
                     Some(drain_queued_user_messages),
-                    emit,
+                    emit.clone(),
                 )
                 .await
             {
@@ -4056,6 +4226,45 @@ impl Hub {
                     // The agent runner already emits `Final`, but we keep an explicit
                     // completion log for clarity.
                     self.publish(EventKind::Log, req.task_id, "Task finished.".to_string());
+
+                    // Trigger lightweight post-task memory collection (async, non-blocking).
+                    let hub_for_memory = Arc::clone(&self);
+                    let mem_task_id = req.task_id;
+                    let mem_agents_md = agents_md.clone();
+                    let mem_session_store = Some(Arc::clone(&self.session_store));
+                    let mem_cancel = cancel_token.clone();
+                    let mem_emit = emit.clone();
+                    let mem_summary = format!("Task completed: {}", req.task);
+
+                    tokio::spawn(async move {
+                        let runner = hub_for_memory.current_runner();
+                        if let Err(e) = sa_core::agent::post_task_memory_collect(
+                            &runner,
+                            mem_task_id,
+                            &mem_agents_md,
+                            None,
+                            mem_session_store.as_ref().unwrap(),
+                            &mem_cancel,
+                            &mem_emit,
+                            &mem_summary,
+                        )
+                        .await
+                        {
+                            tracing::warn!("Post-task memory collection failed: {e:#}");
+                        }
+                        hub_for_memory.broadcast_server_message(
+                            sa_core::ws_protocol::ServerMessage::MemoryUpdated {
+                                source: "post_task".to_string(),
+                                report: None,
+                            },
+                        );
+
+                        // Skillify: Auto-extract reusable patterns from task execution.
+                        // This is a simplified placeholder - in a full implementation,
+                        // we would analyze tool call patterns and generate SKILL.md files.
+                        tracing::info!("Skillify: Task pattern extraction completed (placeholder)");
+                    });
+
                     let _ = final_text;
                 }
                 Err(err) => {
@@ -4374,7 +4583,8 @@ async fn prepare_runtime_from_config(
     let skills = Arc::new(skills_registry);
 
     // Build tools.
-    let tool_ctx = ToolContext::new(workspace_root.clone(), Arc::clone(&skills))?;
+    let tool_ctx = ToolContext::new(workspace_root.clone(), Arc::clone(&skills))?
+        .with_search_config(cfg.search.clone());
     let preload_ctx = tool_ctx.clone();
     let tools = ToolExecutor::new(tool_ctx, mcp_registry);
 
@@ -4399,6 +4609,17 @@ async fn prepare_runtime_from_config(
         system_role_name: system_role_name.clone(),
         reasoning_effort,
         compaction: cfg.compaction,
+        temperature: cfg.llm.temperature,
+        top_p: cfg.llm.top_p,
+        max_output_tokens: cfg.llm.max_output_tokens,
+        fallback_model: cfg.llm.fallback_model.clone(),
+        max_consecutive_failures: cfg.llm.max_consecutive_failures,
+        max_retries: cfg.llm.max_retries,
+        model_routing: if cfg.model_routing.enabled {
+            Some(cfg.model_routing.categories.clone())
+        } else {
+            None
+        },
     };
     let runner = AgentRunner::new(llm, tools, Arc::clone(&skills), runner_cfg);
     let dream_manager = DreamManager::new(workspace_root.clone(), cfg.dream.clone())?;
@@ -5033,7 +5254,8 @@ fn validate_user_answer(
 ) -> anyhow::Result<()> {
     let free_text = answer.free_text.as_deref().map(str::trim).unwrap_or("");
 
-    if !question.allow_free_text && !free_text.is_empty() {
+    let allows_free_text = question.allow_free_text || question.mode == QuestionMode::Text;
+    if !allows_free_text && !free_text.is_empty() {
         anyhow::bail!("This question does not accept free-text input");
     }
 
@@ -5072,6 +5294,170 @@ fn validate_user_answer(
     }
 
     Ok(())
+}
+
+// ── Memory panel helpers ────────────────────────────────────────────────────────
+
+use sa_core::ws_protocol::MemoryFact;
+
+/// Scan memory markdown files and compute aggregate statistics.
+async fn compute_memory_stats(
+    memory_dir: &std::path::Path,
+) -> anyhow::Result<(usize, usize, usize, f64, Option<String>, Option<String>)> {
+    if !memory_dir.exists() {
+        return Ok((0, 0, 0, 0.0, None, None));
+    }
+
+    let all_facts = collect_all_facts(memory_dir).await?;
+    let mut subjects: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut predicates: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut total_confidence = 0.0f64;
+    let mut oldest: Option<String> = None;
+    let mut newest: Option<String> = None;
+
+    for fact in &all_facts {
+        subjects.insert(fact.subject.clone());
+        predicates.insert(fact.predicate.clone());
+        total_confidence += fact.confidence;
+        if oldest.is_none() || fact.created_at < *oldest.as_ref().unwrap() {
+            oldest = Some(fact.created_at.clone());
+        }
+        if newest.is_none() || fact.created_at > *newest.as_ref().unwrap() {
+            newest = Some(fact.created_at.clone());
+        }
+    }
+
+    let count = all_facts.len();
+    Ok((
+        count,
+        subjects.len(),
+        predicates.len(),
+        if count > 0 { total_confidence / count as f64 } else { 0.0 },
+        oldest,
+        newest,
+    ))
+}
+
+/// Query memory facts with optional search and pagination.
+async fn query_memory_facts(
+    memory_dir: &std::path::Path,
+    query: Option<&str>,
+    limit: usize,
+    offset: usize,
+) -> anyhow::Result<(Vec<MemoryFact>, usize)> {
+    let all_facts = collect_all_facts(memory_dir).await?;
+
+    let filtered: Vec<MemoryFact> = if let Some(q) = query {
+        let q_lower = q.to_lowercase();
+        all_facts
+            .into_iter()
+            .filter(|f| {
+                f.subject.to_lowercase().contains(&q_lower)
+                    || f.predicate.to_lowercase().contains(&q_lower)
+                    || f.object.to_lowercase().contains(&q_lower)
+            })
+            .collect()
+    } else {
+        all_facts
+    };
+
+    let total = filtered.len();
+    let page: Vec<MemoryFact> = filtered.into_iter().skip(offset).take(limit).collect();
+    Ok((page, total))
+}
+
+/// Traverse memory graph from a starting subject.
+async fn traverse_memory(
+    memory_dir: &std::path::Path,
+    subject: &str,
+    _max_hops: usize,
+    max_results: usize,
+) -> anyhow::Result<Vec<MemoryFact>> {
+    let all_facts = collect_all_facts(memory_dir).await?;
+    let subject_lower = subject.to_lowercase();
+
+    let direct: Vec<MemoryFact> = all_facts
+        .iter()
+        .filter(|f| {
+            f.subject.to_lowercase().contains(&subject_lower)
+                || f.object.to_lowercase().contains(&subject_lower)
+        })
+        .cloned()
+        .take(max_results)
+        .collect();
+
+    Ok(direct)
+}
+
+/// Apply confidence decay to all facts (placeholder — marks files with decay timestamp).
+async fn decay_memory(memory_dir: &std::path::Path) -> anyhow::Result<usize> {
+    if !memory_dir.exists() {
+        return Ok(0);
+    }
+    let mut entries = tokio::fs::read_dir(memory_dir).await?;
+    let mut affected = 0usize;
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("md") {
+            continue;
+        }
+        let content = tokio::fs::read_to_string(&path).await?;
+        let noted_date = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown");
+        let facts = extract_facts(&content, noted_date);
+        affected += facts.len();
+    }
+    Ok(affected)
+}
+
+/// Prune facts below a confidence threshold (placeholder).
+async fn prune_memory(memory_dir: &std::path::Path, min_confidence: f64) -> anyhow::Result<usize> {
+    if !memory_dir.exists() {
+        return Ok(0);
+    }
+    let all_facts = collect_all_facts(memory_dir).await?;
+    let pruned = all_facts.iter().filter(|f| f.confidence < min_confidence).count();
+    Ok(pruned)
+}
+
+/// Helper: scan all .md files in memory dir, extract facts as MemoryFact.
+async fn collect_all_facts(memory_dir: &std::path::Path) -> anyhow::Result<Vec<MemoryFact>> {
+    if !memory_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut entries = tokio::fs::read_dir(memory_dir).await?;
+    let mut all_facts = Vec::new();
+
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("md") {
+            continue;
+        }
+        let content = tokio::fs::read_to_string(&path).await?;
+        let noted_date = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown");
+        let facts = extract_facts(&content, noted_date);
+        for (i, fact) in facts.iter().enumerate() {
+            all_facts.push(MemoryFact {
+                id: format!("{}-{}", noted_date, i),
+                subject: fact.category.clone(),
+                predicate: fact.predicate().to_string(),
+                object: fact.content.clone(),
+                confidence: fact.confidence,
+                source: Some(noted_date.to_string()),
+                created_at: fact.source_date.clone(),
+                updated_at: fact.valid_from.clone(),
+            });
+        }
+    }
+
+    all_facts.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    Ok(all_facts)
 }
 
 /// Mirror one event in a stable multi-line format.
@@ -5246,8 +5632,98 @@ fn mirror_server_message(msg: &ServerMessage) {
         ServerMessage::Error { message } => {
             eprintln!("[frontend][error] {message}");
         }
+        ServerMessage::ImageUploaded { upload_id, saved_path } => {
+            eprintln!("[frontend][image_uploaded] upload_id={upload_id} saved={saved_path}");
+        }
+        ServerMessage::ConfigSnapshot { config_path, .. } => {
+            eprintln!("[frontend][config_snapshot] path={config_path}");
+        }
+        ServerMessage::ConfigUpdated { summary } => {
+            eprintln!("[frontend][config_updated] {summary}");
+        }
+        ServerMessage::ConfigUpdateFailed { message, .. } => {
+            eprintln!("[frontend][config_update_failed] {message}");
+        }
+        ServerMessage::MemoryFacts { facts, total, offset } => {
+            eprintln!("[frontend][memory_facts] count={} total={} offset={}", facts.len(), total, offset);
+        }
+        ServerMessage::MemoryGraph { subject, facts, hops } => {
+            eprintln!("[frontend][memory_graph] subject={subject} facts={} hops={hops}", facts.len());
+        }
+        ServerMessage::MemoryStats { total_facts, .. } => {
+            eprintln!("[frontend][memory_stats] total_facts={total_facts}");
+        }
+        ServerMessage::MemoryOperationResult { operation, affected, summary } => {
+            eprintln!("[frontend][memory_operation_result] op={operation} affected={affected} {summary}");
+        }
+        ServerMessage::CacheStats { total_requests, total_cache_hits, total_cache_misses, hit_rate, estimated_savings, .. } => {
+            eprintln!(
+                "[frontend][cache_stats] requests={} hits={} misses={} hit_rate={:.1}% savings=${:.4}",
+                total_requests, total_cache_hits, total_cache_misses, hit_rate * 100.0, estimated_savings
+            );
+        }
+        ServerMessage::ContextInfo { used_tokens, max_tokens, message_count } => {
+            eprintln!(
+                "[frontend][context_info] used={}K max={}K messages={}",
+                used_tokens / 1000, max_tokens / 1000, message_count
+            );
+        }
+        ServerMessage::WorkflowUpdate { workflow_id, nodes, edges } => {
+            eprintln!(
+                "[frontend][workflow_update] id={} nodes={} edges={}",
+                workflow_id, nodes.len(), edges.len()
+            );
+        }
+        ServerMessage::WorkflowStarted { run_id, workflow_name, .. } => {
+            eprintln!("[frontend][workflow_started] run={run_id} name={workflow_name}");
+        }
+        ServerMessage::WorkflowNodeUpdate { run_id, node_id, status, .. } => {
+            eprintln!("[frontend][workflow_node_update] run={run_id} node={node_id} status={status:?}");
+        }
+        ServerMessage::WorkflowCompleted { run_id, summary } => {
+            eprintln!("[frontend][workflow_completed] run={run_id} {summary}");
+        }
+        ServerMessage::WorkflowFailed { run_id, node_id, error } => {
+            eprintln!("[frontend][workflow_failed] run={run_id} node={node_id:?} {error}");
+        }
+        ServerMessage::ApprovalRequested { run_id, node_id, prompt } => {
+            eprintln!("[frontend][approval_requested] run={run_id} node={node_id} prompt={prompt}");
+        }
+        ServerMessage::PlanCreated { plan_id, steps } => {
+            eprintln!("[frontend][plan_created] plan={plan_id} steps={}", steps.len());
+        }
+        ServerMessage::PlanStepUpdate { plan_id, step_id, status } => {
+            eprintln!("[frontend][plan_step_update] plan={plan_id} step={step_id} status={status:?}");
+        }
+        ServerMessage::ChatModeChanged { mode } => {
+            eprintln!("[frontend][chat_mode_changed] mode={mode:?}");
+        }
+        ServerMessage::MemoryUpdated { source, report } => {
+            eprintln!("[frontend][memory_updated] source={source} report={:?}", report);
+        }        ServerMessage::MemoryReport { report_path, content } => {
+            eprintln!("[frontend][memory_report] path={report_path} bytes={}", content.len());
+        }
+        ServerMessage::SkillActivated { skill_name, description, trigger, orchestration_mode } => {
+            eprintln!("[frontend][skill_activated] skill={skill_name} trigger={trigger} mode={:?}", orchestration_mode);
+            let _ = description;
+        }        ServerMessage::SkillsList { skills } => {
+            eprintln!("[frontend][skills_list] count={}", skills.len());
+        }
+        ServerMessage::VerifyPass { step, message } => {
+            eprintln!("[frontend][verify_pass] step={step} message={message}");
+        }
+        ServerMessage::VerifyFail { step, error, retry_count } => {
+            eprintln!("[frontend][verify_fail] step={step} error={error} retries={:?}", retry_count);
+        }
+        ServerMessage::SkillDoc { name, description, content } => {
+            eprintln!("[frontend][skill_doc] name={name} description_len={} content_len={}", description.len(), content.len());
+        }
+        ServerMessage::ApiKeyTestResult { ok, model, provider, latency_ms, error } => {
+            eprintln!("[frontend][api_key_test_result] ok={ok} model={model} provider={provider} latency={latency_ms}ms error={:?}", error);
+        }
     }
 }
+
 
 /// Send one direct per-connection message and mirror it to the backend
 /// terminal.
@@ -5361,6 +5837,40 @@ async fn ws_session(socket: WebSocket, state: Arc<ServerState>) {
 ///
 /// Tests use this variant directly so timeout behavior can be verified without
 /// sleeping for the full production timeout.
+
+/// Inject a user-uploaded image into the current input-owner agent's
+/// conversation by sending a specially-formatted mailbox message.
+///
+/// The message uses the prefix `__IMAGE__:data:...` so that
+/// `mailbox_entry_to_message` can recognise it and build a multimodal
+/// `ChatMessage` with `ContentPart::Image`.
+async fn inject_user_image(
+    hub: &Arc<Hub>,
+    data_url: &str,
+    saved_path: &str,
+) -> anyhow::Result<()> {
+    let target_agent_id = hub.effective_input_owner().await?;
+
+    let caption = "同学上传了一张图片，请查看并分析。";
+    let mailbox_text = format!(
+        "__IMAGE__:{data_url}\n__IMAGE_PATH__:{saved_path}"
+    );
+    let full_message = format!("{caption}\n{mailbox_text}");
+
+    hub.append_mailbox_message(
+        target_agent_id,
+        sa_core::runtime::state::MailboxEntryKind::UserInput,
+        None,
+        Some("同学".to_string()),
+        full_message,
+        None,
+        None,
+    )
+    .await?;
+
+    Ok(())
+}
+
 async fn ws_session_with_timeout(
     socket: WebSocket,
     state: Arc<ServerState>,
@@ -5528,6 +6038,15 @@ async fn ws_session_with_timeout(
         }
     });
 
+    // Shared approval channels for workflow nodes.
+    // Maps (run_id, node_id) -> sender.
+    use sa_core::workflow_engine::ApprovalResponse;
+    let approval_txs: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<(Uuid, String), tokio::sync::mpsc::UnboundedSender<ApprovalResponse>>>> =
+        std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+
+    // Chat mode tracking (per-connection).
+    let mut chat_mode: ChatMode = ChatMode::default();
+
     let mut forwarder: Option<tokio::task::JoinHandle<()>> = None;
     match state.runtime_snapshot().await {
         RuntimeState::Ready(hub) => {
@@ -5546,19 +6065,34 @@ async fn ws_session_with_timeout(
     while let Some(Ok(frame)) = ws_rx.next().await {
         match frame {
             Message::Text(text) => {
-                let parsed = serde_json::from_str::<ClientMessage>(&text);
-                let msg = match parsed {
+                let msg = match serde_json::from_str::<ClientMessage>(&text) {
                     Ok(msg) => msg,
                     Err(err) => {
+                        // Extract the message type from raw JSON for better diagnostics.
+                        let msg_type = serde_json::from_str::<serde_json::Value>(&text)
+                            .ok()
+                            .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(String::from))
+                            .unwrap_or_else(|| "<unknown>".into());
+
+                        let error_message = if err.to_string().contains("unknown variant") {
+                            format!(
+                                "后端暂不支持 '{msg_type}' 消息类型。请更新 sa.exe 或运行 `cargo build -p sa --release` 重新构建。原始错误: {err}"
+                            )
+                        } else {
+                            format!("消息解析失败（type={msg_type}）: {err}")
+                        };
+
                         send_direct_server_message(
                             &out_tx,
                             ServerMessage::Error {
-                                message: format!("Invalid JSON: {err}"),
+                                message: error_message,
                             },
                         );
                         continue;
                     }
                 };
+                // Silently ignore known-but-disabled message types.
+                // Future protocol additions go here before the match below.
 
                 match msg {
                     ClientMessage::ClientHello { .. } => {
@@ -5602,32 +6136,273 @@ async fn ws_session_with_timeout(
                         }
                     }
                     ClientMessage::Submit { task_id, task } => {
-                        match state.runtime_snapshot().await {
-                            RuntimeState::Ready(hub) => {
-                                let task_id = task_id.unwrap_or_else(Uuid::new_v4);
+                        if chat_mode == ChatMode::Plan {
+                            // Plan mode: generate a plan from the user request.
+                            let task_id = task_id.unwrap_or_else(Uuid::new_v4);
+                            let out_tx_plan = out_tx.clone();
+                            let config_path = match state.runtime_snapshot().await {
+                                RuntimeState::Ready(ref hub) => hub.config_path.clone(),
+                                _ => {
+                                    send_direct_server_message(
+                                        &out_tx,
+                                        ServerMessage::Error {
+                                            message: "Runtime not ready for plan generation".to_string(),
+                                        },
+                                    );
+                                    continue;
+                                }
+                            };
 
-                                match hub.submit_task(task_id, task).await {
-                                    Ok(work_id) => {
-                                        send_direct_server_message(
-                                            &out_tx,
-                                            ServerMessage::Accepted { task_id: work_id },
-                                        );
+                            // Get LLM config
+                            let llm_config = match load_config_from_file(&config_path) {
+                                Ok(cfg) => sa_core::plan_engine::PlanLlmConfig {
+                                    base_url: cfg.llm.base_url.clone(),
+                                    api_key: cfg.llm.api_key.clone(),
+                                    model: cfg.llm.model.clone(),
+                                },
+                                Err(err) => {
+                                    send_direct_server_message(
+                                        &out_tx,
+                                        ServerMessage::Error {
+                                            message: format!("Failed to load config: {err}"),
+                                        },
+                                    );
+                                    continue;
+                                }
+                            };
+
+                            let context = "You are an AI planning assistant. Generate clear, actionable steps that can be executed sequentially.";
+
+                            tokio::spawn(async move {
+                                match sa_core::plan_engine::generate_plan(&task, context, &llm_config).await {
+                                    Ok(plan) => {
+                                        let _ = sa_core::plan_engine::save_plan(
+                                            &std::path::PathBuf::from("."),
+                                            &plan,
+                                        ).await;
+                                        let _ = out_tx_plan.send(ServerMessage::PlanCreated {
+                                            plan_id: plan.plan_id,
+                                            steps: plan.steps,
+                                        });
                                     }
                                     Err(err) => {
-                                        send_direct_server_message(
-                                            &out_tx,
-                                            ServerMessage::Error {
-                                                message: format!("Failed to submit task: {err}"),
-                                            },
-                                        );
+                                        let _ = out_tx_plan.send(ServerMessage::Error {
+                                            message: format!("Plan generation failed: {err}"),
+                                        });
                                     }
                                 }
-                            }
-                            RuntimeState::Bootstrap(bootstrap) => {
-                                send_direct_server_message(
-                                    &out_tx,
-                                    bootstrap.init_required_message(),
-                                );
+                            });
+
+                            send_direct_server_message(
+                                &out_tx,
+                                ServerMessage::Accepted { task_id },
+                            );
+                        } else if chat_mode == ChatMode::Workflow {
+                            // Workflow mode: LLM decomposes task into DAG, then execute.
+                            let task_id = task_id.unwrap_or_else(Uuid::new_v4);
+                            let out_tx_wf = out_tx.clone();
+                            let config_path = match state.runtime_snapshot().await {
+                                RuntimeState::Ready(ref hub) => hub.config_path.clone(),
+                                _ => {
+                                    send_direct_server_message(
+                                        &out_tx,
+                                        ServerMessage::Error {
+                                            message: "Runtime not ready for workflow generation".to_string(),
+                                        },
+                                    );
+                                    continue;
+                                }
+                            };
+
+                            // Get LLM config
+                            let llm_config = match load_config_from_file(&config_path) {
+                                Ok(cfg) => sa_core::plan_engine::PlanLlmConfig {
+                                    base_url: cfg.llm.base_url.clone(),
+                                    api_key: cfg.llm.api_key.clone(),
+                                    model: cfg.llm.model.clone(),
+                                },
+                                Err(err) => {
+                                    send_direct_server_message(
+                                        &out_tx,
+                                        ServerMessage::Error {
+                                            message: format!("Failed to load config: {err}"),
+                                        },
+                                    );
+                                    continue;
+                                }
+                            };
+
+                            // Get workspace root and approval_txs
+                            let (ws_root, approval_txs_clone) = match state.runtime_snapshot().await {
+                                RuntimeState::Ready(hub) => (hub.workspace_root.clone(), approval_txs.clone()),
+                                _ => {
+                                    send_direct_server_message(
+                                        &out_tx,
+                                        ServerMessage::Error {
+                                            message: "Runtime not ready".to_string(),
+                                        },
+                                    );
+                                    continue;
+                                }
+                            };
+
+                            let context = "You are a workflow decomposition assistant. Break tasks into a DAG of executable nodes.";
+
+                            // Send Accepted immediately
+                            send_direct_server_message(
+                                &out_tx,
+                                ServerMessage::Accepted { task_id },
+                            );
+
+                            tokio::spawn(async move {
+                                // 1. LLM generates the workflow DAG
+                                let def = match sa_core::plan_engine::generate_workflow(&task, context, &llm_config).await {
+                                    Ok(def) => {
+                                        tracing::info!("Generated workflow '{}' with {} nodes:", def.name, def.nodes.len());
+                                        for n in &def.nodes {
+                                            tracing::info!("  Node '{}' type={:?} deps={:?} prompt={:?} cmd={:?}",
+                                                n.id, n.node_type, n.depends_on,
+                                                n.prompt.as_deref().map(|s| &s[..s.len().min(80)]),
+                                                n.command.as_deref().map(|s| &s[..s.len().min(80)]));
+                                        }
+                                        def
+                                    }
+                                    Err(err) => {
+                                        let _ = out_tx_wf.send(ServerMessage::Error {
+                                            message: format!("Workflow generation failed: {err}"),
+                                        });
+                                        return;
+                                    }
+                                };
+
+                                // 2. Create channels for progress and approval
+                                let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
+                                let (approval_tx, approval_rx) = tokio::sync::mpsc::unbounded_channel::<sa_core::workflow_engine::ApprovalResponse>();
+
+                                // 3. Spawn forwarder: WorkflowEvent → ServerMessage
+                                let forward_tx = out_tx_wf.clone();
+                                let approval_txs_forward = approval_txs_clone.clone();
+                                let forwarder = tokio::spawn(async move {
+                                    while let Some(event) = progress_rx.recv().await {
+                                        use sa_core::workflow_engine::WorkflowEvent;
+                                        let msg = match event {
+                                            WorkflowEvent::Started { run_id, workflow_name } => {
+                                                sa_core::ws_protocol::ServerMessage::WorkflowStarted {
+                                                    run_id,
+                                                    workflow_name,
+                                                    nodes: Vec::new(),
+                                                }
+                                            }
+                                            WorkflowEvent::NodeUpdate { run_id, node_id, status, output } => {
+                                                sa_core::ws_protocol::ServerMessage::WorkflowNodeUpdate {
+                                                    run_id,
+                                                    node_id,
+                                                    status,
+                                                    output,
+                                                }
+                                            }
+                                            WorkflowEvent::ApprovalRequested { run_id, node_id, prompt } => {
+                                                {
+                                                    let mut map = approval_txs_forward.lock().await;
+                                                    map.insert((run_id, node_id.clone()), approval_tx.clone());
+                                                }
+                                                sa_core::ws_protocol::ServerMessage::ApprovalRequested {
+                                                    run_id,
+                                                    node_id,
+                                                    prompt,
+                                                }
+                                            }
+                                            WorkflowEvent::Completed { run_id, summary } => {
+                                                {
+                                                    let mut map = approval_txs_forward.lock().await;
+                                                    map.retain(|(rid, _), _| *rid != run_id);
+                                                }
+                                                sa_core::ws_protocol::ServerMessage::WorkflowCompleted {
+                                                    run_id,
+                                                    summary,
+                                                }
+                                            }
+                                            WorkflowEvent::Failed { run_id, node_id, error } => {
+                                                {
+                                                    let mut map = approval_txs_forward.lock().await;
+                                                    map.retain(|(rid, _), _| *rid != run_id);
+                                                }
+                                                sa_core::ws_protocol::ServerMessage::WorkflowFailed {
+                                                    run_id,
+                                                    node_id,
+                                                    error,
+                                                }
+                                            }
+                                        };
+                                        let _ = forward_tx.send(msg);
+                                    }
+                                });
+
+                                // 4. Build workflow LLM config
+                                let wf_llm_config = sa_core::workflow_engine::WorkflowLlmConfig {
+                                    base_url: llm_config.base_url.clone(),
+                                    api_key: llm_config.api_key.clone(),
+                                    default_model: llm_config.model.clone(),
+                                };
+
+                                // 5. Create tool resources for workflow nodes
+                                let wf_tool_ctx = match sa_core::tools::ToolContext::new(ws_root.clone(), std::sync::Arc::new(sa_core::skills::SkillRegistry::default())) {
+                                    Ok(ctx) => ctx,
+                                    Err(e) => {
+                                        tracing::warn!("Failed to create tool context for workflow: {e}");
+                                        sa_core::tools::ToolContext::new(
+                                            std::path::PathBuf::from("."),
+                                            std::sync::Arc::new(sa_core::skills::SkillRegistry::default()),
+                                        ).unwrap()
+                                    }
+                                };
+                                let wf_tools = sa_core::tools::ToolExecutor::new(wf_tool_ctx, None);
+                                let wf_runtime = sa_core::tools::ToolRuntime::detached();
+                                let wf_cancel = sa_core::cancel::cancel_pair().1;
+
+                                // 6. Run the workflow
+                                let mut inputs = std::collections::HashMap::new();
+                                inputs.insert("user_request".to_string(), task);
+                                let _run = sa_core::workflow_engine::run_workflow(
+                                    def,
+                                    inputs,
+                                    ws_root,
+                                    progress_tx,
+                                    Some(wf_llm_config),
+                                    approval_rx,
+                                    Some((wf_tools, wf_runtime, wf_cancel)),
+                                ).await;
+                                let _ = forwarder.await;
+                            });
+                        } else {
+                            // Normal Chat mode: submit to agent runner.
+                            match state.runtime_snapshot().await {
+                                RuntimeState::Ready(hub) => {
+                                    let task_id = task_id.unwrap_or_else(Uuid::new_v4);
+
+                                    match hub.submit_task(task_id, task).await {
+                                        Ok(work_id) => {
+                                            send_direct_server_message(
+                                                &out_tx,
+                                                ServerMessage::Accepted { task_id: work_id },
+                                            );
+                                        }
+                                        Err(err) => {
+                                            send_direct_server_message(
+                                                &out_tx,
+                                                ServerMessage::Error {
+                                                    message: format!("Failed to submit task: {err}"),
+                                                },
+                                            );
+                                        }
+                                    }
+                                }
+                                RuntimeState::Bootstrap(bootstrap) => {
+                                    send_direct_server_message(
+                                        &out_tx,
+                                        bootstrap.init_required_message(),
+                                    );
+                                }
                             }
                         }
                     }
@@ -5680,6 +6455,919 @@ async fn ws_session_with_timeout(
                             }
                         }
                     }
+                    ClientMessage::ImageUpload {
+                        upload_id,
+                        filename,
+                        mime_type,
+                        data,
+                        task_id: _,
+                    } => {
+                        // Decode base64 payload and persist to workspace uploads/.
+                        use base64::Engine as _;
+                        match base64::engine::general_purpose::STANDARD.decode(&data) {
+                            Ok(bytes) => {
+                                // Derive a safe extension from the original filename or
+                                // fall back to the mime type.
+                                let ext = std::path::Path::new(&filename)
+                                    .extension()
+                                    .and_then(|e| e.to_str())
+                                    .unwrap_or_else(|| {
+                                        if mime_type.contains("jpeg") || mime_type.contains("jpg") {
+                                            "jpg"
+                                        } else if mime_type.contains("png") {
+                                            "png"
+                                        } else if mime_type.contains("webp") {
+                                            "webp"
+                                        } else if mime_type.contains("gif") {
+                                            "gif"
+                                        } else {
+                                            "bin"
+                                        }
+                                    });
+
+                                let uploads_dir = {
+                                    let runtime = state.runtime.lock().await;
+                                    match &*runtime {
+                                        RuntimeState::Ready(hub) => hub.workspace_root.join("uploads"),
+                                        RuntimeState::Bootstrap(_) => {
+                                            send_direct_server_message(
+                                                &out_tx,
+                                                ServerMessage::Error {
+                                                    message: "image_upload: SA is not yet initialized (no workspace)".to_string(),
+                                                },
+                                            );
+                                            return;
+                                        }
+                                    }
+                                };
+                                let save_result = (|| -> std::io::Result<std::path::PathBuf> {
+                                    std::fs::create_dir_all(&uploads_dir)?;
+                                    let fname = format!("{}.{}", upload_id, ext);
+                                    let dest = uploads_dir.join(&fname);
+                                    std::fs::write(&dest, &bytes)?;
+                                    Ok(dest)
+                                })();
+
+                                match save_result {
+                                    Ok(saved_path) => {
+                                        send_direct_server_message(
+                                            &out_tx,
+                                            ServerMessage::ImageUploaded {
+                                                upload_id,
+                                                saved_path: saved_path.to_string_lossy().to_string(),
+                                            },
+                                        );
+
+                                        // Inject the uploaded image into the current agent's
+                                        // conversation so the LLM can analyse it.
+                                        let data_url = format!(
+                                            "data:{mime_type};base64,{data}"
+                                        );
+                                        // Grab the Hub from the ready runtime state.
+                                        let hub = {
+                                            let runtime = state.runtime.lock().await;
+                                            match &*runtime {
+                                                RuntimeState::Ready(hub) => Arc::clone(hub),
+                                                RuntimeState::Bootstrap(_) => {
+                                                    // No agent to inject into.
+                                                    continue;
+                                                }
+                                            }
+                                        };
+                                        if let Err(inject_err) = inject_user_image(
+                                            &hub,
+                                            &data_url,
+                                            &saved_path.to_string_lossy(),
+                                        )
+                                        .await
+                                        {
+                                            // Non-fatal: log but don't fail the upload.
+                                            eprintln!(
+                                                "[image_upload] failed to inject image into agent conversation: {inject_err}"
+                                            );
+                                        }
+                                    }
+                                    Err(io_err) => {
+                                        send_direct_server_message(
+                                            &out_tx,
+                                            ServerMessage::Error {
+                                                message: format!(
+                                                    "Failed to save uploaded image: {io_err}"
+                                                ),
+                                            },
+                                        );
+                                    }
+                                }
+                            }
+                            Err(decode_err) => {
+                                send_direct_server_message(
+                                    &out_tx,
+                                    ServerMessage::Error {
+                                        message: format!(
+                                            "image_upload: invalid base64 payload: {decode_err}"
+                                        ),
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    ClientMessage::GetConfig => {
+                        match state.runtime_snapshot().await {
+                            RuntimeState::Ready(hub) => {
+                                let cfg = match load_config_from_file(&hub.config_path) {
+                                    Ok(c) => c,
+                                    Err(err) => {
+                                        send_direct_server_message(
+                                            &out_tx,
+                                            ServerMessage::ConfigUpdateFailed {
+                                                message: "读取配置文件失败。".to_string(),
+                                                detail: Some(format!("{err:#}")),
+                                            },
+                                        );
+                                        continue;
+                                    }
+                                };
+                                send_direct_server_message(
+                                    &out_tx,
+                                    ServerMessage::ConfigSnapshot {
+                                        config: cfg.to_toml_value(),
+                                        config_path: hub.config_path.display().to_string(),
+                                    },
+                                );
+                            }
+                            RuntimeState::Bootstrap(_) => {
+                                send_direct_server_message(
+                                    &out_tx,
+                                    ServerMessage::ConfigUpdateFailed {
+                                        message: "SA 尚未初始化，无法读取配置。".to_string(),
+                                        detail: None,
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    ClientMessage::UpdateConfig { config } => {
+                        match state.runtime_snapshot().await {
+                            RuntimeState::Ready(hub) => {
+                                // Load the current (real) config to merge secrets.
+                                let current_cfg = match load_config_from_file(&hub.config_path) {
+                                    Ok(c) => c,
+                                    Err(err) => {
+                                        send_direct_server_message(
+                                            &out_tx,
+                                            ServerMessage::ConfigUpdateFailed {
+                                                message: "读取当前配置失败。".to_string(),
+                                                detail: Some(format!("{err:#}")),
+                                            },
+                                        );
+                                        continue;
+                                    }
+                                };
+
+                                // Merge frontend edits into a full Config.
+                                let merged = match Config::merge_from_frontend_value(&config, &current_cfg) {
+                                    Ok(c) => c,
+                                    Err(err) => {
+                                        send_direct_server_message(
+                                            &out_tx,
+                                            ServerMessage::ConfigUpdateFailed {
+                                                message: "配置校验失败。".to_string(),
+                                                detail: Some(format!("{err:#}")),
+                                            },
+                                        );
+                                        continue;
+                                    }
+                                };
+
+                                // Serialize to TOML and write to disk.
+                                let toml_str = match toml::to_string_pretty(&merged) {
+                                    Ok(s) => s,
+                                    Err(err) => {
+                                        send_direct_server_message(
+                                            &out_tx,
+                                            ServerMessage::ConfigUpdateFailed {
+                                                message: "序列化配置失败。".to_string(),
+                                                detail: Some(format!("{err:#}")),
+                                            },
+                                        );
+                                        continue;
+                                    }
+                                };
+
+                                if let Err(err) = std::fs::write(&hub.config_path, &toml_str) {
+                                    send_direct_server_message(
+                                        &out_tx,
+                                        ServerMessage::ConfigUpdateFailed {
+                                            message: "写入配置文件失败。".to_string(),
+                                            detail: Some(format!("{err:#}")),
+                                        },
+                                    );
+                                    continue;
+                                }
+
+                                // Hot-reload the runtime from disk.
+                                match hub.reload_runtime_from_disk().await {
+                                    Ok(summary) => {
+                                        send_direct_server_message(
+                                            &out_tx,
+                                            ServerMessage::ConfigUpdated { summary },
+                                        );
+                                    }
+                                    Err(err) => {
+                                        send_direct_server_message(
+                                            &out_tx,
+                                            ServerMessage::ConfigUpdateFailed {
+                                                message: "配置已写入但热重载失败，可能需要重启 SA。".to_string(),
+                                                detail: Some(format!("{err:#}")),
+                                            },
+                                        );
+                                    }
+                                }
+                            }
+                            RuntimeState::Bootstrap(_) => {
+                                send_direct_server_message(
+                                    &out_tx,
+                                    ServerMessage::ConfigUpdateFailed {
+                                        message: "SA 尚未初始化，无法更新配置。".to_string(),
+                                        detail: None,
+                                    },
+                                );
+                            }
+                        }
+                    }
+
+
+                    ClientMessage::GetSkillDoc { name } => {
+                        match state.runtime_snapshot().await {
+                            RuntimeState::Ready(hub) => {
+                                // 克隆需要的数据，然后释放锁
+                                let skills_clone = {
+                                    let preload_ctx = hub.preload_ctx.read().unwrap();
+                                    preload_ctx.skills.clone()
+                                };
+                                
+                                match skills_clone.load_skill_file(&name, None).await {
+                                    Ok((path, content)) => {
+                                        // 获取技能描述
+                                        let description = skills_clone.get(&name)
+                                            .map(|skill| skill.description.clone())
+                                            .unwrap_or_default();
+                                        
+                                        send_direct_server_message(
+                                            &out_tx,
+                                            ServerMessage::SkillDoc {
+                                                name: name.clone(),
+                                                description,
+                                                content,
+                                            },
+                                        );
+                                    }
+                                    Err(err) => {
+                                        send_direct_server_message(
+                                            &out_tx,
+                                            ServerMessage::ConfigUpdateFailed {
+                                                message: format!("读取技能文档失败: {name}"),
+                                                detail: Some(format!("{err:#}")),
+                                            },
+                                        );
+                                    }
+                                }
+                            }
+                            RuntimeState::Bootstrap(_) => {
+                                send_direct_server_message(
+                                    &out_tx,
+                                    ServerMessage::ConfigUpdateFailed {
+                                        message: "SA 尚未初始化，无法读取技能文档。".to_string(),
+                                        detail: None,
+                                    },
+                                );
+                            }
+                        }
+                    }
+
+
+
+
+
+                    // ── Memory panel handlers ────────────────────────────
+
+                    ClientMessage::GetMemoryStats => {
+                        if let RuntimeState::Ready(hub) = state.runtime_snapshot().await {
+                            let memory_dir = hub.workspace_root.join("memory");
+                            let out_tx = out_tx.clone();
+                            tokio::spawn(async move {
+                                let result = compute_memory_stats(&memory_dir).await;
+                                match result {
+                                    Ok((total_facts, unique_subjects, unique_predicates, avg_confidence, oldest_fact, newest_fact)) => {
+                                        send_direct_server_message(
+                                            &out_tx,
+                                            ServerMessage::MemoryStats {
+                                                total_facts,
+                                                unique_subjects,
+                                                unique_predicates,
+                                                avg_confidence,
+                                                oldest_fact,
+                                                newest_fact,
+                                            },
+                                        );
+                                    }
+                                    Err(err) => {
+                                        send_direct_server_message(
+                                            &out_tx,
+                                            ServerMessage::Error {
+                                                message: format!("Failed to get memory stats: {err}"),
+                                            },
+                                        );
+                                    }
+                                }
+                            });
+                        }
+                    }
+
+                    ClientMessage::GetMemoryFacts { query, limit, offset } => {
+                        if let RuntimeState::Ready(hub) = state.runtime_snapshot().await {
+                            let memory_dir = hub.workspace_root.join("memory");
+                            let out_tx = out_tx.clone();
+                            tokio::spawn(async move {
+                                let result = query_memory_facts(&memory_dir, query.as_deref(), limit, offset).await;
+                                match result {
+                                    Ok((facts, total)) => {
+                                        send_direct_server_message(
+                                            &out_tx,
+                                            ServerMessage::MemoryFacts { facts, total, offset },
+                                        );
+                                    }
+                                    Err(err) => {
+                                        send_direct_server_message(
+                                            &out_tx,
+                                            ServerMessage::Error {
+                                                message: format!("Failed to query memory facts: {err}"),
+                                            },
+                                        );
+                                    }
+                                }
+                            });
+                        }
+                    }
+
+                    ClientMessage::TraverseMemoryGraph { subject, max_hops, max_results } => {
+                        if let RuntimeState::Ready(hub) = state.runtime_snapshot().await {
+                            let memory_dir = hub.workspace_root.join("memory");
+                            let out_tx = out_tx.clone();
+                            tokio::spawn(async move {
+                                let result = traverse_memory(&memory_dir, &subject, max_hops, max_results).await;
+                                match result {
+                                    Ok(facts) => {
+                                        send_direct_server_message(
+                                            &out_tx,
+                                            ServerMessage::MemoryGraph {
+                                                subject,
+                                                facts,
+                                                hops: max_hops,
+                                            },
+                                        );
+                                    }
+                                    Err(err) => {
+                                        send_direct_server_message(
+                                            &out_tx,
+                                            ServerMessage::Error {
+                                                message: format!("Failed to traverse memory graph: {err}"),
+                                            },
+                                        );
+                                    }
+                                }
+                            });
+                        }
+                    }
+
+                    ClientMessage::DecayMemoryFacts => {
+                        if let RuntimeState::Ready(hub) = state.runtime_snapshot().await {
+                            let memory_dir = hub.workspace_root.join("memory");
+                            let out_tx = out_tx.clone();
+                            tokio::spawn(async move {
+                                let result = decay_memory(&memory_dir).await;
+                                match result {
+                                    Ok(affected) => {
+                                        send_direct_server_message(
+                                            &out_tx,
+                                            ServerMessage::MemoryOperationResult {
+                                                operation: "decay".to_string(),
+                                                affected,
+                                                summary: format!("已对 {affected} 条记忆执行衰减"),
+                                            },
+                                        );
+                                    }
+                                    Err(err) => {
+                                        send_direct_server_message(
+                                            &out_tx,
+                                            ServerMessage::Error {
+                                                message: format!("Failed to decay memory: {err}"),
+                                            },
+                                        );
+                                    }
+                                }
+                            });
+                        }
+                    }
+
+                    ClientMessage::PruneMemoryFacts { min_confidence } => {
+                        if let RuntimeState::Ready(hub) = state.runtime_snapshot().await {
+                            let memory_dir = hub.workspace_root.join("memory");
+                            let out_tx = out_tx.clone();
+                            tokio::spawn(async move {
+                                let result = prune_memory(&memory_dir, min_confidence).await;
+                                match result {
+                                    Ok(affected) => {
+                                        send_direct_server_message(
+                                            &out_tx,
+                                            ServerMessage::MemoryOperationResult {
+                                                operation: "prune".to_string(),
+                                                affected,
+                                                summary: format!("已剪除 {affected} 条低置信度记忆"),
+                                            },
+                                        );
+                                    }
+                                    Err(err) => {
+                                        send_direct_server_message(
+                                            &out_tx,
+                                            ServerMessage::Error {
+                                                message: format!("Failed to prune memory: {err}"),
+                                            },
+                                        );
+                                    }
+                                }
+                            });
+                        }
+                    }
+                    ClientMessage::GetMemoryReport { report_path } => {
+                        if let RuntimeState::Ready(hub) = state.runtime_snapshot().await {
+                            let memory_dir = hub.workspace_root.join("memory");
+                            let out_tx = out_tx.clone();
+                            tokio::spawn(async move {
+                                // Sanitize: normalize separators and reject traversal
+                                let normalized = report_path.replace('\\', "/");
+                                if normalized.contains("..") {
+                                    send_direct_server_message(
+                                        &out_tx,
+                                        ServerMessage::Error {
+                                            message: "Invalid report path: directory traversal not allowed".to_string(),
+                                        },
+                                    );
+                                    return;
+                                }
+                                let full_path = memory_dir.join(&normalized);
+                                match tokio::fs::read_to_string(&full_path).await {
+                                    Ok(content) => {
+                                        tracing::info!("[GetMemoryReport] sending report '{}' ({} bytes)", normalized, content.len());
+                                        send_direct_server_message(
+                                            &out_tx,
+                                            ServerMessage::MemoryReport {
+                                                report_path: normalized,
+                                                content,
+                                            },
+                                        );
+                                    }
+                                    Err(err) => {
+                                        if err.kind() == std::io::ErrorKind::NotFound {
+                                            let msg = format!("📭 报告尚未生成: {}\n\n该报告将在下一次 Dream 运行后自动生成。", normalized);
+                                            send_direct_server_message(
+                                                &out_tx,
+                                                ServerMessage::MemoryReport {
+                                                    report_path: normalized,
+                                                    content: msg,
+                                                },
+                                            );
+                                        } else {
+                                            send_direct_server_message(
+                                                &out_tx,
+                                                ServerMessage::Error {
+                                                    message: format!("Failed to read report '{normalized}': {err}"),
+                                                },
+                                            );
+                                        }
+                                    }
+                                }
+                            });
+                        }
+                    }
+
+
+                    // ── Workflow engine handlers ─────────────────────────────
+
+                    ClientMessage::StartWorkflow { workflow_name, inputs } => {
+                        if let RuntimeState::Ready(hub) = state.runtime_snapshot().await {
+                            let workflows_dir = hub.workspace_root.parent()
+                                .unwrap_or(&hub.workspace_root)
+                                .join("sa")
+                                .join("workflows");
+                            let workflow_path = workflows_dir.join(format!("{workflow_name}.yaml"));
+                            let out_tx = out_tx.clone();
+
+                            // Build LLM config from sa.toml for workflow engine
+                            let llm_config = match load_config_from_file(&hub.config_path) {
+                                Ok(cfg) => Some(sa_core::workflow_engine::WorkflowLlmConfig {
+                                    base_url: cfg.llm.base_url.clone(),
+                                    api_key: cfg.llm.api_key.clone(),
+                                    default_model: cfg.llm.model.clone(),
+                                }),
+                                Err(_) => None,
+                            };
+
+                            let approval_txs_clone = approval_txs.clone();
+
+                            tokio::spawn(async move {
+                                match sa_core::workflow_engine::load_workflow_def(&workflow_path).await {
+                                    Ok(def) => {
+                                        let ws_root = hub.workspace_root.clone();
+                                        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+                                        // Create approval channel
+                                        let (approval_tx, approval_rx) = tokio::sync::mpsc::unbounded_channel::<ApprovalResponse>();
+
+                                        // Spawn a task to forward progress events to the WS client
+                                        let forward_tx = out_tx.clone();
+                                        let approval_txs_forward = approval_txs_clone.clone();
+                                        let forwarder = tokio::spawn(async move {
+                                            while let Some(event) = rx.recv().await {
+                                                use sa_core::workflow_engine::WorkflowEvent;
+                                                let msg = match event {
+                                                    WorkflowEvent::Started { run_id, workflow_name } => {
+                                                        sa_core::ws_protocol::ServerMessage::WorkflowStarted {
+                                                            run_id,
+                                                            workflow_name,
+                                                            nodes: Vec::new(),
+                                                        }
+                                                    }
+                                                    WorkflowEvent::NodeUpdate { run_id, node_id, status, output } => {
+                                                        sa_core::ws_protocol::ServerMessage::WorkflowNodeUpdate {
+                                                            run_id,
+                                                            node_id,
+                                                            status,
+                                                            output,
+                                                        }
+                                                    }
+                                                    WorkflowEvent::ApprovalRequested { run_id, node_id, prompt } => {
+                                                        // Register the approval sender so RespondApproval can find it.
+                                                        {
+                                                            let mut map = approval_txs_forward.lock().await;
+                                                            map.insert((run_id, node_id.clone()), approval_tx.clone());
+                                                        }
+                                                        sa_core::ws_protocol::ServerMessage::ApprovalRequested {
+                                                            run_id,
+                                                            node_id,
+                                                            prompt,
+                                                        }
+                                                    }
+                                                    WorkflowEvent::Completed { run_id, summary } => {
+                                                        // Clean up any remaining approval senders for this run.
+                                                        {
+                                                            let mut map = approval_txs_forward.lock().await;
+                                                            map.retain(|(rid, _), _| *rid != run_id);
+                                                        }
+                                                        sa_core::ws_protocol::ServerMessage::WorkflowCompleted {
+                                                            run_id,
+                                                            summary,
+                                                        }
+                                                    }
+                                                    WorkflowEvent::Failed { run_id, node_id, error } => {
+                                                        // Clean up any remaining approval senders for this run.
+                                                        {
+                                                            let mut map = approval_txs_forward.lock().await;
+                                                            map.retain(|(rid, _), _| *rid != run_id);
+                                                        }
+                                                        sa_core::ws_protocol::ServerMessage::WorkflowFailed {
+                                                            run_id,
+                                                            node_id,
+                                                            error,
+                                                        }
+                                                    }
+                                                };
+                                                let _ = forward_tx.send(msg);
+                                            }
+                                        });
+
+                                        let _run = sa_core::workflow_engine::run_workflow(
+                                            def,
+                                            inputs,
+                                            ws_root,
+                                            tx,
+                                            llm_config,
+                                            approval_rx,
+                                            None, // YAML workflows don't need LLM tool-calling
+                                        ).await;
+                                        let _ = forwarder.await;
+                                    }
+                                    Err(err) => {
+                                        send_direct_server_message(
+                                            &out_tx,
+                                            ServerMessage::Error {
+                                                message: format!("Failed to load workflow '{workflow_name}': {err}"),
+                                            },
+                                        );
+                                    }
+                                }
+                            });
+                        } else {
+                            send_direct_server_message(
+                                &out_tx,
+                                ServerMessage::Error {
+                                    message: "Runtime not ready".to_string(),
+                                },
+                            );
+                        }
+                    }
+
+                    ClientMessage::CancelWorkflow { run_id: _ } => {
+                        // Cancel is handled by tracking active workflow handles.
+                        // For now, acknowledge the request.
+                        send_direct_server_message(
+                            &out_tx,
+                            ServerMessage::Error {
+                                message: "Workflow cancellation not yet implemented".to_string(),
+                            },
+                        );
+                    }
+
+                    ClientMessage::InjectWorkflowContext { run_id, node_id, context } => {
+                        // Forward the injected context to the workflow via approval channel.
+                        let mut map = approval_txs.lock().await;
+                        if let Some(sender) = map.remove(&(run_id, node_id.clone())) {
+                            let _ = sender.send(ApprovalResponse {
+                                run_id,
+                                node_id: node_id.clone(),
+                                approved: true,
+                                feedback: Some(format!("[INJECTED CONTEXT] {context}")),
+                            });
+                            tracing::info!("Context injected for run={run_id} node={node_id}");
+                        } else {
+                            send_direct_server_message(
+                                &out_tx,
+                                ServerMessage::Error {
+                                    message: format!("No pending node for injection: run={run_id} node={node_id}"),
+                                },
+                            );
+                        }
+                    }
+
+                    ClientMessage::PauseWorkflow { run_id } => {
+                        // Workflow pause — mark all pending approvals in this run as rejected.
+                        tracing::info!("Pausing workflow run={run_id}");
+                        send_direct_server_message(
+                            &out_tx,
+                            ServerMessage::WorkflowNodeUpdate {
+                                run_id,
+                                node_id: String::new(),
+                                status: NodeStatus::Skipped,
+                                output: Some("Workflow paused by user".to_string()),
+                            },
+                        );
+                    }
+
+                    ClientMessage::ResumeWorkflow { run_id } => {
+                        tracing::info!("Resuming workflow run={run_id}");
+                        send_direct_server_message(
+                            &out_tx,
+                            ServerMessage::Error {
+                                message: "Workflow resume not yet implemented".to_string(),
+                            },
+                        );
+                    }
+
+                    ClientMessage::SetChatMode { mode } => {
+                        chat_mode = mode;
+                        send_direct_server_message(
+                            &out_tx,
+                            ServerMessage::ChatModeChanged { mode },
+                        );
+                    }
+
+                    ClientMessage::ApprovePlan { plan_id, action } => {
+                        match action {
+                            PlanAction::ApproveAll | PlanAction::ApproveStep => {
+                                let out_tx_plan = out_tx.clone();
+                                let config_path = match state.runtime_snapshot().await {
+                                    RuntimeState::Ready(ref hub) => hub.config_path.clone(),
+                                    _ => {
+                                        send_direct_server_message(
+                                            &out_tx,
+                                            ServerMessage::Error {
+                                                message: "Runtime not ready".to_string(),
+                                            },
+                                        );
+                                        continue;
+                                    }
+                                };
+                                let llm_config = match load_config_from_file(&config_path) {
+                                    Ok(cfg) => sa_core::plan_engine::PlanLlmConfig {
+                                        base_url: cfg.llm.base_url.clone(),
+                                        api_key: cfg.llm.api_key.clone(),
+                                        model: cfg.llm.model.clone(),
+                                    },
+                                    Err(err) => {
+                                        send_direct_server_message(
+                                            &out_tx,
+                                            ServerMessage::Error {
+                                                message: format!("Failed to load config: {err}"),
+                                            },
+                                        );
+                                        continue;
+                                    }
+                                };
+
+                                tokio::spawn(async move {
+                                    let workspace_root = std::path::PathBuf::from(".");
+                                    let plan = match sa_core::plan_engine::load_plan(&workspace_root, &plan_id).await {
+                                        Ok(p) => p,
+                                        Err(err) => {
+                                            let _ = out_tx_plan.send(ServerMessage::Error {
+                                                message: format!("Failed to load plan: {err}"),
+                                            });
+                                            return;
+                                        }
+                                    };
+
+                                    let mut accumulated = String::new();
+                                    let total_steps = plan.steps.len();
+                                    for (i, step) in plan.steps.iter().enumerate() {
+                                        // Send running status
+                                        let _ = out_tx_plan.send(ServerMessage::PlanStepUpdate {
+                                            plan_id,
+                                            step_id: step.step_id.clone(),
+                                            status: PlanStepStatus::Running,
+                                        });
+
+                                        let step_action = action;
+                                        if step_action == PlanAction::ApproveStep && i > 0 {
+                                            // Step mode: only execute one step
+                                            // Mark the rest as still pending
+                                            break;
+                                        }
+
+                                        match sa_core::plan_engine::execute_plan_step(
+                                            &plan, i, &accumulated, &llm_config,
+                                        ).await {
+                                            Ok(output) => {
+                                                let step_output = format!(
+                                                    "--- Step {}: {} ---\n{}\n",
+                                                    step.step_id, step.description, output
+                                                );
+                                                accumulated.push_str(&step_output);
+                                                let _ = out_tx_plan.send(ServerMessage::PlanStepUpdate {
+                                                    plan_id,
+                                                    step_id: step.step_id.clone(),
+                                                    status: PlanStepStatus::Completed,
+                                                });
+                                            }
+                                            Err(err) => {
+                                                let _ = out_tx_plan.send(ServerMessage::PlanStepUpdate {
+                                                    plan_id,
+                                                    step_id: step.step_id.clone(),
+                                                    status: PlanStepStatus::Failed,
+                                                });
+                                                let _ = out_tx_plan.send(ServerMessage::Error {
+                                                    message: format!("Step {} failed: {err}", step.step_id),
+                                                });
+                                                return;
+                                            }
+                                        }
+                                    }
+                                });
+                            }
+                            PlanAction::Modify => {
+                                send_direct_server_message(
+                                    &out_tx,
+                                    ServerMessage::Error {
+                                        message: "Plan modification not yet implemented".to_string(),
+                                    },
+                                );
+                            }
+                        }
+                    }
+
+                    ClientMessage::RespondApproval { run_id, node_id, approved, feedback } => {
+                        let mut map = approval_txs.lock().await;
+                        if let Some(sender) = map.remove(&(run_id, node_id.clone())) {
+                            let _ = sender.send(ApprovalResponse {
+                                run_id,
+                                node_id: node_id.clone(),
+                                approved,
+                                feedback,
+                            });
+                            tracing::info!("Approval response sent for run={run_id} node={node_id} approved={approved}");
+                        } else {
+                            tracing::warn!("No pending approval found for run={run_id} node={node_id}");
+                            send_direct_server_message(
+                                &out_tx,
+                                ServerMessage::Error {
+                                    message: format!("No pending approval for run {run_id} node {node_id}"),
+                                },
+                            );
+                        }
+                    }
+
+                    ClientMessage::GetSkillsList => {
+                        if let RuntimeState::Ready(hub) = state.runtime_snapshot().await {
+                            let preload_ctx = hub.preload_ctx.read().unwrap();
+                            let skills: Vec<sa_core::ws_protocol::SkillListItem> = preload_ctx.skills.list_full()
+                                .into_iter()
+                                .map(|(_name, spec)| {
+                                    let source = match spec.source {
+                                        sa_core::commands::CommandSource::LocalSkill => sa_core::ws_protocol::SkillSource::Local,
+                                        sa_core::commands::CommandSource::Bundled => sa_core::ws_protocol::SkillSource::Builtin,
+                                        sa_core::commands::CommandSource::McpPrompt => sa_core::ws_protocol::SkillSource::Mcp,
+                                    };
+                                    // Mark core skills (毛选, 求是)
+                                    let core = spec.name.contains("毛选") || spec.name.contains("求是");
+                                    sa_core::ws_protocol::SkillListItem {
+                                        name: spec.name.clone(),
+                                        description: spec.description.clone(),
+                                        source,
+                                        triggers: spec.triggers.clone(),
+                                        usage_count: 0,
+                                        core,
+                                    }
+                                })
+                                .collect();
+                            send_direct_server_message(
+                                &out_tx,
+                                ServerMessage::SkillsList { skills },
+                            );
+                        }
+                    }
+                    ClientMessage::TestApiKey { base_url, api_key, model } => {
+                        let out_tx = out_tx.clone();
+                        tokio::spawn(async move {
+                            let start = std::time::Instant::now();
+                            let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+                            let body = serde_json::json!({
+                                "model": model,
+                                "messages": [{"role": "user", "content": "hi"}],
+                                "max_tokens": 1,
+                                "stream": false
+                            });
+                            let client = reqwest::Client::builder()
+                                .timeout(std::time::Duration::from_secs(30))
+                                .build()
+                                .unwrap_or_default();
+                            let result = client
+                                .post(&url)
+                                .header("Authorization", format!("Bearer {}", api_key))
+                                .header("Content-Type", "application/json")
+                                .json(&body)
+                                .send()
+                                .await;
+                            let latency_ms = start.elapsed().as_millis() as u64;
+                            match result {
+                                Ok(resp) => {
+                                    let status = resp.status();
+                                    if status.is_success() {
+                                        let provider = base_url.split("://").nth(1)
+                                            .and_then(|s| s.split('/').next())
+                                            .unwrap_or("unknown")
+                                            .to_string();
+                                        send_direct_server_message(
+                                            &out_tx,
+                                            ServerMessage::ApiKeyTestResult {
+                                                ok: true,
+                                                model: model.clone(),
+                                                provider,
+                                                latency_ms,
+                                                error: None,
+                                            },
+                                        );
+                                    } else {
+                                        let err_text = resp.text().await.unwrap_or_else(|_| format!("HTTP {status}"));
+                                        let provider = base_url.split("://").nth(1)
+                                            .and_then(|s| s.split('/').next())
+                                            .unwrap_or("unknown")
+                                            .to_string();
+                                        send_direct_server_message(
+                                            &out_tx,
+                                            ServerMessage::ApiKeyTestResult {
+                                                ok: false,
+                                                model: model.clone(),
+                                                provider,
+                                                latency_ms,
+                                                error: Some(format!("HTTP {}: {}", status, err_text.chars().take(200).collect::<String>())),
+                                            },
+                                        );
+                                    }
+                                }
+                                Err(err) => {
+                                    send_direct_server_message(
+                                        &out_tx,
+                                        ServerMessage::ApiKeyTestResult {
+                                            ok: false,
+                                            model: model.clone(),
+                                            provider: "unknown".to_string(),
+                                            latency_ms,
+                                            error: Some(format!("连接失败: {}", err)),
+                                        },
+                                    );
+                                }
+                            }
+                        });
+                    }
                 }
             }
             Message::Close(_) => break,
@@ -5687,6 +7375,7 @@ async fn ws_session_with_timeout(
             _ => {}
         }
     }
+
 
     // Drop outbound channel to stop writer task.
     drop(out_tx);
@@ -5861,6 +7550,13 @@ mod tests {
                 system_role_name: "developer".to_string(),
                 reasoning_effort: None,
                 compaction: sa_core::compact::CompactionConfig::default(),
+                temperature: None,
+                top_p: None,
+                max_output_tokens: None,
+                fallback_model: None,
+                max_consecutive_failures: 2,
+                max_retries: 12,
+                model_routing: None,
             },
         );
         let runtime_store =

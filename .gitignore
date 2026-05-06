@@ -2,6 +2,7 @@
 /target/
 /dist/
 node_modules/
+WebUI/node_modules/
 
 # === OS/Editor ===
 .DS_Store
@@ -44,3 +45,23 @@ memory/
 # === Test Coverage ===
 coverage/
 *.lcov
+
+# === Binaries ===
+*.exe
+*.pdb
+
+# === Python ===
+__pycache__/
+*.pyc
+*.pyo
+
+# === Runtime State (dynamic, not for version control) ===
+workspace/runtime/
+workspace/interactions/
+workspace/sessions/
+workspace/sa.exe
+
+# === Tool State ===
+.omc/
+.tokeny/
+.claude/

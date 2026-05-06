@@ -168,7 +168,7 @@
 
 ### 5. 记忆系统
 
-记忆系统采用“原始层 -> 长期层 -> dream 审计层”的分层结构：
+记忆系统采用"原始层 -> 长期层 -> dream 审计层"的分层结构：
 
 - 长期总纲：`MEMORY.md` / `memory.md`
 - 专题长期记忆：`memory/topics/*.md`
@@ -184,6 +184,55 @@
 - Agent 需要回忆时，优先调用：
   - `MemorySearch`
   - `MemoryGet`
+
+#### 5.1 记忆系统优化（新增）
+
+SA 引入了 5 个记忆优化模块，提升记忆管理效率：
+
+**P0: 噪音控制**
+- 检测上下文中的重复内容、过期信息、低重要性内容、工具输出冗余
+- 提供噪音比例和优化建议
+- 配置：`[working_memory.noise]`
+
+**P1: 记忆指针系统**
+- MEMORY.md 只存储指针（Markdown 链接），实际内容在子文件
+- 支持懒加载和层次化组织
+- 目录结构：`memory/core/`、`memory/long-term/`、`memory/short-term/`、`memory/working/`
+- 配置：`[memory_pointer]`
+
+**P2: 记忆新陈代谢**
+- 自动归档：30 天未访问且低重要性的记忆
+- 重要性衰减：随时间降低未访问记忆的重要性
+- 智能晋升：频繁访问的记忆自动升级
+- 硬删除：90 天后清除已废弃的记忆
+- 配置：`[memory_metabolism]`
+
+**P3: 时间线检索**
+- 支持日期范围查询（`TimeRange::Range`）
+- 支持相对时间查询（`TimeRange::Relative`，如"最近 7 天"）
+- 支持时间线生成和时间邻近性排序
+- 配置：`[timeline_retrieval]`
+
+**P4: Skills 淘汰机制**
+- 使用统计追踪：记录每个 skill 的使用次数和成功率
+- 自动合并：相似度超过阈值的 skills 自动合并
+- 低频淘汰：长期未使用且使用次数低于阈值的 skills 自动废弃
+- 智能晋升：频繁使用的 skills 自动升级为 Active
+- 配置：`[skill_metabolism]`
+
+#### 5.2 记忆生命周期
+
+```text
+Working Memory (热缓冲)
+    ↓ 溢出时压缩
+Short-term Memory (日记)
+    ↓ 30 天未访问 + 低重要性
+Archive (冷存储)
+    ↓ 90 天后
+Hard Delete (永久删除)
+
+频繁访问 → 自动晋升
+```
 
 ### 6. 会话持久化与压缩恢复
 

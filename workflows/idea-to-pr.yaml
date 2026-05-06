@@ -1,0 +1,42 @@
+name: idea-to-pr
+description: 从功能创意到 Pull Request 的完整开发流程
+default_model: deepseek-v4-flash
+nodes:
+  - id: brainstorm
+    node_type: prompt
+    prompt: "分析以下功能创意，梳理核心需求和边界：{{idea}}"
+    model: deepseek-v4-flash
+    label: 需求分析
+
+  - id: architecture
+    node_type: prompt
+    depends_on: [brainstorm]
+    prompt: "基于需求分析，设计技术方案和架构"
+    model: deepseek-v4-flash
+    label: 架构设计
+
+  - id: implement
+    node_type: prompt
+    depends_on: [architecture]
+    prompt: "根据架构设计，编写实现代码"
+    model: sensenova-6.7-flash-lite
+    label: 编码实现
+
+  - id: test
+    node_type: bash
+    depends_on: [implement]
+    command: "cargo test --workspace 2>&1 || true"
+    label: 运行测试
+
+  - id: review
+    node_type: prompt
+    depends_on: [test]
+    prompt: "审查代码质量，检查潜在问题"
+    model: deepseek-v4-flash
+    label: 代码审查
+
+  - id: approve
+    node_type: approval
+    depends_on: [review]
+    prompt: "代码审查完成，请确认是否提交 PR"
+    label: 审批提交

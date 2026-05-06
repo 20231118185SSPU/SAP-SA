@@ -13,13 +13,14 @@ use anyhow::Context as _;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use ts_rs::TS;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use tokio_stream::StreamExt;
 use uuid::Uuid;
 
 /// Wire protocol used for one OpenAI-compatible endpoint.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, TS)]
 pub enum WireApi {
     /// Classic `POST /v1/chat/completions`.
     #[default]
@@ -56,7 +57,7 @@ pub enum WireApi {
 /// - Anthropic-style gateways normally expect `x-api-key: ...`
 /// - Anthropic setup-token / OAuth flows instead expect `Authorization`
 /// - some vendors proxy Anthropic but keep Anthropic auth semantics
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, TS)]
 pub enum AuthStyle {
     /// `Authorization: Bearer <token>`
     #[default]
@@ -124,6 +125,30 @@ impl ChatCompletionsError {
             ChatCompletionsError::Http { status, .. } => Some(*status),
             ChatCompletionsError::InvalidResponse(_) => None,
         }
+    }
+
+    /// Return `true` if this 429 error body indicates the quota is fully
+    /// exhausted (as opposed to a temporary rate limit that will reset).
+    ///
+    /// Checks for these substrings (case-insensitive) in the error body:
+    /// - `quota exhausted`
+    /// - `quota exceeded`
+    /// - `insufficient_quota`
+    ///
+    /// Returns `false` for non-429 errors and transient rate-limit 429s.
+    pub fn is_quota_exhausted(&self) -> bool {
+        let body = match self {
+            ChatCompletionsError::Http { status, body }
+                if *status == reqwest::StatusCode::TOO_MANY_REQUESTS =>
+            {
+                body
+            }
+            _ => return false,
+        };
+        let lower = body.to_lowercase();
+        lower.contains("quota exhausted")
+            || lower.contains("quota exceeded")
+            || lower.contains("insufficient_quota")
     }
 }
 
@@ -218,6 +243,18 @@ impl OpenAiClient {
         self.wire_api
     }
 
+    /// Resolve the model name based on category and routing table.
+    pub fn resolve_model(&self, category: Option<&str>, routing: Option<&HashMap<String, String>>, default_model: &str) -> String {
+        if let Some(cat) = category {
+            if let Some(routing_table) = routing {
+                if let Some(model) = routing_table.get(cat) {
+                    return model.clone();
+                }
+            }
+        }
+        default_model.to_string()
+    }
+
     /// Compute the `chat/completions` URL.
     fn chat_completions_url(&self) -> String {
         if self.path_ends_with("/chat/completions") {
@@ -293,10 +330,12 @@ impl OpenAiClient {
         &self,
         req: &ChatCompletionsRequest,
     ) -> Result<ChatCompletionsResponse, ChatCompletionsError> {
+        // Filter out empty assistant/tool messages that some providers reject.
+        let sanitized = req.sanitized();
         match self.wire_api {
-            WireApi::ChatCompletions => self.send_chat_completions_request(req).await,
-            WireApi::Responses => self.send_responses_request(req).await,
-            WireApi::AnthropicMessages => self.send_anthropic_messages_request(req).await,
+            WireApi::ChatCompletions => self.send_chat_completions_request(&sanitized).await,
+            WireApi::Responses => self.send_responses_request(&sanitized).await,
+            WireApi::AnthropicMessages => self.send_anthropic_messages_request(&sanitized).await,
         }
     }
 
@@ -614,6 +653,65 @@ impl OpenAiClient {
     }
 }
 
+/// Input for embedding requests — single text or batch.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(untagged)]
+pub enum EmbeddingInput {
+    Single(String),
+    Batch(Vec<String>),
+}
+
+/// Response wrapper for the embeddings endpoint.
+#[derive(Debug, Deserialize)]
+struct EmbeddingResponse {
+    data: Vec<EmbeddingData>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EmbeddingData {
+    embedding: Vec<f32>,
+}
+
+impl OpenAiClient {
+    /// Call `POST /v1/embeddings` and return embedding vectors.
+    pub async fn embeddings(
+        &self,
+        model: &str,
+        input: EmbeddingInput,
+        stream: bool,
+    ) -> anyhow::Result<Vec<Vec<f32>>> {
+        let _ = stream; // embeddings API does not stream
+        let url = format!("{}/embeddings", self.base_url.trim_end_matches('/'));
+        let body = serde_json::json!({
+            "model": model,
+            "input": match &input {
+                EmbeddingInput::Single(s) => serde_json::Value::String(s.clone()),
+                EmbeddingInput::Batch(v) => serde_json::Value::Array(
+                    v.iter().map(|s| serde_json::Value::String(s.clone())).collect()
+                ),
+            },
+        });
+        let resp = self
+            .http
+            .post(&url)
+            .headers(self.auth_headers.clone())
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("embeddings request failed: {e}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("embeddings API returned {status}: {text}");
+        }
+        let parsed: EmbeddingResponse = resp
+            .json()
+            .await
+            .map_err(|e| anyhow::anyhow!("embeddings response parse failed: {e}"))?;
+        Ok(parsed.data.into_iter().map(|d| d.embedding).collect())
+    }
+}
+
 /// Build the authentication headers that should be attached to every request
 /// made by this client.
 fn build_auth_headers(api_key: &str, auth_style: AuthStyle) -> anyhow::Result<HeaderMap> {
@@ -841,6 +939,83 @@ pub struct ChatCompletionsRequest {
     /// Whether to use streaming. (We keep it `false` in this minimal agent.)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream: Option<bool>,
+
+    /// Sampling temperature (0.0 – 2.0).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+
+    /// Nucleus sampling parameter (0.0 – 1.0).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f64>,
+}
+
+impl ChatCompletionsRequest {
+    /// Return a copy of this request with empty messages filtered out.
+    ///
+    /// Some providers reject assistant messages that carry neither `content`
+    /// nor `tool_calls`.  A tool-execution loop can occasionally produce such
+    /// messages (e.g. when a tool result arrives but the prior assistant turn
+    /// had no visible text or tool calls).  Stripping them before dispatch
+    /// prevents 400 Bad Request errors.
+    pub fn sanitized(&self) -> Self {
+        let messages = self
+            .messages
+            .iter()
+            .filter(|msg| match msg.role.as_str() {
+                "assistant" => msg.content.is_some() || msg.tool_calls.is_some(),
+                "tool" => msg.content.is_some() && msg.tool_call_id.is_some(),
+                _ => true,
+            })
+            .cloned()
+            .collect();
+        Self {
+            model: self.model.clone(),
+            messages,
+            max_tokens: self.max_tokens,
+            reasoning_effort: self.reasoning_effort.clone(),
+            tools: self.tools.clone(),
+            tool_choice: self.tool_choice.clone(),
+            stream: self.stream,
+            temperature: self.temperature,
+            top_p: self.top_p,
+        }
+    }
+}
+
+/// Content of a chat message: either plain text or a multimodal list.
+///
+/// Uses `#[serde(untagged)]` so that existing on-disk sessions containing a
+/// plain JSON string deserialise into the `Text` variant transparently.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum MessageContent {
+    /// Plain text string (backward-compatible with existing serialized data).
+    Text(String),
+    /// Multimodal content parts (text + images).
+    Parts(Vec<ContentPart>),
+}
+
+/// One part inside a multimodal message content array.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ContentPart {
+    /// A text block.
+    Text { text: String },
+    /// An image block with a URL (data: or https:).
+    Image {
+        /// Image URL details.
+        image_url: ImageUrl,
+    },
+}
+
+/// Image URL wrapper matching OpenAI's content-part format.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ImageUrl {
+    /// Either a `data:image/...;base64,...` URL or an `https://` URL.
+    pub url: String,
+    /// Detail level: `"auto"`, `"low"`, or `"high"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 /// A single message in SA's canonical history format.
@@ -849,11 +1024,11 @@ pub struct ChatMessage {
     /// Role name (e.g. `system`, `developer`, `user`, `assistant`, `tool`).
     pub role: String,
 
-    /// Text content.
+    /// Text or multimodal content.
     ///
     /// For tool-calls, providers often return `null` content.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub content: Option<String>,
+    pub content: Option<MessageContent>,
 
     /// Tool calls emitted by the assistant.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -894,7 +1069,19 @@ impl ChatMessage {
     pub fn text(role: impl Into<String>, content: impl Into<String>) -> Self {
         Self {
             role: role.into(),
-            content: Some(content.into()),
+            content: Some(MessageContent::Text(content.into())),
+            tool_calls: None,
+            tool_call_id: None,
+            request_usage: None,
+            responses_input_items: None,
+        }
+    }
+
+    /// Construct a multimodal message with text + image content parts.
+    pub fn multimodal(role: impl Into<String>, parts: Vec<ContentPart>) -> Self {
+        Self {
+            role: role.into(),
+            content: Some(MessageContent::Parts(parts)),
             tool_calls: None,
             tool_call_id: None,
             request_usage: None,
@@ -906,12 +1093,48 @@ impl ChatMessage {
     pub fn tool_result(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
         Self {
             role: "tool".to_string(),
-            content: Some(content.into()),
+            content: Some(MessageContent::Text(content.into())),
             tool_calls: None,
             tool_call_id: Some(tool_call_id.into()),
             request_usage: None,
             responses_input_items: None,
         }
+    }
+
+    /// Extract plain text from content, regardless of `Text` or `Parts` variant.
+    ///
+    /// For `Parts`, only `ContentPart::Text` items are included; images are
+    /// represented as a placeholder string like `[Image: data:image/png;base64,...]`.
+    pub fn text_content(&self) -> Option<String> {
+        self.content.as_ref().and_then(|c| match c {
+            MessageContent::Text(s) => {
+                let trimmed = s.trim().to_string();
+                (!trimmed.is_empty()).then_some(trimmed)
+            }
+            MessageContent::Parts(parts) => {
+                let mut pieces = Vec::new();
+                for part in parts {
+                    match part {
+                        ContentPart::Text { text } => {
+                            let t = text.trim();
+                            if !t.is_empty() {
+                                pieces.push(t.to_string());
+                            }
+                        }
+                        ContentPart::Image { image_url } => {
+                            // Use a compact placeholder so the agent knows an image is present.
+                            let preview = if image_url.url.len() > 80 {
+                                format!("[Image: {}...]", &image_url.url[..60])
+                            } else {
+                                format!("[Image: {}]", image_url.url)
+                            };
+                            pieces.push(preview);
+                        }
+                    }
+                }
+                (!pieces.is_empty()).then_some(pieces.join("\n"))
+            }
+        })
     }
 }
 
@@ -1260,7 +1483,7 @@ impl ChatCompletionsStreamAccumulator {
             choices: vec![ChatChoice {
                 message: ChatMessage {
                     role: self.role.unwrap_or_else(|| "assistant".to_string()),
-                    content,
+                    content: content.map(MessageContent::Text),
                     tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
                     tool_call_id: None,
                     request_usage: None,
@@ -1338,6 +1561,12 @@ impl AnthropicMessagesRequest {
             (!native.is_empty()).then_some(native)
         });
 
+        // Inject prompt caching breakpoints:
+        // - last tool_result message (highest reuse value)
+        // - last user message (catches the latest context)
+        let mut messages = messages;
+        inject_anthropic_cache_breakpoints(&mut messages);
+
         Self {
             model: req.model.clone(),
             max_tokens: req.max_tokens.unwrap_or(DEFAULT_ANTHROPIC_MAX_TOKENS),
@@ -1362,8 +1591,23 @@ impl AnthropicMessage {
     fn user_text(text: String) -> Self {
         Self {
             role: "user".to_string(),
-            content: vec![AnthropicContentOut::Text { text }],
+            content: vec![AnthropicContentOut::Text { text, cache_control: None }],
         }
+    }
+}
+
+/// Anthropic cache control directive.
+#[derive(Debug, Clone, Serialize)]
+struct CacheControl {
+    /// Cache type — always `"ephemeral"` for prompt caching.
+    #[serde(rename = "type")]
+    type_: String,
+}
+
+impl CacheControl {
+    /// Create an ephemeral cache control directive.
+    fn ephemeral() -> Self {
+        Self { type_: "ephemeral".to_string() }
     }
 }
 
@@ -1373,7 +1617,11 @@ impl AnthropicMessage {
 enum AnthropicContentOut {
     /// Plain text block.
     #[serde(rename = "text")]
-    Text { text: String },
+    Text {
+        text: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
+    },
     /// Assistant-native tool-use block.
     #[serde(rename = "tool_use")]
     ToolUse {
@@ -1383,6 +1631,8 @@ enum AnthropicContentOut {
         name: String,
         /// JSON arguments object.
         input: Value,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
     },
     /// User-side tool-result block answering one previous `tool_use`.
     #[serde(rename = "tool_result")]
@@ -1391,7 +1641,29 @@ enum AnthropicContentOut {
         tool_use_id: String,
         /// Textual tool result body.
         content: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
     },
+    /// Image block for multimodal messages.
+    #[serde(rename = "image")]
+    Image {
+        /// Image source details.
+        source: AnthropicImageSource,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
+    },
+}
+
+/// Image source for Anthropic's `image` content block.
+#[derive(Debug, Clone, Serialize)]
+struct AnthropicImageSource {
+    /// Source type — always `"base64"` for inline images.
+    #[serde(rename = "type")]
+    type_: String,
+    /// MIME type, e.g. `"image/png"`.
+    media_type: String,
+    /// Base64-encoded image bytes.
+    data: String,
 }
 
 /// Native Anthropic tool definition.
@@ -1461,8 +1733,8 @@ fn convert_messages_to_anthropic(
     for message in messages {
         match message.role.as_str() {
             "system" | "developer" => {
-                if let Some(text) = non_empty_text(message.content.as_deref()) {
-                    system_parts.push(text.to_string());
+                if let Some(text) = message.text_content() {
+                    system_parts.push(text);
                 }
             }
             "assistant" => {
@@ -1474,13 +1746,15 @@ fn convert_messages_to_anthropic(
             "tool" => {
                 if let Some(native) = build_anthropic_tool_result_message(message) {
                     native_messages.push(native);
-                } else if let Some(text) = non_empty_text(message.content.as_deref()) {
-                    native_messages.push(AnthropicMessage::user_text(text.to_string()));
+                } else if let Some(text) = message.text_content() {
+                    native_messages.push(AnthropicMessage::user_text(text));
                 }
             }
             _ => {
-                if let Some(text) = non_empty_text(message.content.as_deref()) {
-                    native_messages.push(AnthropicMessage::user_text(text.to_string()));
+                // user (and any other role) → convert multimodal content
+                let native = build_anthropic_user_message(message);
+                if let Some(native) = native {
+                    native_messages.push(native);
                 }
             }
         }
@@ -1490,14 +1764,126 @@ fn convert_messages_to_anthropic(
     (system, native_messages)
 }
 
+/// Inject Anthropic prompt caching breakpoints on the last tool_result
+/// message and the last user message for maximum cache reuse.
+///
+/// This marks content blocks with `cache_control: {"type": "ephemeral"}`
+/// so Anthropic can cache those breakpoints and avoid re-processing
+/// the prefix on subsequent requests.
+fn inject_anthropic_cache_breakpoints(messages: &mut [AnthropicMessage]) {
+    // Mark the last tool_result message's content blocks.
+    if let Some(last_tool_msg) = messages.iter_mut().rev().find(|m| {
+        m.role == "user"
+            && m.content
+                .iter()
+                .any(|c| matches!(c, AnthropicContentOut::ToolResult { .. }))
+    }) {
+        for block in &mut last_tool_msg.content {
+            if let AnthropicContentOut::ToolResult { cache_control, .. } = block {
+                *cache_control = Some(CacheControl::ephemeral());
+            }
+        }
+    }
+
+    // Mark the last user message's content blocks (skip if already marked above).
+    if let Some(last_user_msg) = messages.iter_mut().rev().find(|m| {
+        m.role == "user"
+            && !m.content.iter().any(|c| matches!(c, AnthropicContentOut::ToolResult { cache_control: Some(_), .. }))
+    }) {
+        if let Some(last_block) = last_user_msg.content.last_mut() {
+            match last_block {
+                AnthropicContentOut::Text { cache_control, .. }
+                | AnthropicContentOut::Image { cache_control, .. } => {
+                    *cache_control = Some(CacheControl::ephemeral());
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Build an Anthropic user message from SA's canonical message, handling both
+/// plain text and multimodal (text + images) content.
+fn build_anthropic_user_message(message: &ChatMessage) -> Option<AnthropicMessage> {
+    let content = message.content.as_ref()?;
+
+    match content {
+        MessageContent::Text(text) => {
+            let text = text.trim();
+            if text.is_empty() {
+                return None;
+            }
+            Some(AnthropicMessage::user_text(text.to_string()))
+        }
+        MessageContent::Parts(parts) => {
+            let mut blocks = Vec::<AnthropicContentOut>::new();
+            let mut has_content = false;
+
+            for part in parts {
+                match part {
+                    ContentPart::Text { text } => {
+                        let t = text.trim();
+                        if !t.is_empty() {
+                            blocks.push(AnthropicContentOut::Text {
+                                text: t.to_string(),
+                                cache_control: None,
+                            });
+                            has_content = true;
+                        }
+                    }
+                    ContentPart::Image { image_url } => {
+                        if let Some(source) = parse_data_url_to_anthropic_source(&image_url.url) {
+                            blocks.push(AnthropicContentOut::Image { source, cache_control: None });
+                            has_content = true;
+                        }
+                    }
+                }
+            }
+
+            has_content.then(|| AnthropicMessage {
+                role: "user".to_string(),
+                content: blocks,
+            })
+        }
+    }
+}
+
+/// Parse a `data:<media_type>;base64,<data>` URL into an Anthropic image source.
+fn parse_data_url_to_anthropic_source(data_url: &str) -> Option<AnthropicImageSource> {
+    let url = data_url.trim();
+    if !url.starts_with("data:") {
+        return None;
+    }
+    // Expected format: data:image/png;base64,iVBOR...
+    let rest = &url[5..];
+    let semi = rest.find(';')?;
+    let comma = rest.find(',')?;
+    if semi > comma {
+        return None;
+    }
+    let media_type = &rest[..semi];
+    let encoding = &rest[semi + 1..comma];
+    if !encoding.eq_ignore_ascii_case("base64") {
+        return None;
+    }
+    let data = &rest[comma + 1..];
+    if data.is_empty() {
+        return None;
+    }
+
+    Some(AnthropicImageSource {
+        type_: "base64".to_string(),
+        media_type: media_type.to_string(),
+        data: data.to_string(),
+    })
+}
+
 /// Build one Anthropic assistant message from SA's canonical assistant turn.
 fn build_anthropic_assistant_message(message: &ChatMessage) -> Option<AnthropicMessage> {
     let mut content = Vec::<AnthropicContentOut>::new();
 
-    if let Some(text) = non_empty_text(message.content.as_deref()) {
-        content.push(AnthropicContentOut::Text {
-            text: text.to_string(),
-        });
+    if let Some(text) = message.text_content() {
+        content.push(AnthropicContentOut::Text { text, cache_control: None });
     }
 
     if let Some(tool_calls) = message.tool_calls.as_ref() {
@@ -1509,6 +1895,7 @@ fn build_anthropic_assistant_message(message: &ChatMessage) -> Option<AnthropicM
                 id,
                 name: tool_call.function.name.clone(),
                 input,
+                cache_control: None,
             });
         }
     }
@@ -1523,12 +1910,13 @@ fn build_anthropic_assistant_message(message: &ChatMessage) -> Option<AnthropicM
 /// result history item.
 fn build_anthropic_tool_result_message(message: &ChatMessage) -> Option<AnthropicMessage> {
     let tool_use_id = sanitize_id(message.tool_call_id.as_deref())?;
-    let content = message.content.clone().unwrap_or_default();
+    let content = message.text_content().unwrap_or_default();
     Some(AnthropicMessage {
         role: "user".to_string(),
         content: vec![AnthropicContentOut::ToolResult {
             tool_use_id,
             content,
+            cache_control: None,
         }],
     })
 }
@@ -1581,7 +1969,7 @@ fn normalize_anthropic_messages_response(
         choices: vec![ChatChoice {
             message: ChatMessage {
                 role: "assistant".to_string(),
-                content,
+                content: content.map(MessageContent::Text),
                 tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
                 tool_call_id: None,
                 request_usage: None,
@@ -1670,20 +2058,45 @@ impl ResponsesRequest {
                 "tool" => {
                     if let Some(item) = build_tool_output_item(message) {
                         input.push(item);
-                    } else if let Some(text) = non_empty_text(message.content.as_deref()) {
+                    } else if let Some(text) = message.text_content() {
                         input.push(ResponsesInputItem::user_text(format!(
                             "[Tool result]\n{text}"
                         )));
                     }
                 }
                 "user" => {
-                    if let Some(text) = message.content.as_deref() {
-                        input.push(ResponsesInputItem::user_text(text.to_string()));
+                    if let Some(content) = message.content.as_ref() {
+                        match content {
+                            MessageContent::Text(text) => {
+                                input.push(ResponsesInputItem::user_text(text.clone()));
+                            }
+                            MessageContent::Parts(parts) => {
+                                let items: Vec<ResponsesContentItem> = parts
+                                    .iter()
+                                    .map(|part| match part {
+                                        ContentPart::Text { text } => {
+                                            ResponsesContentItem::InputText {
+                                                text: text.clone(),
+                                            }
+                                        }
+                                        ContentPart::Image { image_url } => {
+                                            ResponsesContentItem::InputImage {
+                                                image_url: image_url.url.clone(),
+                                            }
+                                        }
+                                    })
+                                    .collect();
+                                input.push(ResponsesInputItem::Message {
+                                    role: "user".to_string(),
+                                    content: items,
+                                });
+                            }
+                        }
                     }
                 }
                 _ => {
-                    if let Some(text) = non_empty_text(message.content.as_deref()) {
-                        instructions.push(text.to_string());
+                    if let Some(text) = message.text_content() {
+                        instructions.push(text);
                     }
                 }
             }
@@ -2268,7 +2681,7 @@ fn normalize_responses_response(response: ResponsesResponse) -> ChatCompletionsR
 
     let message = ChatMessage {
         role: "assistant".to_string(),
-        content,
+        content: content.map(MessageContent::Text),
         tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
         tool_call_id: None,
         request_usage: None,
@@ -2533,10 +2946,10 @@ fn normalize_responses_reasoning_content(
 fn build_assistant_responses_items(message: &ChatMessage) -> Vec<ResponsesInputItem> {
     let mut items = Vec::<ResponsesInputItem>::new();
 
-    if let Some(text) = message.content.as_deref() {
+    if let Some(text) = message.text_content() {
         items.push(ResponsesInputItem::message_output_text(
             "assistant",
-            text.to_string(),
+            text,
         ));
     }
 
@@ -2559,7 +2972,7 @@ fn build_assistant_responses_items(message: &ChatMessage) -> Vec<ResponsesInputI
 /// Build a `function_call_output` item from one canonical SA tool result message.
 fn build_tool_output_item(message: &ChatMessage) -> Option<ResponsesInputItem> {
     let call_id = sanitize_id(message.tool_call_id.as_deref())?;
-    let output = message.content.clone().unwrap_or_default();
+    let output = message.text_content().unwrap_or_default();
     Some(ResponsesInputItem::FunctionCallOutput {
         call_id,
         output: ResponsesFunctionCallOutputPayload::from_text(output),
@@ -2859,7 +3272,7 @@ mod tests {
         let response = acc.synthetic_response();
         let normalized = normalize_responses_response(response);
         let choice = normalized.first_choice().expect("choice should exist");
-        assert_eq!(choice.message.content.as_deref(), Some("hello world"));
+        assert_eq!(choice.message.text_content().as_deref(), Some("hello world"));
     }
 
     #[test]
@@ -2872,7 +3285,7 @@ mod tests {
                 ChatMessage::text("user", "看一下 a.txt"),
                 ChatMessage {
                     role: "assistant".to_string(),
-                    content: Some("先读文件".to_string()),
+                    content: Some(MessageContent::Text("先读文件".to_string())),
                     tool_calls: Some(vec![ToolCall {
                         id: "call_123".to_string(),
                         kind: "function".to_string(),
@@ -2950,7 +3363,7 @@ mod tests {
         let normalized = normalize_anthropic_messages_response(response);
         let usage = normalized.usage.clone().expect("usage should exist");
         let choice = normalized.first_choice().expect("choice should exist");
-        assert_eq!(choice.message.content.as_deref(), Some("先读取配置"));
+        assert_eq!(choice.message.text_content().as_deref(), Some("先读取配置"));
         let tool_calls = choice
             .message
             .tool_calls
@@ -3245,7 +3658,7 @@ mod tests {
         let choice = normalized
             .first_choice()
             .expect("normalized choice should exist");
-        assert_eq!(choice.message.content.as_deref(), Some("第一行\n第二行"));
+        assert_eq!(choice.message.text_content().as_deref(), Some("第一行\n第二行"));
     }
 
     #[test]
@@ -3261,7 +3674,7 @@ mod tests {
             .first_choice()
             .expect("normalized choice should exist");
         assert_eq!(
-            choice.message.content.as_deref(),
+            choice.message.text_content().as_deref(),
             Some("hello from top-level")
         );
     }

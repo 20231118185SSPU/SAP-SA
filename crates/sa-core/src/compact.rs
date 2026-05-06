@@ -22,12 +22,12 @@
 
 use crate::cancel::CancelToken;
 use crate::openai::{
-    ChatCompletionsError, ChatCompletionsRequest, ChatMessage, ChatUsage, OpenAiClient, ToolCall,
-    ToolDefinition,
+    ChatCompletionsError, ChatCompletionsRequest, ChatMessage, ChatUsage, ContentPart,
+    MessageContent, OpenAiClient, ToolCall, ToolDefinition,
 };
 use crate::retry::retry_delay;
 use anyhow::Context as _;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
 
 /// Synthetic message prefix used to inject the compaction checkpoint back into
@@ -154,7 +154,7 @@ const TOKEN_ESTIMATE_SAFETY_MARGIN_DENOMINATOR: usize = 5;
 /// These numbers are intentionally conservative because SA only receives
 /// authoritative usage snapshots on successful assistant turns. Everything
 /// after the latest assistant usage still relies on heuristics.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CompactionConfig {
     /// Master kill-switch.
@@ -289,6 +289,13 @@ struct CutPointResult {
 /// The stable system/developer prompt always stays first. If history has been
 /// compacted already, we inject a synthetic user summary right after it, then we
 /// append the retained real conversation messages.
+///
+/// Before returning, any completely empty assistant messages (no `content`,
+/// no `tool_calls`) are silently removed.  Such messages can arise when a model
+/// returns an empty turn (e.g. a "stop" finish reason with no actual content).
+/// Sending them to the provider triggers a 400 error like:
+///
+///   "messages[N] assistant must provide content, reasoning_content or tool_calls"
 pub fn build_request_messages(
     system_message: &ChatMessage,
     state: &CompactionState,
@@ -303,7 +310,24 @@ pub fn build_request_messages(
         request_messages.push(build_compaction_summary_message(summary));
     }
 
-    request_messages.extend(conversation_messages.iter().cloned());
+    // Append conversation messages, filtering out empty assistant turns that
+    // would cause provider 400 errors.
+    request_messages.extend(
+        conversation_messages
+            .iter()
+            .cloned()
+            .filter(|m| {
+                if m.role != "assistant" {
+                    return true;
+                }
+                let has_content = m.content.as_ref().is_some_and(|c| match c {
+                    MessageContent::Text(s) => !s.is_empty(),
+                    MessageContent::Parts(p) => !p.is_empty(),
+                });
+                let has_tool_calls = m.tool_calls.as_ref().is_some_and(|t| !t.is_empty());
+                has_content || has_tool_calls
+            }),
+    );
     request_messages
 }
 
@@ -314,6 +338,7 @@ pub fn build_compaction_summary_message(summary: &str) -> ChatMessage {
         format!("{COMPACTION_SUMMARY_PREFIX}{summary}{COMPACTION_SUMMARY_SUFFIX}"),
     )
 }
+
 
 /// Opportunistically compact the conversation history when it becomes large.
 ///
@@ -506,12 +531,12 @@ pub fn serialize_conversation(messages: &[ChatMessage]) -> String {
     for message in messages {
         match message.role.as_str() {
             "user" => {
-                if let Some(content) = non_empty_text(message.content.as_deref()) {
+                if let Some(content) = message.text_content() {
                     parts.push(format!("[User]: {content}"));
                 }
             }
             "assistant" => {
-                if let Some(content) = non_empty_text(message.content.as_deref()) {
+                if let Some(content) = message.text_content() {
                     parts.push(format!("[Assistant]: {content}"));
                 }
 
@@ -527,17 +552,17 @@ pub fn serialize_conversation(messages: &[ChatMessage]) -> String {
                 }
             }
             "tool" => {
-                if let Some(content) = non_empty_text(message.content.as_deref()) {
+                if let Some(content) = message.text_content() {
                     parts.push(format!("[Tool result]: {content}"));
                 }
             }
             role if role == "system" || role == "developer" => {
-                if let Some(content) = non_empty_text(message.content.as_deref()) {
+                if let Some(content) = message.text_content() {
                     parts.push(format!("[Context]: {content}"));
                 }
             }
             other => {
-                if let Some(content) = non_empty_text(message.content.as_deref()) {
+                if let Some(content) = message.text_content() {
                     parts.push(format!("[{other}]: {content}"));
                 }
             }
@@ -705,7 +730,32 @@ pub fn estimate_tokens(message: &ChatMessage) -> usize {
     let mut chars = 0usize;
 
     chars += message.role.len();
-    chars += message.content.as_deref().map_or(0, str::len);
+
+    // Count text characters; for images, estimate based on base64 length.
+    if let Some(content) = message.content.as_ref() {
+        match content {
+            MessageContent::Text(text) => {
+                chars += text.len();
+            }
+            MessageContent::Parts(parts) => {
+                for part in parts {
+                    match part {
+                        ContentPart::Text { text } => {
+                            chars += text.len();
+                        }
+                        ContentPart::Image { image_url } => {
+                            // Estimate tokens from base64 payload length.
+                            // A base64 string of length N encodes roughly 3N/4 bytes.
+                            // At ~4 chars/token, that's 3N/16 tokens.
+                            // For a typical image: base64 is ~100K+ chars → ~18K+ tokens.
+                            // Use base64 length directly for a reasonable estimate.
+                            chars += image_url.url.len();
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     if let Some(tool_call_id) = message.tool_call_id.as_deref() {
         chars += tool_call_id.len();
@@ -890,9 +940,7 @@ async fn generate_summary(
         .context("Summarization response contained no choices")?;
     let summary = choice
         .message
-        .content
-        .as_deref()
-        .map(str::trim)
+        .text_content()
         .filter(|text| !text.is_empty())
         .ok_or_else(|| anyhow::anyhow!("Summarization response contained empty content"))?;
 
@@ -927,9 +975,7 @@ async fn generate_turn_prefix_summary(
         .context("Turn-prefix summarization response contained no choices")?;
     let summary = choice
         .message
-        .content
-        .as_deref()
-        .map(str::trim)
+        .text_content()
         .filter(|text| !text.is_empty())
         .ok_or_else(|| {
             anyhow::anyhow!("Turn-prefix summarization response contained empty content")
@@ -957,6 +1003,8 @@ fn build_summarization_request(
         tools: None,
         tool_choice: None,
         stream: Some(false),
+        temperature: None,
+        top_p: None,
     }
 }
 
@@ -1022,15 +1070,6 @@ fn format_tool_call(tool_call: &ToolCall) -> String {
             tool_call.function.name, tool_call.function.arguments
         ),
     }
-}
-
-/// Strip and reject empty text values.
-fn non_empty_text(text: Option<&str>) -> Option<&str> {
-    let text = text?.trim();
-    if text.is_empty() {
-        return None;
-    }
-    Some(text)
 }
 
 /// Convert transport-layer summarization failures into stable `anyhow` errors.

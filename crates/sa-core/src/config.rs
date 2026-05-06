@@ -1,4 +1,4 @@
-//! Configuration loading for StudyAdministrator (SA).
+﻿//! Configuration loading for StudyAdministrator (SA).
 //!
 //! The user request explicitly asked for:
 //! - A TOML configuration file.
@@ -13,13 +13,14 @@ use crate::compact::CompactionConfig;
 use crate::dream::DreamConfig;
 use crate::openai::{AuthStyle, WireApi};
 use anyhow::Context as _;
+use crate::pii_detector::SanitizePolicy;
 use serde::de::Error as SerdeError;
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 /// Root configuration object (maps to the full `sa.toml`).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     /// LLM/provider configuration (`[llm]`).
     pub llm: LlmConfig,
@@ -53,10 +54,200 @@ pub struct Config {
     /// Durable multi-agent runtime configuration (`[team]`).
     #[serde(default)]
     pub team: TeamConfig,
+
+    /// Model routing configuration (`[model_routing]`).
+    #[serde(default)]
+    pub model_routing: ModelRoutingConfig,
+
+    /// Multi-backend search configuration (`[search]`).
+    #[serde(default)]
+    pub search: SearchConfig,
+}
+
+
+/// Model routing configuration (`[model_routing]` section).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ModelRoutingConfig {
+    /// Whether model routing is enabled.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Task category → model name mapping.
+    #[serde(default)]
+    pub categories: HashMap<String, String>,
+    /// Per-category API configuration overrides (optional).
+    #[serde(default)]
+    pub providers: HashMap<String, LlmProviderOverride>,
+}
+
+/// Per-category LLM provider override.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LlmProviderOverride {
+    /// Optional base URL override.
+    pub base_url: Option<String>,
+    /// Optional API key override.
+    pub api_key: Option<String>,
+}
+
+// ──────────────────── Search backend configuration ─────────────────
+
+/// Multi-backend search configuration (`[search]` section).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchConfig {
+    /// Ordered list of backend names to try (e.g. `["sogou", "ddg"]`).
+    #[serde(default = "default_search_backends")]
+    pub backends: Vec<String>,
+
+    /// Per-backend timeout in seconds.
+    #[serde(default = "default_search_timeout_secs")]
+    pub timeout_secs: u64,
+
+    /// Overall timeout for the entire search chain in seconds.
+    #[serde(default = "default_search_total_timeout_secs")]
+    pub total_timeout_secs: u64,
+
+    /// Brave Search API config.
+    #[serde(default)]
+    pub brave: BraveSearchConfig,
+
+    /// Bing Search API config.
+    #[serde(default)]
+    pub bing: BingSearchConfig,
+
+    /// SerpApi config.
+    #[serde(default)]
+    pub serpapi: SerpApiSearchConfig,
+
+    /// Sogou HTML scraping config.
+    #[serde(default)]
+    pub sogou: SogouSearchConfig,
+
+    /// DuckDuckGo HTML scraping config.
+    #[serde(default)]
+    pub ddg: DdgSearchConfig,
+
+    /// SearXNG self-hosted instance config.
+    #[serde(default)]
+    pub searxng: SearXngSearchConfig,
+
+    /// Semantic Scholar academic search config.
+    #[serde(default)]
+    pub semantic_scholar: SemanticScholarSearchConfig,
+}
+
+impl Default for SearchConfig {
+    fn default() -> Self {
+        Self {
+            backends: default_search_backends(),
+            timeout_secs: default_search_timeout_secs(),
+            total_timeout_secs: default_search_total_timeout_secs(),
+            brave: BraveSearchConfig::default(),
+            bing: BingSearchConfig::default(),
+            serpapi: SerpApiSearchConfig::default(),
+            sogou: SogouSearchConfig::default(),
+            ddg: DdgSearchConfig::default(),
+            searxng: SearXngSearchConfig::default(),
+            semantic_scholar: SemanticScholarSearchConfig::default(),
+        }
+    }
+}
+
+fn default_search_backends() -> Vec<String> {
+    vec!["sogou".to_string(), "ddg".to_string()]
+}
+
+fn default_search_timeout_secs() -> u64 {
+    15
+}
+
+fn default_search_total_timeout_secs() -> u64 {
+    45
+}
+
+/// Brave Search API configuration (`[search.brave]`).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct BraveSearchConfig {
+    /// Brave Search API subscription key.
+    #[serde(default)]
+    pub api_key: String,
+}
+
+/// Bing Search API configuration (`[search.bing]`).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct BingSearchConfig {
+    /// Bing Search API subscription key.
+    #[serde(default)]
+    pub api_key: String,
+}
+
+/// SerpApi configuration (`[search.serpapi]`).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SerpApiSearchConfig {
+    /// SerpApi API key.
+    #[serde(default)]
+    pub api_key: String,
+}
+
+/// Sogou HTML scraping configuration (`[search.sogou]`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SogouSearchConfig {
+    /// Whether Sogou backend is enabled.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl Default for SogouSearchConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+/// DuckDuckGo HTML scraping configuration (`[search.ddg]`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DdgSearchConfig {
+    /// Whether DuckDuckGo backend is enabled.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl Default for DdgSearchConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+/// SearXNG self-hosted instance configuration (`[search.searxng]`).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SearXngSearchConfig {
+    /// Base URL of the SearXNG instance (e.g. `http://localhost:8888`).
+    #[serde(default)]
+    pub base_url: String,
+
+    /// Whether SearXNG backend is enabled.
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+/// Semantic Scholar API configuration (`[search.semantic_scholar]`).
+/// Free academic paper search — no API key required for basic access.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SemanticScholarSearchConfig {
+    /// Whether Semantic Scholar backend is enabled.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl Default for SemanticScholarSearchConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// LLM/provider configuration (`[llm]` section).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmConfig {
     /// OpenAI-compatible base URL (example: `https://example.com/v1`).
     pub base_url: String,
@@ -120,10 +311,62 @@ pub struct LlmConfig {
     /// If this field is absent or blank, we omit it from the request body.
     #[serde(default)]
     pub reasoning_effort: Option<String>,
+    /// Sampling temperature (0.0 – 2.0).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+    /// Nucleus sampling parameter (0.0 – 1.0).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f64>,
+    /// Maximum output tokens per request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u32>,
+    /// Fallback model for automatic failover when the primary model produces
+    /// consecutive retryable errors. Defaults to `None` (disabled).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_model: Option<String>,
+    /// Number of consecutive retryable failures before switching to the
+    /// fallback model. Defaults to 2.
+    #[serde(default = "default_max_consecutive_failures")]
+    pub max_consecutive_failures: u32,
+    /// Maximum total retry attempts across all retryable errors before
+    /// giving up. Defaults to 12. When reached, the task is terminated
+    /// with an error message.
+    #[serde(default = "default_max_retries")]
+    pub max_retries: u32,
+
+    /// Thinking/reasoning configuration for models that support extended
+    /// thinking (e.g. MiMo-V2.5, DeepSeek-R1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<ThinkingConfig>,
+
+    /// Whether the model supports vision/multimodal image input.
+    /// When `true`, the runtime will include `image_url` content parts
+    /// in chat completion requests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vision: Option<bool>,
+}
+
+/// Thinking/reasoning configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThinkingConfig {
+    /// Type of thinking mode. Typically `"enabled"` or `"disabled"`.
+    #[serde(rename = "type")]
+    pub kind: String,
+    /// Maximum tokens allocated for thinking/reasoning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_tokens: Option<u32>,
+}
+
+fn default_max_consecutive_failures() -> u32 {
+    2
+}
+
+fn default_max_retries() -> u32 {
+    12
 }
 
 /// Durable multi-agent runtime configuration (`[team]` section).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TeamConfig {
     /// Whether unfinished work should be resumed automatically on boot.
     #[serde(default = "default_team_auto_resume")]
@@ -147,7 +390,7 @@ pub struct TeamConfig {
 ///
 /// The enum still exists so the config format remains explicit and can grow
 /// later without another breaking TOML change.
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum PermissionMode {
     /// No approval UI. Global deny rules and command-scoped restrictions still
@@ -157,7 +400,7 @@ pub enum PermissionMode {
 }
 
 /// Non-interactive permission controls (`[permissions]` section).
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PermissionsConfig {
     /// High-level mode. Defaults to `bypass`.
     #[serde(default)]
@@ -247,8 +490,223 @@ impl LlmConfig {
     }
 }
 
+/// Mask a sensitive string, keeping only the last `keep` characters visible.
+///
+/// Returns a string like `"sk-...xxxx"` if the input is longer than `keep`,
+/// or the original value if it's short enough.
+fn mask_secret(value: &str, keep: usize) -> String {
+    let trimmed = value.trim();
+    if trimmed.len() <= keep {
+        return "***".to_string();
+    }
+    let visible = &trimmed[trimmed.len() - keep..];
+    format!("***{visible}")
+}
+
+impl Config {
+    /// Serialize this config into a [`toml::Value`] for frontend display.
+    ///
+    /// Sensitive fields (e.g. `api_key`) are masked via [`mask_secret`].
+    pub fn to_toml_value(&self) -> toml::Value {
+        // Build each section as a TOML table.
+        let mut llm = toml::Table::new();
+        llm.insert("base_url".to_string(), toml::Value::String(self.llm.base_url.clone()));
+        llm.insert("api_key".to_string(), toml::Value::String(mask_secret(&self.llm.api_key, 4)));
+        llm.insert("model".to_string(), toml::Value::String(self.llm.model.clone()));
+        if let Some(ref wire_api) = self.llm.wire_api {
+            // Use serde serialization (lowercase) instead of Debug format.
+            let s = serde_json::to_string(wire_api).unwrap_or_else(|_| format!("{wire_api:?}"));
+            // serde_json::to_string wraps in quotes, remove them.
+            let s = s.trim_matches('"').to_string();
+            llm.insert("wire_api".to_string(), toml::Value::String(s));
+        }
+        if let Some(ref auth_style) = self.llm.auth_style {
+            let s = serde_json::to_string(auth_style).unwrap_or_else(|_| format!("{auth_style:?}"));
+            let s = s.trim_matches('"').to_string();
+            llm.insert("auth_style".to_string(), toml::Value::String(s));
+        }
+        if let Some(ref role) = self.llm.system_role_name {
+            llm.insert("system_role_name".to_string(), toml::Value::String(role.clone()));
+        }
+        if let Some(ref effort) = self.llm.reasoning_effort {
+            llm.insert("reasoning_effort".to_string(), toml::Value::String(effort.clone()));
+        }
+        if let Some(temp) = self.llm.temperature {
+            llm.insert("temperature".to_string(), toml::Value::Float(temp));
+        }
+        if let Some(tp) = self.llm.top_p {
+            llm.insert("top_p".to_string(), toml::Value::Float(tp));
+        }
+        if let Some(max_tok) = self.llm.max_output_tokens {
+            llm.insert("max_output_tokens".to_string(), toml::Value::Integer(max_tok as i64));
+        }
+        if let Some(ref fallback) = self.llm.fallback_model {
+            llm.insert("fallback_model".to_string(), toml::Value::String(fallback.clone()));
+        }
+        llm.insert("max_consecutive_failures".to_string(), toml::Value::Integer(self.llm.max_consecutive_failures as i64));
+        llm.insert("max_retries".to_string(), toml::Value::Integer(self.llm.max_retries as i64));
+        if let Some(ref thinking) = self.llm.thinking {
+            let mut tbl = toml::Table::new();
+            tbl.insert("type".to_string(), toml::Value::String(thinking.kind.clone()));
+            if let Some(budget) = thinking.budget_tokens {
+                tbl.insert("budget_tokens".to_string(), toml::Value::Integer(budget as i64));
+            }
+            llm.insert("thinking".to_string(), toml::Value::Table(tbl));
+        }
+        if let Some(vision) = self.llm.vision {
+            llm.insert("vision".to_string(), toml::Value::Boolean(vision));
+        }
+
+        let mut server = toml::Table::new();
+        server.insert("bind".to_string(), toml::Value::String(self.server.bind.clone()));
+        server.insert("ws_path".to_string(), toml::Value::String(self.server.ws_path.clone()));
+
+        let mut workspace = toml::Table::new();
+        workspace.insert("root_dir".to_string(), toml::Value::String(self.workspace.root_dir.clone()));
+        workspace.insert("agents_md".to_string(), toml::Value::String(self.workspace.agents_md.clone()));
+
+        let mut root = toml::Table::new();
+        root.insert("llm".to_string(), toml::Value::Table(llm));
+        root.insert("server".to_string(), toml::Value::Table(server));
+        root.insert("workspace".to_string(), toml::Value::Table(workspace));
+
+        toml::Value::Table(root)
+    }
+
+    /// Merge user-edited fields from a frontend JSON value into a new `Config`,
+    /// preserving the real `api_key` if the client sent a masked placeholder.
+    ///
+    /// The `current` parameter provides the live config values (including
+    /// unmasked secrets) to fall back on.
+    pub fn merge_from_frontend_value(
+        frontend: &toml::Value,
+        current: &Config,
+    ) -> anyhow::Result<Self> {
+        let tbl = frontend
+            .as_table()
+            .context("update_config payload must be a JSON object")?;
+
+        // Helper to read a string field from a toml::Value table.
+        let get_str = |table: &toml::Table, key: &str| -> Option<String> {
+            table.get(key).and_then(|v| v.as_str()).map(|s| s.to_string())
+        };
+
+        // --- [llm] ---
+        let llm_tbl = tbl
+            .get("llm")
+            .and_then(|v| v.as_table())
+            .context("config.llm must be an object")?;
+
+        let base_url = get_str(llm_tbl, "base_url")
+            .context("config.llm.base_url is required")?;
+        let model = get_str(llm_tbl, "model")
+            .context("config.llm.model is required")?;
+
+        // If the client sent a masked api_key, keep the current real one.
+        let raw_api_key = get_str(llm_tbl, "api_key").unwrap_or_default();
+        let api_key = if raw_api_key.starts_with("***") {
+            current.llm.api_key.clone()
+        } else {
+            raw_api_key
+        };
+
+        let wire_api = get_str(llm_tbl, "wire_api")
+            .map(|s| serde_json::from_value::<WireApi>(serde_json::json!(s)))
+            .transpose()
+            .context("config.llm.wire_api is invalid")?;
+
+        let auth_style = get_str(llm_tbl, "auth_style")
+            .map(|s| serde_json::from_value::<AuthStyle>(serde_json::json!(s)))
+            .transpose()
+            .context("config.llm.auth_style is invalid")?;
+
+        let system_role_name = get_str(llm_tbl, "system_role_name")
+            .filter(|s| !s.trim().is_empty());
+
+        let reasoning_effort = get_str(llm_tbl, "reasoning_effort")
+            .filter(|s| !s.trim().is_empty());
+
+        let temperature = llm_tbl.get("temperature").and_then(|v| v.as_float());
+        let top_p = llm_tbl.get("top_p").and_then(|v| v.as_float());
+        let max_output_tokens = llm_tbl
+            .get("max_output_tokens")
+            .and_then(|v| v.as_integer())
+            .map(|v| v as u32);
+
+        // Parse thinking config
+        let thinking = llm_tbl.get("thinking").and_then(|v| {
+            let tbl = v.as_table()?;
+            let kind = tbl.get("type")?.as_str()?.to_string();
+            let budget_tokens = tbl.get("budget_tokens").and_then(|v| v.as_integer()).map(|v| v as u32);
+            Some(ThinkingConfig { kind, budget_tokens })
+        });
+
+        // Parse vision flag
+        let vision = llm_tbl.get("vision").and_then(|v| v.as_bool());
+
+        let llm = LlmConfig {
+            base_url,
+            api_key,
+            model,
+            wire_api,
+            auth_style,
+            system_role_name,
+            reasoning_effort,
+            temperature,
+            top_p,
+            max_output_tokens,
+            fallback_model: None,
+            max_consecutive_failures: 2,
+            max_retries: 12,
+            thinking,
+            vision,
+        };
+
+        // --- [server] ---
+        let server_tbl = tbl
+            .get("server")
+            .and_then(|v| v.as_table())
+            .context("config.server must be an object")?;
+
+        let server = ServerConfig {
+            bind: get_str(server_tbl, "bind")
+                .context("config.server.bind is required")?,
+            ws_path: get_str(server_tbl, "ws_path")
+                .context("config.server.ws_path is required")?,
+        };
+
+        // --- [workspace] ---
+        let workspace_tbl = tbl
+            .get("workspace")
+            .and_then(|v| v.as_table())
+            .context("config.workspace must be an object")?;
+
+        let workspace = WorkspaceConfig {
+            root_dir: get_str(workspace_tbl, "root_dir")
+                .context("config.workspace.root_dir is required")?,
+            agents_md: get_str(workspace_tbl, "agents_md")
+                .context("config.workspace.agents_md is required")?,
+        };
+
+        // Carry over other sections from current config unchanged.
+        Ok(Config {
+            llm,
+            server,
+            workspace,
+            skills: current.skills.clone(),
+            compaction: current.compaction.clone(),
+            dream: current.dream.clone(),
+            mcp: current.mcp.clone(),
+            permissions: current.permissions.clone(),
+            team: current.team.clone(),
+            model_routing: current.model_routing.clone(),
+            search: current.search.clone(),
+        })
+    }
+}
+
 /// WebSocket daemon configuration (`[server]` section).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
     /// Listen address (example: `127.0.0.1:8765`).
     pub bind: String,
@@ -258,7 +716,7 @@ pub struct ServerConfig {
 }
 
 /// Workspace configuration (`[workspace]` section).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceConfig {
     /// The directory the agent is allowed to operate in.
     pub root_dir: String,
@@ -292,7 +750,7 @@ impl WorkspaceConfig {
 }
 
 /// Skills discovery configuration (`[skills]` section).
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SkillsConfig {
     /// Directories to scan for installed skills.
     ///
@@ -302,7 +760,7 @@ pub struct SkillsConfig {
 }
 
 /// Transport type for MCP server connections.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum McpTransport {
     /// Spawn a local process and communicate over stdin/stdout.
@@ -315,7 +773,7 @@ pub enum McpTransport {
 }
 
 /// Configuration for one external MCP server.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Serialize, Default)]
 pub struct McpServerConfig {
     /// Display name used as the tool prefix (`<server>__<tool>`).
     pub name: String,
@@ -346,12 +804,72 @@ pub struct McpServerConfig {
 /// Supported format:
 /// - `[mcp]`
 /// - `[mcp.<server_name>]`
+///
+/// Serialization produces the named-table format so that
+/// `toml::to_string_pretty → toml::from_str` round-trips correctly.
 #[derive(Debug, Clone, Default)]
 pub struct McpConfig {
     /// Whether MCP support is enabled.
     pub enabled: bool,
     /// Configured MCP servers.
     pub servers: Vec<McpServerConfig>,
+}
+
+/// Helper for serializing [`McpConfig`] in named-table TOML format.
+#[derive(Serialize)]
+struct McpConfigForSerialize {
+    enabled: bool,
+    #[serde(flatten)]
+    servers: BTreeMap<String, McpServerForSerialize>,
+}
+
+/// One server entry without the `name` field (the key acts as the name).
+#[derive(Serialize)]
+struct McpServerForSerialize {
+    transport: McpTransport,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    url: Option<String>,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    command: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    args: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cwd: Option<PathBuf>,
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    env: HashMap<String, String>,
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    headers: HashMap<String, String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_timeout_secs: Option<u64>,
+}
+
+impl Serialize for McpConfig {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut server_map = BTreeMap::new();
+        for server in &self.servers {
+            server_map.insert(
+                server.name.clone(),
+                McpServerForSerialize {
+                    transport: server.transport,
+                    url: server.url.clone(),
+                    command: server.command.clone(),
+                    args: server.args.clone(),
+                    cwd: server.cwd.clone(),
+                    env: server.env.clone(),
+                    headers: server.headers.clone(),
+                    tool_timeout_secs: server.tool_timeout_secs,
+                },
+            );
+        }
+        McpConfigForSerialize {
+            enabled: self.enabled,
+            servers: server_map,
+        }
+        .serialize(serializer)
+    }
 }
 
 impl<'de> Deserialize<'de> for McpServerConfig {
@@ -509,6 +1027,25 @@ struct RawMcpConfig {
     /// Named-table format: `[mcp.<name>]`.
     #[serde(flatten)]
     named_servers: BTreeMap<String, McpServerConfig>,
+}
+
+/// Privacy and PII detection configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PrivacyConfig {
+    /// Whether PII detection is enabled.
+    pub pii_detection: bool,
+    /// How to handle detected PII.
+    pub sanitize_policy: SanitizePolicy,
+}
+
+impl Default for PrivacyConfig {
+    fn default() -> Self {
+        Self {
+            pii_detection: true,
+            sanitize_policy: SanitizePolicy::Redact,
+        }
+    }
 }
 
 impl SkillsConfig {
@@ -772,6 +1309,14 @@ mod tests {
             auth_style: None,
             system_role_name: None,
             reasoning_effort: None,
+            temperature: None,
+            top_p: None,
+            max_output_tokens: None,
+            fallback_model: None,
+            max_consecutive_failures: 2,
+            max_retries: 12,
+            thinking: None,
+            vision: None,
         }
     }
 
