@@ -1259,18 +1259,24 @@ fn strip_timeout_wrapper(tokens: &[String]) -> Result<usize, String> {
             index += 1;
             continue;
         }
-        if token == "-k" || token == "-s" || token == "--kill-after" || token == "--signal" {
+        // -k/-s with value as next token: -k 5, --kill-after 10
+        if matches!(token.as_str(), "-k" | "-s" | "--kill-after" | "--signal") {
             if index + 1 >= tokens.len() {
                 return Err(format!("`timeout {token}` is missing its value"));
             }
             index += 2;
             continue;
         }
-        if token.starts_with("--kill-after=")
-            || token.starts_with("--signal=")
-            || token.starts_with("-k")
-            || token.starts_with("-s")
+        // -k/-s with attached value: -k5, -s10
+        if (token.starts_with("-k") || token.starts_with("-s"))
+            && token.len() > 2
+            && token[2..].chars().next().is_some_and(|c| c.is_ascii_digit())
         {
+            index += 1;
+            continue;
+        }
+        // --kill-after=N, --signal=N
+        if token.starts_with("--kill-after=") || token.starts_with("--signal=") {
             index += 1;
             continue;
         }
@@ -1659,6 +1665,20 @@ mod tests {
     #[test]
     fn allows_command_dash_v_probe() {
         let decision = validate("command -v bash");
+        assert_eq!(decision, BashSafetyDecision::Allow { warning: None });
+    }
+
+    #[test]
+    fn allows_timeout_with_kill_after_attached_value() {
+        // `-k5` form: value attached to flag, not a separate token
+        let decision = validate("timeout -k5 rm -rf /tmp/test");
+        assert_eq!(decision, BashSafetyDecision::Allow { warning: None });
+    }
+
+    #[test]
+    fn allows_timeout_with_kill_after_separate_value() {
+        // `-k 5` form: value as next token
+        let decision = validate("timeout -k 5 rm -rf /tmp/test");
         assert_eq!(decision, BashSafetyDecision::Allow { warning: None });
     }
 }

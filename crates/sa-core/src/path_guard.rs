@@ -103,22 +103,27 @@ pub fn validate_resolved_tool_path(
         );
     }
 
+    // Dangerous file names are blocked for ALL operations (Read, Write, Edit).
+    if resolved_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(is_dangerous_file_name)
+        .unwrap_or(false)
+    {
+        let verb = match operation {
+            PathOperation::Read => "reading",
+            PathOperation::Write | PathOperation::Edit => "mutation",
+        };
+        anyhow::bail!(
+            "SA blocks {verb} of sensitive configuration files through generic file tools: {}",
+            resolved_path.display()
+        );
+    }
+
     if matches!(operation, PathOperation::Read) {
         if path_contains_dangerous_directory(resolved_path) {
             anyhow::bail!(
                 "SA blocks reading dangerous internal/config directories through generic file tools: {}",
-                resolved_path.display()
-            );
-        }
-
-        if resolved_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .map(is_dangerous_file_name)
-            .unwrap_or(false)
-        {
-            anyhow::bail!(
-                "SA blocks reading sensitive configuration files through generic file tools: {}",
                 resolved_path.display()
             );
         }
@@ -136,18 +141,6 @@ pub fn validate_resolved_tool_path(
     if path_contains_dangerous_directory(resolved_path) {
         anyhow::bail!(
             "SA blocks generic file mutation inside dangerous directories: {}",
-            resolved_path.display()
-        );
-    }
-
-    if resolved_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .map(is_dangerous_file_name)
-        .unwrap_or(false)
-    {
-        anyhow::bail!(
-            "SA blocks generic file mutation for dangerous configuration files: {}",
             resolved_path.display()
         );
     }

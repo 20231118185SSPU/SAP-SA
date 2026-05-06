@@ -26,7 +26,15 @@ use crate::tools::{
 use std::collections::HashMap;
 use crate::ws_protocol::EventKind;
 use anyhow::Context as _;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
+
+static SUMMARY_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"<summary>\s*(.*?)\s*</summary>").expect("valid summary regex")
+});
+
+static FILE_REF_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"\{\{file:([^:}]+)(?::(\d+))?(?::(\d+))?\}\}").expect("valid file ref regex")
+});
 use uuid::Uuid;
 
 /// Static prompt source-of-truth loaded from the repository-level `prompt.md`.
@@ -50,17 +58,16 @@ fn expand_file_refs(
     messages: &mut [ChatMessage],
     workspace_root: &std::path::Path,
 ) {
-    let re = regex::Regex::new(r"\{\{file:([^:}]+)(?::(\d+))?(?::(\d+))?\}\}").unwrap();
     for msg in messages.iter_mut() {
         let Some(MessageContent::Text(text)) = &msg.content else {
             continue;
         };
-        if !re.is_match(text) {
+        if !FILE_REF_RE.is_match(text) {
             continue;
         }
         let mut result = text.clone();
         let mut modified = false;
-        for caps in re.captures_iter(text) {
+        for caps in FILE_REF_RE.captures_iter(text) {
             let file_path = caps.get(1).unwrap().as_str();
             let start: usize = caps
                 .get(2)
@@ -713,12 +720,12 @@ impl AgentRunner {
                         persistent_session.as_deref(),
                     )?;
                 }
-                Ok(ToolExecutionResult::ImagePayload { .. }) => {
+                Ok(ref image @ ToolExecutionResult::ImagePayload { .. }) => {
                     // Image payload: inject as a multimodal user message so the
                     // LLM can "see" the image on the next request.
                     let (tool_msg, user_msg) =
-                        build_image_payload_messages(&call.id, exec_result.as_ref().unwrap());
-                    let b64_len = match exec_result.as_ref().unwrap() {
+                        build_image_payload_messages(&call.id, image);
+                    let b64_len = match image {
                         ToolExecutionResult::ImagePayload { data_url, .. } => data_url.len(),
                         _ => 0,
                     };
@@ -1301,9 +1308,7 @@ impl AgentRunner {
             // Runs every turn that has non-empty assistant text, regardless of tool calls.
             if let Some(ref text) = assistant_text {
                 if !text.trim().is_empty() {
-                    let summary_re =
-                        regex::Regex::new(r"<summary>\s*(.*?)\s*</summary>").unwrap();
-                    if !summary_re.is_match(text) {
+                    if !SUMMARY_RE.is_match(text) {
                         let warning = ChatMessage::text(
                             "user",
                             "[DANGER] 上一轮回复遗漏了 <summary>做什么/为什么</summary> 标签。请在后续回复中严格遵守格式要求。",
@@ -1404,11 +1409,11 @@ impl AgentRunner {
                             persistent_session.as_deref(),
                         )?;
                     }
-                    Ok(ToolExecutionResult::ImagePayload { .. }) => {
+                    Ok(ref image @ ToolExecutionResult::ImagePayload { .. }) => {
                         // Image payload: inject as a multimodal user message.
                         let (tool_msg, user_msg) =
-                            build_image_payload_messages(&call.id, exec_result.as_ref().unwrap());
-                        let b64_len = match exec_result.as_ref().unwrap() {
+                            build_image_payload_messages(&call.id, image);
+                        let b64_len = match image {
                             ToolExecutionResult::ImagePayload { data_url, .. } => data_url.len(),
                             _ => 0,
                         };
