@@ -68,7 +68,11 @@ fn expand_file_refs(
         let mut result = text.clone();
         let mut modified = false;
         for caps in FILE_REF_RE.captures_iter(text) {
-            let file_path = caps.get(1).unwrap().as_str();
+            let Some(file_match) = caps.get(1) else {
+                tracing::warn!(target: "file_expand", "capture group 1 missing in file ref match");
+                continue;
+            };
+            let file_path = file_match.as_str();
             let start: usize = caps
                 .get(2)
                 .and_then(|m| m.as_str().parse().ok())
@@ -95,8 +99,11 @@ fn expand_file_refs(
                     String::new()
                 };
                 let replacement = format!("[expanded {{file:{file_path}}}:]\n{truncated}{excerpt}\n[/expanded]");
-                let full_match = caps.get(0).unwrap().as_str();
-                result = result.replace(full_match, &replacement);
+                let Some(full_match) = caps.get(0) else {
+                    tracing::warn!(target: "file_expand", "capture group 0 missing in file ref match");
+                    continue;
+                };
+                result = result.replace(full_match.as_str(), &replacement);
                 modified = true;
             }
         }
@@ -1177,20 +1184,20 @@ impl AgentRunner {
                         // 5.7 Quota exhausted: skip retry delay and either
                         //     failover immediately or terminate the task.
                         if err.is_quota_exhausted() {
-                            let fallback_available = self.cfg.fallback_model.is_some()
-                                && req.model != *self.cfg.fallback_model.as_ref().unwrap();
-                            if fallback_available {
-                                let fallback = self.cfg.fallback_model.as_ref().unwrap().clone();
-                                (emit)(
-                                    EventKind::Log,
-                                    task_id,
-                                    format!(
-                                        "配额耗尽，自动切换至 fallback 模型: {fallback}"
-                                    ),
-                                );
-                                req.model = fallback;
-                                model_error_count = 0;
-                                continue;
+                            if let Some(ref model) = self.cfg.fallback_model {
+                                if req.model != *model {
+                                    let fallback = model.clone();
+                                    (emit)(
+                                        EventKind::Log,
+                                        task_id,
+                                        format!(
+                                            "配额耗尽，自动切换至 fallback 模型: {fallback}"
+                                        ),
+                                    );
+                                    req.model = fallback;
+                                    model_error_count = 0;
+                                    continue;
+                                }
                             }
                             // No fallback or already on fallback: terminate.
                             let msg = format!(
@@ -1214,22 +1221,23 @@ impl AgentRunner {
 
                         // 5.6 Multi-model failover: switch to fallback model after
                         // consecutive failures exceed the configured threshold.
-                        if model_error_count >= self.cfg.max_consecutive_failures.max(1)
-                            && self.cfg.fallback_model.is_some()
-                            && req.model != *self.cfg.fallback_model.as_ref().unwrap()
-                        {
-                            let fallback = self.cfg.fallback_model.as_ref().unwrap().clone();
-                            (emit)(
-                                EventKind::Log,
-                                task_id,
-                                format!(
-                                    "模型 {model_error_count} 次连续失败，自动切换至 fallback 模型: {fallback}"
-                                ),
-                            );
-                            req.model = fallback;
-                            model_error_count = 0;
-                            // Retry immediately with the fallback model (no delay).
-                            continue;
+                        if model_error_count >= self.cfg.max_consecutive_failures.max(1) {
+                            if let Some(ref model) = self.cfg.fallback_model {
+                                if req.model != *model {
+                                    let fallback = model.clone();
+                                    (emit)(
+                                        EventKind::Log,
+                                        task_id,
+                                        format!(
+                                            "模型 {model_error_count} 次连续失败，自动切换至 fallback 模型: {fallback}"
+                                        ),
+                                    );
+                                    req.model = fallback;
+                                    model_error_count = 0;
+                                    // Retry immediately with the fallback model (no delay).
+                                    continue;
+                                }
+                            }
                         }
 
                         let delay = retry_delay(model_error_count);
