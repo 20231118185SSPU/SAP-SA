@@ -60,8 +60,14 @@ workspace/runtime/
 workspace/interactions/
 workspace/sessions/
 workspace/sa.exe
+sa/interactions/
+sa/sessions/
+sa/runtime/agents/
+sa/runtime/works/
 
 # === Tool State ===
 .omc/
 .tokeny/
 .claude/
+.deepseek/
+openspec/
