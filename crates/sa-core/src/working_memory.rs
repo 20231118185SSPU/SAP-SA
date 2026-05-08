@@ -340,7 +340,9 @@ impl WorkingMemory {
         // Persist to MemoryStore
         if let Some(ref store) = self.memory_store {
             let slot = self.pinned_slots.get(&key).unwrap();
-            let _ = store.pin(&key, &slot.label, &slot.content, slot.note.as_deref());
+            if let Err(e) = store.pin(&key, &slot.label, &slot.content, slot.note.as_deref()) {
+                tracing::warn!("Failed to persist pin to MemoryStore: {e}");
+            }
         }
     }
 
@@ -349,7 +351,9 @@ impl WorkingMemory {
         let removed = self.pinned_slots.remove(key);
         if removed.is_some() {
             if let Some(ref store) = self.memory_store {
-                let _ = store.unpin(key);
+                if let Err(e) = store.unpin(key) {
+                    tracing::warn!("Failed to persist unpin to MemoryStore: {e}");
+                }
             }
         }
         removed

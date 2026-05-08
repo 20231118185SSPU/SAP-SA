@@ -15,30 +15,6 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-// ── Configuration ───────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct MemoryStoreConfig {
-    pub enabled: bool,
-    pub db_path: String,
-    pub min_confidence: f64,
-    pub cleanup_max_age_days: u32,
-    pub cleanup_min_importance: f64,
-}
-
-impl Default for MemoryStoreConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            db_path: "memory/memory.db".into(),
-            min_confidence: 0.3,
-            cleanup_max_age_days: 90,
-            cleanup_min_importance: 0.15,
-        }
-    }
-}
-
 // ── Data models ─────────────────────────────────────────────────────────────
 
 /// Episodic memory entry stored in the `memories` table.
@@ -507,6 +483,10 @@ impl MemoryStore {
         let mut visited = std::collections::HashSet::new();
         let mut frontier = vec![subject.to_string()];
         let mut result = Vec::new();
+        let mut stmt = conn.prepare(
+            "SELECT id, subject, predicate, object, confidence, source, created_at, updated_at
+             FROM facts WHERE subject = ?1 ORDER BY confidence DESC",
+        )?;
 
         for _ in 0..max_hops {
             if frontier.is_empty() {
@@ -517,10 +497,6 @@ impl MemoryStore {
                 if !visited.insert(subj.clone()) {
                     continue;
                 }
-                let mut stmt = conn.prepare(
-                    "SELECT id, subject, predicate, object, confidence, source, created_at, updated_at
-                     FROM facts WHERE subject = ?1 ORDER BY confidence DESC",
-                )?;
                 let rows = stmt.query_map(params![subj], |row| row_to_fact(row))?;
                 for row in rows {
                     let fact = row?;
@@ -618,35 +594,27 @@ impl MemoryStore {
     /// Aggregate statistics.
     pub fn stats(&self) -> Result<MemoryStats> {
         let conn = self.conn.lock().unwrap();
-        let total_memories: i64 =
-            conn.query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))?;
-        let total_facts: i64 = conn.query_row("SELECT COUNT(*) FROM facts", [], |r| r.get(0))?;
-        let unique_subjects: i64 =
-            conn.query_row("SELECT COUNT(DISTINCT subject) FROM facts", [], |r| {
-                r.get(0)
-            })?;
-        let unique_predicates: i64 =
-            conn.query_row("SELECT COUNT(DISTINCT predicate) FROM facts", [], |r| {
-                r.get(0)
-            })?;
-        let avg_confidence: f64 = conn
-            .query_row(
-                "SELECT COALESCE(AVG(confidence), 0.0) FROM facts",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap_or(0.0);
-        let total_pins: i64 =
-            conn.query_row("SELECT COUNT(*) FROM pinned_slots", [], |r| r.get(0))?;
-
-        Ok(MemoryStats {
-            total_memories,
-            total_facts,
-            unique_subjects,
-            unique_predicates,
-            avg_confidence,
-            total_pins,
-        })
+        conn.query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM memories),
+                (SELECT COUNT(*) FROM facts),
+                (SELECT COUNT(DISTINCT subject) FROM facts),
+                (SELECT COUNT(DISTINCT predicate) FROM facts),
+                (SELECT COALESCE(AVG(confidence), 0.0) FROM facts),
+                (SELECT COUNT(*) FROM pinned_slots)",
+            [],
+            |r| {
+                Ok(MemoryStats {
+                    total_memories: r.get(0)?,
+                    total_facts: r.get(1)?,
+                    unique_subjects: r.get(2)?,
+                    unique_predicates: r.get(3)?,
+                    avg_confidence: r.get(4)?,
+                    total_pins: r.get(5)?,
+                })
+            },
+        )
+        .context("Failed to get memory stats")
     }
 
     /// Generate a deterministic fact ID from (subject, predicate, object).
@@ -674,7 +642,7 @@ impl MemoryStore {
     }
 
     /// Access the raw connection for migration purposes.
-    pub fn raw_conn(&self) -> &Mutex<Connection> {
+    pub(crate) fn raw_conn(&self) -> &Mutex<Connection> {
         &self.conn
     }
 }
