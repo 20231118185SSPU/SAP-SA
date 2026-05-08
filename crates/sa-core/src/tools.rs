@@ -1142,6 +1142,8 @@ pub struct ToolExecutor {
     pub ctx: ToolContext,
     /// Optional external MCP registry.
     mcp_registry: Option<Arc<McpRegistry>>,
+    /// Unified memory store (SQLite-backed).
+    pub memory_store: Option<Arc<crate::memory_store::MemoryStore>>,
 }
 
 impl std::fmt::Debug for ToolExecutor {
@@ -1163,7 +1165,13 @@ struct ImageAnalyzeOutput {
 impl ToolExecutor {
     /// Create a new executor.
     pub fn new(ctx: ToolContext, mcp_registry: Option<Arc<McpRegistry>>) -> Self {
-        Self { ctx, mcp_registry }
+        Self { ctx, mcp_registry, memory_store: None }
+    }
+
+    /// Attach a memory store to this executor.
+    pub fn with_memory_store(mut self, store: Arc<crate::memory_store::MemoryStore>) -> Self {
+        self.memory_store = Some(store);
+        self
     }
 
     /// Tool definitions advertised to the model.

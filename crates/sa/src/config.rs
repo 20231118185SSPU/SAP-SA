@@ -54,6 +54,7 @@ pub(crate) struct PreparedRuntime {
     pub(crate) workspace_root: PathBuf,
     pub(crate) reloadable: crate::RuntimeReloadState,
     pub(crate) dream_manager: DreamManager,
+    pub(crate) memory_store: std::sync::Arc<sa_core::memory_store::MemoryStore>,
     pub(crate) reload_summary: String,
 }
 
@@ -189,8 +190,16 @@ pub(crate) async fn prepare_runtime_from_config(
             None
         },
     };
-    let dream_manager = DreamManager::new(workspace_root.clone(), cfg.dream.clone(), cfg.semantic_memory.clone(), cfg.procedure.clone(), Some(llm_cfg_for_dream))?;
-    let runner = sa_core::agent::AgentRunner::new(llm, tools, Arc::clone(&skills), runner_cfg, cfg.working_memory.clone(), dream_manager.wake_handle());
+    let dream_manager = DreamManager::new(workspace_root.clone(), cfg.dream.clone())?;
+    let runner = sa_core::agent::AgentRunner::new(llm, tools, Arc::clone(&skills), runner_cfg);
+
+    // Initialize unified SQLite memory store.
+    let memory_db_path = workspace_root.join("memory").join("memory.db");
+    let memory_store = std::sync::Arc::new(
+        sa_core::memory_store::MemoryStore::new(&memory_db_path)
+            .map_err(|e| anyhow::anyhow!("Failed to initialize MemoryStore: {e}"))?,
+    );
+
     let max_concurrent_model_calls = cfg.team.max_concurrent_model_calls;
     let reload_summary = format!(
         "reloaded model={} system_role={} reasoning_effort={} local_skills={} mcp_servers={} agents_md={}",
@@ -215,6 +224,7 @@ pub(crate) async fn prepare_runtime_from_config(
             max_concurrent_model_calls,
         },
         dream_manager,
+        memory_store,
         reload_summary,
     })
 }

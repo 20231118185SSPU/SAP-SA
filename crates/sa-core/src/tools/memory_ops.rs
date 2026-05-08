@@ -1,12 +1,9 @@
 //! Memory-related tool implementations for ToolExecutor.
+//!
+//! All operations go through `MemoryStore` (SQLite-backed).
 
 use crate::cancel::CancelToken;
-use crate::cold_store;
-use crate::memory::{
-    self, MemoryMetadata, extract_entries_from_daily,
-    read_markdown_memory, search_markdown_memory, write_daily_memory,
-};
-use crate::working_memory::{PinnedSlot, WorkingMemory};
+use crate::memory_store::{MemoryEntry, MemoryPatch, MemoryStore};
 use super::ToolExecutor;
 use anyhow::Context as _;
 use serde::Deserialize;
@@ -23,6 +20,14 @@ pub trait MemoryOps {
     async fn unpin_memory(&self, args: serde_json::Value, cancel: &CancelToken) -> anyhow::Result<String>;
 }
 
+fn require_store(executor: &ToolExecutor) -> anyhow::Result<&MemoryStore> {
+    executor
+        .memory_store
+        .as_ref()
+        .map(|arc| arc.as_ref())
+        .context("MemoryStore not configured — memory tools unavailable")
+}
+
 #[async_trait::async_trait]
 impl MemoryOps for ToolExecutor {
 
@@ -32,7 +37,7 @@ impl MemoryOps for ToolExecutor {
         struct Args {
             query: String,
             max_results: Option<usize>,
-            min_score: Option<f64>,
+            scope: Option<String>,
         }
 
         let args: Args =
@@ -41,20 +46,14 @@ impl MemoryOps for ToolExecutor {
             anyhow::bail!("MemorySearch cancelled");
         }
 
-        let results = search_markdown_memory(
-            &self.ctx.workspace_root,
-            &args.query,
-            args.max_results,
-            args.min_score,
-            None,
-            None,
-        )
-        .await?;
+        let store = require_store(self)?;
+        let limit = args.max_results.unwrap_or(10).min(50);
+        let results = store.search_memories(&args.query, args.scope.as_deref(), limit)?;
 
         Ok(serde_json::json!({
             "query": args.query,
+            "count": results.len(),
             "results": results,
-            "engine": "markdown_lexical_v1",
         })
         .to_string())
     }
@@ -63,9 +62,7 @@ impl MemoryOps for ToolExecutor {
     async fn memory_get(&self, args: serde_json::Value, cancel: &CancelToken) -> anyhow::Result<String> {
         #[derive(Debug, Deserialize)]
         struct Args {
-            path: String,
-            from: Option<usize>,
-            lines: Option<usize>,
+            id: String,
         }
 
         let args: Args = serde_json::from_value(args).context("Invalid arguments for MemoryGet")?;
@@ -73,11 +70,18 @@ impl MemoryOps for ToolExecutor {
             anyhow::bail!("MemoryGet cancelled");
         }
 
-        let result =
-            read_markdown_memory(&self.ctx.workspace_root, &args.path, args.from, args.lines)
-                .await?;
-
-        Ok(serde_json::to_string(&result)?)
+        let store = require_store(self)?;
+        match store.get_memory(&args.id)? {
+            Some(entry) => {
+                store.touch_memory(&args.id)?;
+                Ok(serde_json::to_string(&entry)?)
+            }
+            None => Ok(serde_json::json!({
+                "error": "not_found",
+                "id": args.id,
+            })
+            .to_string()),
+        }
     }
 
     // ── forget_memory ──────────────────────────────────────────────────
@@ -94,75 +98,20 @@ impl MemoryOps for ToolExecutor {
             anyhow::bail!("ForgetMemory cancelled");
         }
 
-        // Search for matching entries
-        let results = search_markdown_memory(
-            &self.ctx.workspace_root,
-            &args.query,
-            args.max_results.or(Some(10)),
-            None,
-            None,
-            None,
-        )
-        .await?;
+        let store = require_store(self)?;
+        let limit = args.max_results.unwrap_or(10).min(50);
+        let results = store.search_memories(&args.query, None, limit)?;
 
         let mut deleted = 0usize;
-        let mut errors: Vec<String> = Vec::new();
-
-        for result in &results {
-            // Read the file and find the entry index by matching snippet
-            let file_path = self.ctx.workspace_root.join(&result.path);
-            let content = match std::fs::read_to_string(&file_path) {
-                Ok(c) => c,
-                Err(e) => {
-                    errors.push(format!("{}: read error: {}", result.path, e));
-                    continue;
-                }
-            };
-            let entries = extract_entries_from_daily(&content);
-
-            // Find entry index whose body overlaps with the search result lines
-            // (approximate: match by snippet content)
-            let mut entry_idx = None;
-            for (idx, (body, _meta)) in entries.iter().enumerate() {
-                if body.contains(&result.snippet[..std::cmp::min(50, result.snippet.len())])
-                    || result.snippet.contains(&body[..std::cmp::min(50, body.len())])
-                {
-                    entry_idx = Some(idx);
-                    break;
-                }
-            }
-
-            let Some(idx) = entry_idx else {
-                errors.push(format!(
-                    "{}: could not match snippet to entry",
-                    result.path
-                ));
-                continue;
-            };
-
-            match cold_store::soft_delete_entry(
-                &self.ctx.workspace_root,
-                &result.path,
-                idx,
-                "deleted via ForgetMemory tool",
-            ) {
-                Ok(sr) => {
-                    if sr.success {
-                        deleted += 1;
-                    } else {
-                        errors.push(format!("{}: {}", result.path, sr.reason));
-                    }
-                }
-                Err(e) => {
-                    errors.push(format!("{}: {}", result.path, e));
-                }
+        for entry in &results {
+            if store.delete_memory(&entry.id)? {
+                deleted += 1;
             }
         }
 
         Ok(serde_json::json!({
             "deleted": deleted,
             "total_matches": results.len(),
-            "errors": errors,
         })
         .to_string())
     }
@@ -172,12 +121,11 @@ impl MemoryOps for ToolExecutor {
         #[derive(Debug, Deserialize)]
         struct Args {
             content: String,
-            date: Option<String>,
+            title: Option<String>,
             tags: Option<Vec<String>>,
             importance: Option<f64>,
+            scope: Option<String>,
             force: Option<bool>,
-            title: Option<String>,
-            summary: Option<String>,
         }
 
         let args: Args =
@@ -186,61 +134,56 @@ impl MemoryOps for ToolExecutor {
             anyhow::bail!("MemorySet cancelled");
         }
 
-        let date = args
-            .date
-            .unwrap_or_else(|| chrono::Utc::now().format("%Y-%m-%d").to_string());
-        let file_path = self
-            .ctx
-            .workspace_root
-            .join(format!("memory/{}.md", date));
+        let store = require_store(self)?;
 
-        // Dedup check: if file exists and force is not set, check for similar entries
-        if file_path.exists() && !args.force.unwrap_or(false) {
-            let existing = std::fs::read_to_string(&file_path).unwrap_or_default();
-            let entries = extract_entries_from_daily(&existing);
-            let new_tokens: Vec<&str> = args.content.split_whitespace().collect();
-            for (body, _meta) in &entries {
-                let existing_tokens: Vec<&str> = body.split_whitespace().collect();
-                let intersection = new_tokens
-                    .iter()
-                    .filter(|t| existing_tokens.contains(t))
-                    .count();
-                let union = new_tokens.len() + existing_tokens.len() - intersection;
-                if union == 0 {
-                    continue;
-                }
-                let jaccard = intersection as f64 / union as f64;
-                if jaccard > 0.7 {
+        // Dedup check: search for similar existing entries
+        if !args.force.unwrap_or(false) {
+            let similar = store.search_memories(&args.content[..args.content.len().min(200)], None, 5)?;
+            for existing in &similar {
+                let sim = crate::memory::compute_similarity(&existing.content, &args.content);
+                if sim > 0.7 {
                     return Ok(serde_json::json!({
                         "action": "skipped",
                         "reason": "duplicate",
-                        "similarity": jaccard,
-                        "existing_snippet": body.chars().take(120).collect::<String>(),
-                        "file": format!("memory/{}.md", date),
+                        "similarity": sim,
+                        "existing_id": existing.id,
+                        "existing_snippet": existing.content.chars().take(120).collect::<String>(),
                     })
                     .to_string());
                 }
             }
         }
 
-        // Build metadata
-        let mut meta = MemoryMetadata::default();
-        meta.tags = args.tags;
-        meta.importance = args.importance;
-        meta.title = args.title;
-        meta.summary = args.summary;
+        let now = chrono::Utc::now().timestamp();
+        let title = args.title.unwrap_or_else(|| {
+            args.content.chars().take(50).collect()
+        });
+        let importance = args.importance.unwrap_or_else(|| {
+            crate::memory::score_content_importance(&args.content)
+        });
+        let (valence, _arousal) = crate::memory::detect_emotion(&args.content);
 
-        write_daily_memory(
-            &self.ctx.workspace_root,
-            &date,
-            &args.content,
-            &meta,
-            None,
-        )?;
+        let entry = MemoryEntry {
+            id: MemoryStore::memory_id(&title, &args.content),
+            title,
+            content: args.content.clone(),
+            tags: args.tags.unwrap_or_default(),
+            scope: args.scope.unwrap_or_else(|| "user".into()),
+            importance,
+            emotion_valence: valence,
+            source: "agent".into(),
+            access_count: 0,
+            created_at: now,
+            updated_at: now,
+            accessed_at: now,
+        };
+
+        let id = entry.id.clone();
+        store.insert_memory(&entry)?;
 
         Ok(serde_json::json!({
             "action": "written",
-            "file": format!("memory/{}.md", date),
+            "id": id,
             "content_snippet": args.content.chars().take(120).collect::<String>(),
         })
         .to_string())
@@ -250,18 +193,12 @@ impl MemoryOps for ToolExecutor {
     async fn edit_memory(&self, args: serde_json::Value, cancel: &CancelToken) -> anyhow::Result<String> {
         #[derive(Debug, Deserialize)]
         struct Args {
-            path: String,
-            from_line: usize,
-            #[allow(dead_code)]
-            #[allow(dead_code)]
-            #[allow(dead_code)]
-            #[allow(dead_code)]
-            to_line: usize,
-            new_content: String,
+            id: String,
+            content: Option<String>,
+            title: Option<String>,
             tags: Option<Vec<String>>,
             importance: Option<f64>,
-            title: Option<String>,
-            summary: Option<String>,
+            scope: Option<String>,
         }
 
         let args: Args =
@@ -270,47 +207,20 @@ impl MemoryOps for ToolExecutor {
             anyhow::bail!("EditMemory cancelled");
         }
 
-        let file_path = self.ctx.workspace_root.join(&args.path);
-        let existing = std::fs::read_to_string(&file_path)
-            .with_context(|| format!("Cannot read {}", args.path))?;
-
-        let entries = extract_entries_from_daily(&existing);
-
-        // Find the entry containing from_line
-        let edit_idx = if args.from_line > 0 && args.from_line <= entries.len() {
-            args.from_line - 1
-        } else {
-            0
+        let store = require_store(self)?;
+        let patch = MemoryPatch {
+            title: args.title,
+            content: args.content,
+            tags: args.tags,
+            scope: args.scope,
+            importance: args.importance,
+            emotion_valence: None,
         };
 
-        // Build updated metadata
-        let (_old_body, old_meta) = &entries[edit_idx];
-        let mut updated_meta = old_meta.clone();
-        if let Some(ref tags) = args.tags {
-            updated_meta.tags = Some(tags.clone());
-        }
-        if let Some(imp) = args.importance {
-            updated_meta.importance = Some(imp);
-        }
-        if let Some(ref title) = args.title {
-            updated_meta.title = Some(title.clone());
-        }
-        if let Some(ref summary) = args.summary {
-            updated_meta.summary = Some(summary.clone());
-        }
-
-        memory::rebuild_daily_with_edited_entry(
-            &file_path,
-            &entries,
-            edit_idx,
-            &updated_meta,
-            Some(&args.new_content),
-        )?;
-
+        let updated = store.update_memory(&args.id, &patch)?;
         Ok(serde_json::json!({
-            "action": "edited",
-            "file": args.path,
-            "entry_index": edit_idx,
+            "action": if updated { "edited" } else { "not_found" },
+            "id": args.id,
         })
         .to_string())
     }
@@ -320,8 +230,8 @@ impl MemoryOps for ToolExecutor {
         #[derive(Debug, Deserialize)]
         struct Args {
             key: String,
-            label: String,
             content: String,
+            label: Option<String>,
             note: Option<String>,
         }
 
@@ -331,20 +241,13 @@ impl MemoryOps for ToolExecutor {
             anyhow::bail!("PinMemory cancelled");
         }
 
-        let mut cache = self.pinned_cache.lock().unwrap();
-        let slot = PinnedSlot {
-            label: args.label.clone(),
-            content: args.content.clone(),
-            pinned_at: chrono::Utc::now().timestamp_millis(),
-            note: args.note.clone(),
-        };
-        cache.insert(args.key.clone(), slot);
-        WorkingMemory::save_pinned_to_file(&self.ctx.workspace_root, &cache)?;
+        let store = require_store(self)?;
+        let label = args.label.as_deref().unwrap_or(&args.key);
+        store.pin(&args.key, label, &args.content, args.note.as_deref())?;
 
         Ok(serde_json::json!({
             "action": "pinned",
             "key": args.key,
-            "label": args.label,
         })
         .to_string())
     }
@@ -362,12 +265,11 @@ impl MemoryOps for ToolExecutor {
             anyhow::bail!("UnpinMemory cancelled");
         }
 
-        let mut cache = self.pinned_cache.lock().unwrap();
-        let removed = cache.remove(&args.key);
-        WorkingMemory::save_pinned_to_file(&self.ctx.workspace_root, &cache)?;
+        let store = require_store(self)?;
+        let removed = store.unpin(&args.key)?;
 
         Ok(serde_json::json!({
-            "action": if removed.is_some() { "unpinned" } else { "not_found" },
+            "action": if removed { "unpinned" } else { "not_found" },
             "key": args.key,
         })
         .to_string())

@@ -1,27 +1,22 @@
 //! Working Memory Layer — a structured hot buffer that sits between the
-//! agent's in-memory `messages` vector and the long-term Markdown files.
+//! agent's in-memory `messages` vector and the long-term SQLite store.
 //!
 //! Design goals:
 //! - **Three-segment structure**: hot_buffer (recent messages), pinned_slots
 //!   (user identity, task, never-evicted), scratchpad (internal reasoning).
-//! - **Overflow summarization**: when hot_buffer exceeds capacity (message
-//!   count OR token budget), the oldest 1/3 of non-pinned messages are
-//!   LLM-compressed into a summary that stays in the buffer head.
+//! - **Overflow eviction**: when hot_buffer exceeds capacity (message count OR
+//!   token budget), the oldest non-pinned messages are evicted (FIFO).
 //! - **Importance scoring**: lightweight rule-based scoring (no LLM call)
 //!   on every inbound message; score > threshold triggers "consolidation
 //!   candidate" flag for the dream pipeline.
-//! - **Pinned slots**: model-controlled via PinMemory/UnpinMemory tools.
-//!   Pinned entries are invisible to overflow eviction.
-//!
-//! This module is intentionally stateless across calls — each agent quantum
-//! gets a fresh WorkingMemory instance. Long-term state lives in the
-//! Markdown files (memory.rs / dream.rs).
+//! - **Pinned slots**: persisted via MemoryStore (SQLite). Pinned entries are
+//!   invisible to overflow eviction.
 
-use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
-use std::path::Path;
+use std::sync::Arc;
 
+use crate::memory_store::{MemoryStore, PinnedSlot};
 use crate::noise_assessment::{NoiseAssessment, NoiseAssessor, NoiseConfig};
 use crate::openai::ChatMessage;
 
@@ -42,11 +37,6 @@ pub struct WorkingMemoryConfig {
     /// Importance score threshold that marks a message as "consolidation
     /// candidate" for the dream pipeline.
     pub importance_threshold: f64,
-    /// Fraction of the oldest hot buffer messages to compress when overflow
-    /// is detected (e.g. 0.33 = compress the oldest 1/3).
-    pub overflow_compress_fraction: f64,
-    /// Whether overflow summarization is enabled.
-    pub enable_summarization: bool,
     /// D8: Decay configuration.
     #[serde(default)]
     pub decay: Option<DecayConfig>,
@@ -90,8 +80,6 @@ impl Default for WorkingMemoryConfig {
             hot_buffer_max_chars: 8_000,
             max_memory_bytes: 10 * 1024 * 1024, // 10MB default
             importance_threshold: 0.6,
-            overflow_compress_fraction: 0.33,
-            enable_summarization: true,
             decay: None,
             noise: NoiseConfig::default(),
         }
@@ -106,37 +94,20 @@ impl Default for WorkingMemoryConfig {
 /// No LLM call — runs synchronously on every inbound message.
 ///
 /// Score range: 0.0 – 1.0
-///
-/// Components:
-///   - entity_indicator: contains proper nouns, dates, numbers (0.3)
-///   - preference_keyword: contains preference/always/never/like/dislike (0.3)
-///   - emotion_keyword: contains emotional language (0.2)
-///   - explicit_marker: user prefixes with "remember" / "note that" (0.2)
 fn score_importance(message: &ChatMessage) -> f64 {
     let text = message.text_content().unwrap_or("".to_string());
     let lower = text.to_ascii_lowercase();
 
     let mut score = 0.0;
 
-    // Entity indicator: dates, numbers, proper noun patterns
-    let has_entity = contains_entity_signal(&lower);
-    if has_entity {
+    if contains_entity_signal(&lower) {
         score += 0.3;
     }
-
-    // Preference / behavioral keywords
-    let has_preference = contains_preference_signal(&lower);
-    if has_preference {
+    if contains_preference_signal(&lower) {
         score += 0.6;
     }
-
-    // Emotional intensity (high emotion=0.6, medium=0.4, low=0.1)
-    let emotion = contains_emotion_signal(&lower);
-    score += 0.6 * emotion;
-
-    // Explicit importance markers
-    let has_explicit = contains_explicit_marker(&lower);
-    if has_explicit {
+    score += 0.6 * contains_emotion_signal(&lower);
+    if contains_explicit_marker(&lower) {
         score += 0.2;
     }
 
@@ -144,13 +115,12 @@ fn score_importance(message: &ChatMessage) -> f64 {
 }
 
 fn contains_entity_signal(text: &str) -> bool {
-    // Dates, numbers, quoted terms, slash-separated identifiers
     let patterns = [
-        r"\d{4}-\d{2}-\d{2}",  // ISO dates
-        r"\d{1,2}[月日年]",     // Chinese date patterns
-        r#""[^"]{3,}"#,       // Quoted strings
-        r"/[\w-]+/[\w-]+",    // Slash paths
-        r"\d[\d,.]+[万元人公里个次]", // Quantities with Chinese units
+        r"\d{4}-\d{2}-\d{2}",
+        r"\d{1,2}[月日年]",
+        r#""[^"]{3,}"#,
+        r"/[\w-]+/[\w-]+",
+        r"\d[\d,.]+[万元人公里个次]",
     ];
     patterns.iter().any(|p| regex_lite_match(p, text))
 }
@@ -191,12 +161,9 @@ fn contains_explicit_marker(text: &str) -> bool {
     markers.iter().any(|m| text.contains(m))
 }
 
-/// Simple regex-lite pattern matching (no external crate dependency).
-/// Supports: \d{4}-\d{2}-\d{2} (ISO dates), \d{4} (4-digit years), basic text contains.
 fn regex_lite_match(pattern: &str, text: &str) -> bool {
     match pattern {
         r"\d{4}-\d{2}-\d{2}" => {
-            // Check for YYYY-MM-DD pattern (including YYYY/MM/DD and YYYY.MM.DD)
             for window in text.as_bytes().windows(10) {
                 if window[0].is_ascii_digit()
                     && window[1].is_ascii_digit()
@@ -258,43 +225,23 @@ impl WorkingMemoryEntry {
 }
 
 // ---------------------------------------------------------------------------
-// Pinned slot entry
-// ---------------------------------------------------------------------------
-
-/// One pinned slot entry. Pinned entries are never evicted by overflow.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PinnedSlot {
-    /// Human-readable label for this pinned entry.
-    pub label: String,
-    /// The content stored in this slot.
-    pub content: String,
-    /// When this slot was created (Unix timestamp ms).
-    pub pinned_at: i64,
-    /// Optional free-form note about why this was pinned.
-    pub note: Option<String>,
-}
-
-// ---------------------------------------------------------------------------
 // Working memory struct
 // ---------------------------------------------------------------------------
 
 /// Three-segment working memory.
 ///
 /// - **hot_buffer**: ring buffer of recent messages with importance scores.
-///   Evicted on overflow (oldest non-pinned messages compressed first).
-/// - **pinned_slots**: model-controlled permanent entries (user identity,
-///   current task, etc.). Never evicted automatically.
+///   Oldest entries evicted on overflow (FIFO).
+/// - **pinned_slots**: persisted via MemoryStore (SQLite). Never evicted.
 /// - **scratchpad**: agent's internal reasoning, can be discarded at any time.
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkingMemory {
-    /// Config reference (not stored, passed in at construction).
-    #[serde(skip)]
+    /// Runtime config.
     config: WorkingMemoryConfig,
 
     /// Ring buffer of recent conversation messages.
     hot_buffer: VecDeque<WorkingMemoryEntry>,
 
-    /// Model-controlled pinned slots.
+    /// In-memory cache of pinned slots (synced from/to MemoryStore).
     pinned_slots: HashMap<String, PinnedSlot>,
 
     /// Internal reasoning scratchpad.
@@ -306,8 +253,22 @@ pub struct WorkingMemory {
     /// Total message count in hot_buffer.
     message_count: usize,
 
-    /// Number of overflow compressions performed in this session.
-    compressions: u32,
+    /// Optional MemoryStore for persistent pin storage.
+    memory_store: Option<Arc<MemoryStore>>,
+}
+
+impl std::fmt::Debug for WorkingMemory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkingMemory")
+            .field("config", &self.config)
+            .field("hot_buffer", &self.hot_buffer)
+            .field("pinned_slots", &self.pinned_slots)
+            .field("scratchpad", &self.scratchpad)
+            .field("total_chars", &self.total_chars)
+            .field("message_count", &self.message_count)
+            .field("memory_store", &"<MemoryStore>")
+            .finish()
+    }
 }
 
 impl WorkingMemory {
@@ -325,144 +286,73 @@ impl WorkingMemory {
             scratchpad: String::new(),
             total_chars: 0,
             message_count: 0,
-            compressions: 0,
+            memory_store: None,
         }
     }
 
+    /// Attach a MemoryStore for persistent pin storage.
+    /// Loads existing pins from the store into the in-memory cache.
+    pub fn with_memory_store(mut self, store: Arc<MemoryStore>) -> Self {
+        // Load existing pins
+        if let Ok(pins) = store.list_pins() {
+            for pin in pins {
+                self.pinned_slots.insert(pin.key.clone(), pin);
+            }
+        }
+        self.memory_store = Some(store);
+        self
+    }
+
     /// Add a user or assistant message to the hot buffer.
-    /// Triggers overflow check after insertion.
-    pub fn push_message(&mut self, message: ChatMessage) -> OverflowAction {
+    /// Triggers FIFO eviction if over capacity.
+    pub fn push_message(&mut self, message: ChatMessage) {
         let entry = WorkingMemoryEntry::new(message, &self.config);
         let char_count = entry.char_count;
 
-        // Pre-check: detect if buffer is at/over capacity before insert
-        let needs_eviction = self.message_count >= self.config.hot_buffer_max_messages
-            || self.total_chars + char_count > self.config.hot_buffer_max_chars;
-
-        if needs_eviction {
-            if self.config.enable_summarization {
-                // Evict oldest to make room; return NeedsSummarization so caller
-                // runs summarize_and_compress() after this insert.
-                while self.message_count >= self.config.hot_buffer_max_messages
-                    || self.total_chars + char_count > self.config.hot_buffer_max_chars
-                {
-                    if let Some(entry) = self.hot_buffer.pop_front() {
-                        self.total_chars = self.total_chars.saturating_sub(entry.char_count);
-                        self.message_count = self.message_count.saturating_sub(1);
-                    } else {
-                        break;
-                    }
-                }
-                self.hot_buffer.push_back(entry);
-                self.total_chars += char_count;
-                self.message_count += 1;
-                return OverflowAction::NeedsSummarization;
+        // Evict oldest to make room if at/over capacity
+        while self.message_count >= self.config.hot_buffer_max_messages
+            || self.total_chars + char_count > self.config.hot_buffer_max_chars
+        {
+            if let Some(evicted) = self.hot_buffer.pop_front() {
+                self.total_chars = self.total_chars.saturating_sub(evicted.char_count);
+                self.message_count = self.message_count.saturating_sub(1);
             } else {
-                self.evict_oldest();
+                break;
             }
         }
 
         self.hot_buffer.push_back(entry);
         self.total_chars += char_count;
         self.message_count += 1;
-
-        OverflowAction::None
     }
 
-    /// Check if overflow has occurred and return the action to take.
-    #[allow(dead_code)]
-    fn check_overflow(&mut self) -> OverflowAction {
-        let exceeds_count = self.message_count >= self.config.hot_buffer_max_messages;
-        let exceeds_chars = self.total_chars >= self.config.hot_buffer_max_chars;
-
-        if !exceeds_count && !exceeds_chars {
-            return OverflowAction::None;
-        }
-
-        if !self.config.enable_summarization {
-            // Without summarization, just evict the oldest non-pinned entries
-            self.evict_oldest();
-            return OverflowAction::Evicted;
-        }
-
-        OverflowAction::NeedsSummarization
-    }
-
-    /// Evict the oldest entries from the hot buffer until within limits.
-    /// Pinned entries (if any were somehow added — they shouldn't be) are skipped.
-    fn evict_oldest(&mut self) {
-        while self.message_count > 0
-            && (self.message_count > self.config.hot_buffer_max_messages
-                || self.total_chars > self.config.hot_buffer_max_chars)
-        {
-            if let Some(entry) = self.hot_buffer.pop_front() {
-                self.total_chars = self.total_chars.saturating_sub(entry.char_count);
-                self.message_count = self.message_count.saturating_sub(1);
-            } else {
-                break;
-            }
-        }
-    }
-
-    /// Perform overflow summarization: compress the oldest 1/3 of the buffer
-    /// into a single summary entry at the head.
-    ///
-    /// Returns the text of the compressed block so callers can optionally
-    /// persist it to a daily memory file.
-    pub fn summarize_and_compress(&mut self) -> String {
-        let raw_count = (self.hot_buffer.len() as f64)
-            * self.config.overflow_compress_fraction;
-        let count_to_compress = raw_count.ceil() as usize;
-        let count_to_compress = count_to_compress.max(1);
-
-        let entries_to_compress: Vec<_> = self.hot_buffer.iter().take(count_to_compress).collect();
-        let combined_text: String = entries_to_compress
-            .iter()
-            .map(|e| e.message.text_content().unwrap_or("".to_string()))
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        // Remove the compressed entries
-        for _ in 0..count_to_compress {
-            if let Some(entry) = self.hot_buffer.pop_front() {
-                self.total_chars = self.total_chars.saturating_sub(entry.char_count);
-                self.message_count = self.message_count.saturating_sub(1);
-            }
-        }
-
-        // Insert summary at head
-        let summary_text = format!(
-            "[记忆压缩摘要 - {} 条消息]: {}",
-            count_to_compress,
-            combined_text.chars().take(500).collect::<String>()
-        );
-        let summary_message = ChatMessage::text("system", &summary_text);
-        let summary_entry = WorkingMemoryEntry::new(summary_message, &self.config);
-
-        let summary_char_count = summary_entry.char_count;
-        self.hot_buffer.push_front(summary_entry);
-        self.total_chars += summary_char_count;
-        self.message_count += 1;
-        self.compressions += 1;
-
-        summary_text
-    }
-
-    /// Pin a slot. Overwrites any existing slot with the same key.
+    /// Pin a slot. Persists to MemoryStore if attached.
     pub fn pin(&mut self, key: String, label: String, content: String, note: Option<String>) {
         let slot = PinnedSlot {
+            key: key.clone(),
             label,
-            content,
+            content: content.clone(),
             pinned_at: chrono::Utc::now().timestamp_millis(),
             note,
         };
-        self.pinned_slots.insert(key, slot);
+        self.pinned_slots.insert(key.clone(), slot);
+
+        // Persist to MemoryStore
+        if let Some(ref store) = self.memory_store {
+            let slot = self.pinned_slots.get(&key).unwrap();
+            let _ = store.pin(&key, &slot.label, &slot.content, slot.note.as_deref());
+        }
     }
 
-    /// Unpin (remove) a slot by key.
-    /// Returns the removed slot if it existed.
+    /// Unpin (remove) a slot by key. Removes from MemoryStore if attached.
     pub fn unpin(&mut self, key: &str) -> Option<PinnedSlot> {
-        self.pinned_slots.remove(key)
+        let removed = self.pinned_slots.remove(key);
+        if removed.is_some() {
+            if let Some(ref store) = self.memory_store {
+                let _ = store.unpin(key);
+            }
+        }
+        removed
     }
 
     /// Check if a slot is currently pinned.
@@ -484,8 +374,6 @@ impl WorkingMemory {
     }
 
     /// Get all consolidation-candidate entries (for dream pipeline).
-    /// Includes both: entries with high initial importance (is_consolidation_candidate),
-    /// AND entries whose effective_importance has decayed below threshold.
     pub fn consolidation_candidates(&self) -> Vec<&WorkingMemoryEntry> {
         self.hot_buffer
             .iter()
@@ -496,10 +384,6 @@ impl WorkingMemory {
     }
 
     /// D8: Decay scanner — call this periodically (e.g. per quantum or heartbeat).
-    /// - Computes effective_importance for each entry
-    /// - Applies weaken() to entries below threshold (decline their importance score)
-    /// - Returns how many entries were weakened (for logging/audit)
-    /// - Does NOT remove entries — dream pipeline handles consolidation
     pub fn scan_and_decay(&mut self) -> usize {
         let Some(ref cfg) = self.config.decay else { return 0 };
         let now_ms = chrono::Utc::now().timestamp_millis();
@@ -510,7 +394,6 @@ impl WorkingMemory {
             if last_access == 0 { continue; }
             let elapsed_days = ((now_ms - last_access) / 86_400_000) as f64;
             if elapsed_days <= cfg.decay_after_days as f64 { continue; }
-            // Compute effective_importance inlined to avoid borrow conflict
             let decay_days = elapsed_days - cfg.decay_after_days as f64;
             let strength = cfg.decay_base.powf(-decay_days);
             let freq_boost = cfg.alpha * (1.0 + self.hot_buffer[i].access_count as f64).ln();
@@ -518,7 +401,6 @@ impl WorkingMemory {
                 .min(1.0)
                 .max(cfg.min_importance);
             if effective < threshold {
-                // Decrement importance by access_boost, clamped to min_importance
                 let new_imp = (self.hot_buffer[i].importance - cfg.access_boost).max(cfg.min_importance);
                 self.hot_buffer[i].importance = new_imp;
                 weakened += 1;
@@ -527,8 +409,7 @@ impl WorkingMemory {
         weakened
     }
 
-    /// Get the current hot buffer as a vector of ChatMessages (for injection
-    /// into the agent's messages list).
+    /// Get the current hot buffer as a vector of ChatMessages.
     pub fn to_messages(&self) -> Vec<ChatMessage> {
         self.hot_buffer.iter().map(|e| e.message.clone()).collect()
     }
@@ -538,8 +419,6 @@ impl WorkingMemory {
     // ===================================================================
 
     /// Compute effective importance of an entry after applying decay.
-    /// strength = decay_base ^ (-days_since_last_access) * initial_importance
-    /// clamped to [decay.min_importance, 1.0].
     pub fn effective_importance(&self, entry: &WorkingMemoryEntry) -> f64 {
         let Some(ref cfg) = self.config.decay else {
             return entry.importance;
@@ -561,7 +440,6 @@ impl WorkingMemory {
     }
 
     /// Apply a weaken action to an entry (reduce importance after decay).
-    /// Clamps importance to [decay.min_importance, 1.0].
     pub fn weaken(&mut self, index: usize) {
         let Some(ref cfg) = self.config.decay else { return };
         if index < self.hot_buffer.len() {
@@ -581,7 +459,6 @@ impl WorkingMemory {
     }
 
     /// Apply a strengthen boost to an entry after positive feedback.
-    /// Clamps importance to [0.0, 1.0].
     pub fn strengthen(&mut self, index: usize) {
         let Some(ref cfg) = self.config.decay else { return };
         if index < self.hot_buffer.len() {
@@ -594,7 +471,6 @@ impl WorkingMemory {
 
     /// Return entries whose effective_importance has fallen below the
     /// consolidation threshold — candidates for the dream pipeline.
-    /// Includes both static consolidation markers AND dynamic decayed entries.
     pub fn decayed_candidates(&self) -> Vec<(usize, WorkingMemoryEntry)> {
         self.hot_buffer
             .iter()
@@ -660,40 +536,12 @@ impl WorkingMemory {
             hot_buffer_count: self.message_count,
             hot_buffer_chars: self.total_chars,
             pinned_count: self.pinned_slots.len(),
-            compressions: self.compressions,
             consolidation_candidates: self
                 .hot_buffer
                 .iter()
                 .filter(|e| e.is_consolidation_candidate)
                 .count(),
         }
-    }
-
-    /// Load pinned slots from a JSON file on disk (called at session restore).
-    pub fn load_pinned_from_file(
-        workspace_root: &Path,
-    ) -> anyhow::Result<HashMap<String, PinnedSlot>> {
-        let path = workspace_root.join("memory/.working_memory_pinned.json");
-        if !path.is_file() {
-            return Ok(HashMap::new());
-        }
-        let raw = std::fs::read_to_string(&path)?;
-        let slots: HashMap<String, PinnedSlot> = serde_json::from_str(&raw)
-            .context("Failed to parse pinned slots file")?;
-        Ok(slots)
-    }
-
-    /// Persist pinned slots to disk.
-    pub fn save_pinned_to_file(
-        workspace_root: &Path,
-        slots: &HashMap<String, PinnedSlot>,
-    ) -> anyhow::Result<()> {
-        let path = workspace_root.join("memory/.working_memory_pinned.json");
-        std::fs::create_dir_all(path.parent().unwrap())?;
-        let raw = serde_json::to_string_pretty(slots)
-            .context("Failed to serialize pinned slots")?;
-        std::fs::write(&path, raw).context("Failed to write pinned slots file")?;
-        Ok(())
     }
 
     /// Assess noise in the current hot buffer.
@@ -730,24 +578,12 @@ impl Default for WorkingMemory {
 // Supporting types
 // ---------------------------------------------------------------------------
 
-/// Result of an overflow check.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OverflowAction {
-    /// No overflow; buffer is within limits.
-    None,
-    /// Overflow detected but summarization is disabled; oldest entries evicted.
-    Evicted,
-    /// Overflow detected; summarization is needed.
-    NeedsSummarization,
-}
-
 /// Snapshot stats for logging and debugging.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkingMemoryStats {
     pub hot_buffer_count: usize,
     pub hot_buffer_chars: usize,
     pub pinned_count: usize,
-    pub compressions: u32,
     pub consolidation_candidates: usize,
 }
 
@@ -797,17 +633,14 @@ mod tests {
             wm.push_message(make_message("user", format!("message {i}")));
         }
 
-        // Should evict to max_messages
         assert_eq!(wm.message_count, 3);
     }
 
     #[test]
-    fn working_memory_summarization() {
+    fn working_memory_fifo_eviction() {
         let config = WorkingMemoryConfig {
             hot_buffer_max_messages: 3,
             hot_buffer_max_chars: 50_000,
-            enable_summarization: true,
-            overflow_compress_fraction: 0.33,
             ..Default::default()
         };
         let mut wm = WorkingMemory::from_config(config);
@@ -816,13 +649,11 @@ mod tests {
             wm.push_message(make_message("user", format!("message {i}")));
         }
 
-        let action = wm.check_overflow();
-        assert_eq!(action, OverflowAction::NeedsSummarization);
-
-        let summary = wm.summarize_and_compress();
-        assert!(summary.contains("记忆压缩摘要"));
-        assert!(wm.compressions >= 1);
-        assert!(wm.message_count <= 3); // summary replaces compressed entries
+        // After FIFO eviction, only the last 3 messages should remain
+        let messages = wm.to_messages();
+        assert_eq!(messages.len(), 3);
+        assert!(messages[0].text_content().unwrap().contains("message 2"));
+        assert!(messages[2].text_content().unwrap().contains("message 4"));
     }
 
     #[test]

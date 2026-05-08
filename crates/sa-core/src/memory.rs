@@ -86,9 +86,6 @@ pub struct MemorySearchResult {
     /// Recall paths that contributed to this result.
     #[serde(default)]
     pub contributing_paths: Vec<String>,
-    /// Optional embedding vector for MMR reranking.
-    #[serde(skip)]
-    pub embedding: Option<Vec<f32>>,
 }
 
 /// Bounded file read returned by `MemoryGet`.
@@ -186,74 +183,14 @@ pub async fn build_prompt_block(workspace_root: &Path) -> anyhow::Result<String>
             format!("Failed to read memory file: {}", main_path.display())
         })?;
 
-    // Detect if this is pointer-based memory
-    let is_pointer_based = raw.contains("- [") && raw.contains("](");
-
-    if is_pointer_based {
-        // Pointer-based memory: include summary and resolve pointers
-        use crate::memory_pointer::MemoryPointerCollection;
-
-        let collection = MemoryPointerCollection::parse_from_content(
-            &raw,
-            main_path.clone(),
-        );
-
-        // Include pointer summary
-        let summary = collection.summary();
-        if !summary.is_empty() {
-            let capped = trim_chars(&summary, MAX_PROMPT_MEMORY_CHARS_PER_FILE.min(remaining));
-            if !capped.is_empty() {
-                loaded += 1;
-                remaining = remaining.saturating_sub(capped.chars().count());
-                out.push_str("### 记忆目录\n\n```text\n");
-                out.push_str(&capped);
-                out.push_str("\n```\n\n");
-            }
-        }
-
-        // Resolve and include pointer targets
-        for pointer in collection.active_pointers() {
-            if remaining == 0 {
-                break;
-            }
-
-            let target_path = collection.resolve_path(pointer, &workspace_root);
-            if !target_path.exists() {
-                continue;
-            }
-
-            let target_content = tokio::fs::read_to_string(&target_path)
-                .await
-                .with_context(|| {
-                    format!("Failed to read memory pointer target: {}", target_path.display())
-                })?;
-
-            let trimmed = target_content.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-
-            let capped = trim_chars(trimmed, MAX_PROMPT_MEMORY_CHARS_PER_FILE.min(remaining));
-            if capped.is_empty() {
-                break;
-            }
-
+    let trimmed = raw.trim();
+    if !trimmed.is_empty() {
+        let capped = trim_chars(trimmed, MAX_PROMPT_MEMORY_CHARS_PER_FILE.min(remaining));
+        if !capped.is_empty() {
             loaded += 1;
             remaining = remaining.saturating_sub(capped.chars().count());
-            let display = workspace_relative_display(&workspace_root, &target_path);
-            out.push_str(&format!("### `{}` ({})\n\n```text\n{capped}\n```\n\n", pointer.label, display));
-        }
-    } else {
-        // Traditional memory: include content directly
-        let trimmed = raw.trim();
-        if !trimmed.is_empty() {
-            let capped = trim_chars(trimmed, MAX_PROMPT_MEMORY_CHARS_PER_FILE.min(remaining));
-            if !capped.is_empty() {
-                loaded += 1;
-                remaining = remaining.saturating_sub(capped.chars().count());
-                let display = workspace_relative_display(&workspace_root, &main_path);
-                out.push_str(&format!("### `{display}`\n\n```text\n{capped}\n```\n\n"));
-            }
+            let display = workspace_relative_display(&workspace_root, &main_path);
+            out.push_str(&format!("### `{display}`\n\n```text\n{capped}\n```\n\n"));
         }
     }
 
@@ -405,7 +342,6 @@ pub async fn search_markdown_memory(
                 score,
                 snippet: trim_chars(snippet.trim(), 700),
                 contributing_paths: vec!["Text".to_string()],
-                embedding: None,
             });
         }
 
@@ -430,118 +366,6 @@ pub async fn search_markdown_memory(
     hits.truncate(max_results);
 
     Ok(hits)
-}
-
-/// Hybrid search combining BM25 lexical search with vector similarity via Reciprocal Rank Fusion.
-pub async fn search_markdown_memory_hybrid(
-    workspace_root: &Path,
-    query: &str,
-    max_results: Option<usize>,
-    min_score: Option<f64>,
-    vector_hits: Vec<crate::vector_store::VectorHit>,
-    weights: Option<[f64; 3]>,
-    filter_tags: Option<&[String]>,
-) -> anyhow::Result<Vec<MemorySearchResult>> {
-    // Run lexical search first
-    let lexical_hits = search_markdown_memory(workspace_root, query, max_results, min_score, weights, filter_tags).await?;
-
-    // Convert vector hits to MemorySearchResult
-    let vector_results: Vec<MemorySearchResult> = vector_hits
-        .into_iter()
-        .map(|vh| MemorySearchResult {
-            path: vh.path.clone(),
-            start_line: vh.start_line,
-            end_line: vh.end_line,
-            score: vh.score,
-            snippet: trim_chars(&vh.snippet, 700),
-            contributing_paths: vec!["Vector".to_string()],
-            embedding: Some(vh.embedding),
-        })
-        .collect();
-
-    // Reciprocal Rank Fusion: merge lexical and vector results
-    let rrf_k = 60.0_f64;
-    let mut merged: std::collections::HashMap<String, MemorySearchResult> = std::collections::HashMap::new();
-    let mut merged_scores: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
-
-    // Add lexical results with RRF scoring
-    for (rank, hit) in lexical_hits.iter().enumerate() {
-        let key = format!("{}:{}", hit.path, hit.start_line);
-        let rrf_score = 1.0 / (rrf_k + rank as f64 + 1.0);
-        *merged_scores.entry(key.clone()).or_insert(0.0) += rrf_score * 0.5;
-        merged.entry(key).or_insert_with(|| hit.clone());
-    }
-
-    // Add vector results with RRF scoring (skip when tag filter is active)
-    if filter_tags.is_none() {
-        for (rank, hit) in vector_results.iter().enumerate() {
-            let key = format!("{}:{}", hit.path, hit.start_line);
-            let rrf_score = 1.0 / (rrf_k + rank as f64 + 1.0);
-            *merged_scores.entry(key.clone()).or_insert(0.0) += rrf_score * 0.5;
-            let entry = merged.entry(key).or_insert_with(|| {
-                let mut h = hit.clone();
-                h.contributing_paths = vec!["Vector".to_string()];
-                h
-            });
-            if !entry.contributing_paths.contains(&"Vector".to_string()) {
-                entry.contributing_paths.push("Vector".to_string());
-            }
-        }
-    }
-
-    // Update scores with merged RRF scores
-    let mut results: Vec<MemorySearchResult> = merged
-        .into_iter()
-        .map(|(key, mut result)| {
-            result.score = *merged_scores.get(&key).unwrap_or(&0.0);
-            result
-        })
-        .collect();
-
-    // D9: Emotional and entity recall path boosting.
-    // Detect query emotion and entities, boost matching results.
-    let (_q_valence, q_arousal) = detect_emotion(query);
-    let q_entities = extract_entities_simple(query);
-    if q_arousal > 0.0 || !q_entities.is_empty() {
-        let emotion_boost = 0.05;
-        let entity_boost = 0.03;
-        for result in &mut results {
-            let snippet_lower = result.snippet.to_ascii_lowercase();
-            // Emotional boost: if query has high arousal and snippet also has emotion keywords.
-            if q_arousal > 0.0 {
-                let (_, s_arousal) = detect_emotion(&result.snippet);
-                if s_arousal > 0.0 {
-                    result.score += emotion_boost * q_arousal.min(s_arousal);
-                    if !result.contributing_paths.contains(&"Emotion".to_string()) {
-                        result.contributing_paths.push("Emotion".to_string());
-                    }
-                }
-            }
-            // Entity boost: if snippet contains query entities.
-            for entity in &q_entities {
-                if snippet_lower.contains(&entity.to_ascii_lowercase()) {
-                    result.score += entity_boost;
-                    if !result.contributing_paths.contains(&"Entity".to_string()) {
-                        result.contributing_paths.push("Entity".to_string());
-                    }
-                    break; // one boost per result
-                }
-            }
-        }
-    }
-
-    let max_results = max_results
-        .unwrap_or(DEFAULT_MEMORY_SEARCH_RESULTS)
-        .clamp(1, MAX_MEMORY_SEARCH_RESULTS);
-
-    results.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(Ordering::Equal)
-    });
-    results.truncate(max_results);
-
-    Ok(results)
 }
 
 /// Read a bounded line range from one allowed memory file.

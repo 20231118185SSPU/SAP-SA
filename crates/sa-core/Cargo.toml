@@ -7,6 +7,7 @@ edition = "2024"
 anyhow = "1.0.99"
 async-trait = "0.1.89"
 base64 = "0.22.1"
+blake3 = "1.5"
 chrono = { version = "0.4.42", features = ["serde"] }
 fs4 = "0.13.1"
 hex = "0.4.3"
@@ -37,7 +38,3 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 ndarray = "0.16"
 thiserror = "2.0"
 ts-rs = { version = "10", features = ["serde-compat", "uuid-impl", "chrono-impl"] }
-
-[[example]]
-name = "roundtrip_test"
-path = "examples/roundtrip_test.rs"

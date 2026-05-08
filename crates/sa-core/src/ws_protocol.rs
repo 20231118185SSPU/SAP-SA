@@ -215,6 +215,10 @@ pub enum ClientMessage {
         api_key: String,
         model: String,
     },
+
+    /// Request the list of supported models with pricing info.
+    #[serde(rename = "get_supported_models")]
+    GetSupportedModels,
 }
 
 
@@ -540,6 +544,12 @@ pub enum ServerMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
+
+    /// List of supported models with pricing information.
+    #[serde(rename = "supported_models")]
+    SupportedModels {
+        models: Vec<SupportedModelInfo>,
+    },
 }
 
 /// Cache statistics for a specific model.
@@ -551,6 +561,25 @@ pub struct CacheModelStats {
     pub cache_misses: u64,
     pub output_tokens: u64,
     pub hit_rate: f64,
+}
+
+/// Supported model information with pricing.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+pub struct SupportedModelInfo {
+    /// Model identifier (e.g. "deepseek-v4-flash").
+    pub id: String,
+    /// User-facing display name (e.g. "DeepSeek V4 Flash").
+    pub display_name: String,
+    /// Provider identifier (e.g. "deepseek", "mimo", "openai").
+    pub provider: String,
+    /// Price per million tokens for cache hits (USD).
+    pub cache_hit_price_per_million: f64,
+    /// Price per million tokens for cache misses (USD).
+    pub cache_miss_price_per_million: f64,
+    /// Price per million tokens for output (USD).
+    pub output_price_per_million: f64,
+    /// Whether this model offers a cache discount.
+    pub has_cache_discount: bool,
 }
 
 /// One skill entry in the skills list response.

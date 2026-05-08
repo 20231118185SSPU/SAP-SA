@@ -52,6 +52,10 @@ pub enum KnownModel {
     DeepSeekV4Flash,
     /// DeepSeek V4 Pro - advanced model for complex reasoning
     DeepSeekV4Pro,
+    /// Xiaomi MiMo V2 Pro - flagship reasoning model
+    MiMoV2Pro,
+    /// Xiaomi MiMo V2 Omni - multimodal model
+    MiMoV2Omni,
     /// OpenAI GPT-4o
     Gpt4o,
     /// OpenAI GPT-4o-mini
@@ -64,6 +68,12 @@ pub enum KnownModel {
     Gemini15Pro,
     /// Google Gemini 1.5 Flash
     Gemini15Flash,
+    /// Xiaomi MiMo V2.5 Pro - flagship reasoning model
+    MiMoV25Pro,
+    /// Xiaomi MiMo V2.5 - multimodal base model
+    MiMoV25,
+    /// Xiaomi MiMo V2 Flash - lightweight fast model
+    MiMoV2Flash,
     /// Unknown / custom model – falls back to conservative pricing
     Unknown,
 }
@@ -100,23 +110,44 @@ impl Default for ModelPricing {
 impl ModelPricing {
     /// Select pricing based on a model name string.
     ///
-    /// Matches common model identifiers (case-insensitive substring match)
-    /// and returns the corresponding pricing preset.
+    /// Uses priority matching: exact prefix > specific substring > generic fallback.
     pub fn for_model(model_name: &str) -> Self {
         let lower = model_name.to_lowercase();
 
-        if lower.contains("deepseek") && (lower.contains("v4-pro") || lower.contains("v4_pro")) {
+        // MiMo (prefix match to avoid ambiguity with other models)
+        if lower.starts_with("mimo-v2.5-pro") || lower.starts_with("mimo_v2.5_pro") || lower.contains("mimo-v2.5-pro") {
+            return Self::mimo_v25_pro();
+        }
+        if lower.starts_with("mimo-v2.5") || lower.starts_with("mimo_v2.5") || lower.contains("mimo-v2.5") {
+            return Self::mimo_v25();
+        }
+        if lower.contains("mimo-v2-pro") || lower.contains("mimo_v2_pro") {
+            return Self::mimo_v2_pro();
+        }
+        if lower.contains("mimo-v2-omni") || lower.contains("mimo_v2_omni") {
+            return Self::mimo_v2_omni();
+        }
+        if lower.starts_with("mimo-v2-flash") || lower.starts_with("mimo_v2_flash") || lower.contains("mimo-v2-flash") {
+            return Self::mimo_v2_flash();
+        }
+
+        // DeepSeek
+        if lower.starts_with("deepseek") && (lower.contains("v4-pro") || lower.contains("v4_pro")) {
             return Self::deepseek_v4_pro();
         }
-        if lower.contains("deepseek") {
+        if lower.starts_with("deepseek") {
             return Self::deepseek_v4_flash();
         }
-        if lower.contains("gpt-4o-mini") || lower.contains("gpt_4o_mini") {
+
+        // OpenAI
+        if lower.starts_with("gpt-4o-mini") || lower.starts_with("gpt_4o_mini") {
             return Self::gpt_4o_mini();
         }
-        if lower.contains("gpt-4o") || lower.contains("gpt_4o") {
+        if lower.starts_with("gpt-4o") || lower.contains("gpt_4o") {
             return Self::gpt_4o();
         }
+
+        // Anthropic
         if lower.contains("claude") && lower.contains("haiku") {
             return Self::claude_35_haiku();
         }
@@ -126,6 +157,8 @@ impl ModelPricing {
         if lower.contains("claude") {
             return Self::claude_35_sonnet();
         }
+
+        // Google
         if lower.contains("gemini") && lower.contains("flash") {
             return Self::gemini_15_flash();
         }
@@ -151,27 +184,27 @@ impl ModelPricing {
     pub fn deepseek_v4_pro() -> Self {
         Self {
             model: KnownModel::DeepSeekV4Pro,
-            cache_hit_price_per_million: 0.003625,
-            cache_miss_price_per_million: 0.435,
-            output_price_per_million: 0.87,
+            cache_hit_price_per_million: 0.003448,
+            cache_miss_price_per_million: 0.414,
+            output_price_per_million: 0.828,
         }
     }
 
-    /// OpenAI GPT-4o pricing (no native prompt cache discount).
+    /// OpenAI GPT-4o pricing (50% prompt cache discount since late 2024).
     pub fn gpt_4o() -> Self {
         Self {
             model: KnownModel::Gpt4o,
-            cache_hit_price_per_million: 2.50,
+            cache_hit_price_per_million: 1.25,
             cache_miss_price_per_million: 2.50,
             output_price_per_million: 10.00,
         }
     }
 
-    /// OpenAI GPT-4o-mini pricing.
+    /// OpenAI GPT-4o-mini pricing (50% prompt cache discount since late 2024).
     pub fn gpt_4o_mini() -> Self {
         Self {
             model: KnownModel::Gpt4oMini,
-            cache_hit_price_per_million: 0.15,
+            cache_hit_price_per_million: 0.075,
             cache_miss_price_per_million: 0.15,
             output_price_per_million: 0.60,
         }
@@ -214,6 +247,56 @@ impl ModelPricing {
             cache_hit_price_per_million: 0.01875,
             cache_miss_price_per_million: 0.075,
             output_price_per_million: 0.30,
+        }
+    }
+
+    /// Xiaomi MiMo V2.5 Pro pricing (CNY 7.25/21.75 per M tokens, rate 7.25).
+    pub fn mimo_v25_pro() -> Self {
+        Self {
+            model: KnownModel::MiMoV25Pro,
+            cache_hit_price_per_million: 1.000,
+            cache_miss_price_per_million: 1.000,
+            output_price_per_million: 3.000,
+        }
+    }
+
+    /// Xiaomi MiMo V2.5 pricing (CNY 2.90/14.50 per M tokens, rate 7.25).
+    pub fn mimo_v25() -> Self {
+        Self {
+            model: KnownModel::MiMoV25,
+            cache_hit_price_per_million: 0.400,
+            cache_miss_price_per_million: 0.400,
+            output_price_per_million: 2.000,
+        }
+    }
+
+    /// Xiaomi MiMo V2 Pro pricing (CNY 7.25/21.75 per M tokens, rate 7.25).
+    pub fn mimo_v2_pro() -> Self {
+        Self {
+            model: KnownModel::MiMoV2Pro,
+            cache_hit_price_per_million: 1.000,
+            cache_miss_price_per_million: 1.000,
+            output_price_per_million: 3.000,
+        }
+    }
+
+    /// Xiaomi MiMo V2 Omni pricing (CNY 2.90/14.50 per M tokens, rate 7.25).
+    pub fn mimo_v2_omni() -> Self {
+        Self {
+            model: KnownModel::MiMoV2Omni,
+            cache_hit_price_per_million: 0.400,
+            cache_miss_price_per_million: 0.400,
+            output_price_per_million: 2.000,
+        }
+    }
+
+    /// Xiaomi MiMo V2 Flash pricing (native API: $0.10/$0.30 per M tokens).
+    pub fn mimo_v2_flash() -> Self {
+        Self {
+            model: KnownModel::MiMoV2Flash,
+            cache_hit_price_per_million: 0.100,
+            cache_miss_price_per_million: 0.100,
+            output_price_per_million: 0.300,
         }
     }
 
@@ -709,9 +792,9 @@ mod tests {
     fn test_deepseek_pricing_v4_pro() {
         let pricing = ModelPricing::v4_pro();
         assert_eq!(pricing.model, KnownModel::DeepSeekV4Pro);
-        assert!((pricing.cache_hit_price_per_million - 0.003625).abs() < 0.0001);
-        assert!((pricing.cache_miss_price_per_million - 0.435).abs() < 0.0001);
-        assert!((pricing.output_price_per_million - 0.87).abs() < 0.0001);
+        assert!((pricing.cache_hit_price_per_million - 0.003448).abs() < 0.0001);
+        assert!((pricing.cache_miss_price_per_million - 0.414).abs() < 0.001);
+        assert!((pricing.output_price_per_million - 0.828).abs() < 0.001);
     }
 
     #[test]
@@ -788,6 +871,12 @@ mod tests {
         // Google
         assert_eq!(ModelPricing::for_model("gemini-1.5-pro").model, KnownModel::Gemini15Pro);
         assert_eq!(ModelPricing::for_model("gemini-1.5-flash").model, KnownModel::Gemini15Flash);
+        // MiMo
+        assert_eq!(ModelPricing::for_model("xiaomi/mimo-v2.5-pro").model, KnownModel::MiMoV25Pro);
+        assert_eq!(ModelPricing::for_model("xiaomi/mimo-v2.5").model, KnownModel::MiMoV25);
+        assert_eq!(ModelPricing::for_model("xiaomi/mimo-v2-pro").model, KnownModel::MiMoV2Pro);
+        assert_eq!(ModelPricing::for_model("xiaomi/mimo-v2-omni").model, KnownModel::MiMoV2Omni);
+        assert_eq!(ModelPricing::for_model("xiaomi/mimo-v2-flash").model, KnownModel::MiMoV2Flash);
         // Unknown falls back
         assert_eq!(ModelPricing::for_model("some-random-model").model, KnownModel::DeepSeekV4Flash);
     }

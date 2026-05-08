@@ -35,8 +35,7 @@ use sa_core::interaction_history::{
 };
 use sa_core::mcp_client::McpRegistry;
 use sa_core::memory::{
-    build_prompt_block as build_memory_prompt_block, extract_facts, find_similar_clusters,
-    is_memory_reference,
+    build_prompt_block as build_memory_prompt_block, is_memory_reference,
 };
 use sa_core::openai::{AuthStyle, ChatMessage, OpenAiClient, WireApi};
 use sa_core::runtime::state::AgentStatus;
@@ -283,6 +282,8 @@ struct PreparedRuntime {
     reloadable: RuntimeReloadState,
     /// Dream scheduler manager built from the same config.
     dream_manager: DreamManager,
+    /// Unified SQLite memory store.
+    memory_store: Arc<sa_core::memory_store::MemoryStore>,
     /// Human-readable summary returned by `Reload`.
     reload_summary: String,
 }
@@ -390,6 +391,9 @@ struct Hub {
     /// Current dream scheduler task, if enabled.
     dream_scheduler: Mutex<Option<DreamSchedulerHandle>>,
 
+    /// Unified SQLite memory store.
+    memory_store: Arc<sa_core::memory_store::MemoryStore>,
+
     /// Cache performance monitor for tracking token usage and cache hits.
     cache_monitor: Mutex<sa_core::cache_monitor::CacheMonitor>,
 }
@@ -407,6 +411,7 @@ impl Hub {
         task_audit_store: Arc<TaskAuditStore>,
         runtime_store: RuntimeStore,
         team_state: TeamState,
+        memory_store: Arc<sa_core::memory_store::MemoryStore>,
     ) -> Arc<Self> {
         // Task queue capacity (small but adequate for minimal agent).
         let (task_tx, task_rx) = mpsc::channel::<TaskRequest>(128);
@@ -453,6 +458,7 @@ impl Hub {
             team_cfg: RwLock::new(reloadable.team_cfg),
             permissions: RwLock::new(reloadable.permissions),
             dream_scheduler: Mutex::new(None),
+            memory_store,
             cache_monitor: Mutex::new(sa_core::cache_monitor::CacheMonitor::for_model(&model_name_for_cache)),
         });
 
@@ -4623,6 +4629,13 @@ async fn prepare_runtime_from_config(
     };
     let runner = AgentRunner::new(llm, tools, Arc::clone(&skills), runner_cfg);
     let dream_manager = DreamManager::new(workspace_root.clone(), cfg.dream.clone())?;
+
+    // Initialize unified SQLite memory store.
+    let memory_db_path = workspace_root.join("memory").join("memory.db");
+    let memory_store = Arc::new(
+        sa_core::memory_store::MemoryStore::new(&memory_db_path)
+            .context("Failed to initialize MemoryStore")?,
+    );
     let max_concurrent_model_calls = cfg.team.max_concurrent_model_calls;
     let reload_summary = format!(
         "reloaded model={} system_role={} reasoning_effort={} local_skills={} mcp_servers={} agents_md={}",
@@ -4647,6 +4660,7 @@ async fn prepare_runtime_from_config(
             max_concurrent_model_calls,
         },
         dream_manager,
+        memory_store,
         reload_summary,
     })
 }
@@ -4706,6 +4720,7 @@ async fn build_runtime_from_config(
         task_audit_store,
         runtime_store,
         team_state,
+        prepared.memory_store.clone(),
     );
     hub.recover_runtime().await?;
     hub.replace_dream_scheduler(prepared.dream_manager);
@@ -5298,166 +5313,93 @@ fn validate_user_answer(
 
 // ── Memory panel helpers ────────────────────────────────────────────────────────
 
+use sa_core::memory_store::MemoryStore;
 use sa_core::ws_protocol::MemoryFact;
 
-/// Scan memory markdown files and compute aggregate statistics.
-async fn compute_memory_stats(
-    memory_dir: &std::path::Path,
+/// Get aggregate memory statistics from the unified store.
+fn compute_memory_stats_from_store(
+    store: &MemoryStore,
 ) -> anyhow::Result<(usize, usize, usize, f64, Option<String>, Option<String>)> {
-    if !memory_dir.exists() {
-        return Ok((0, 0, 0, 0.0, None, None));
-    }
-
-    let all_facts = collect_all_facts(memory_dir).await?;
-    let mut subjects: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut predicates: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut total_confidence = 0.0f64;
-    let mut oldest: Option<String> = None;
-    let mut newest: Option<String> = None;
-
-    for fact in &all_facts {
-        subjects.insert(fact.subject.clone());
-        predicates.insert(fact.predicate.clone());
-        total_confidence += fact.confidence;
-        if oldest.is_none() || fact.created_at < *oldest.as_ref().unwrap() {
-            oldest = Some(fact.created_at.clone());
-        }
-        if newest.is_none() || fact.created_at > *newest.as_ref().unwrap() {
-            newest = Some(fact.created_at.clone());
-        }
-    }
-
-    let count = all_facts.len();
+    let stats = store.stats()?;
     Ok((
-        count,
-        subjects.len(),
-        predicates.len(),
-        if count > 0 { total_confidence / count as f64 } else { 0.0 },
-        oldest,
-        newest,
+        stats.total_facts as usize,
+        stats.unique_subjects as usize,
+        stats.unique_predicates as usize,
+        stats.avg_confidence,
+        None, // oldest_fact — not tracked in MemoryStats
+        None, // newest_fact — not tracked in MemoryStats
     ))
 }
 
-/// Query memory facts with optional search and pagination.
-async fn query_memory_facts(
-    memory_dir: &std::path::Path,
+/// Query memory facts from the unified store with optional search and pagination.
+fn query_memory_facts_from_store(
+    store: &MemoryStore,
     query: Option<&str>,
     limit: usize,
     offset: usize,
 ) -> anyhow::Result<(Vec<MemoryFact>, usize)> {
-    let all_facts = collect_all_facts(memory_dir).await?;
-
-    let filtered: Vec<MemoryFact> = if let Some(q) = query {
-        let q_lower = q.to_lowercase();
-        all_facts
-            .into_iter()
-            .filter(|f| {
-                f.subject.to_lowercase().contains(&q_lower)
-                    || f.predicate.to_lowercase().contains(&q_lower)
-                    || f.object.to_lowercase().contains(&q_lower)
-            })
-            .collect()
-    } else {
-        all_facts
-    };
-
-    let total = filtered.len();
-    let page: Vec<MemoryFact> = filtered.into_iter().skip(offset).take(limit).collect();
+    let effective_limit = limit + offset;
+    let raw_facts = store.query_facts(query.unwrap_or(""), effective_limit)?;
+    let total = raw_facts.len();
+    let page: Vec<MemoryFact> = raw_facts
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .map(|f| MemoryFact {
+            id: f.id,
+            subject: f.subject,
+            predicate: f.predicate,
+            object: f.object,
+            confidence: f.confidence,
+            source: Some(f.source),
+            created_at: chrono::DateTime::from_timestamp(f.created_at, 0)
+                .map(|dt| dt.to_rfc3339())
+                .unwrap_or_default(),
+            updated_at: chrono::DateTime::from_timestamp(f.updated_at, 0)
+                .map(|dt| dt.to_rfc3339())
+                .unwrap_or_default(),
+        })
+        .collect();
     Ok((page, total))
 }
 
-/// Traverse memory graph from a starting subject.
-async fn traverse_memory(
-    memory_dir: &std::path::Path,
+/// Traverse memory graph from the unified store.
+fn traverse_memory_from_store(
+    store: &MemoryStore,
     subject: &str,
-    _max_hops: usize,
+    max_hops: usize,
     max_results: usize,
 ) -> anyhow::Result<Vec<MemoryFact>> {
-    let all_facts = collect_all_facts(memory_dir).await?;
-    let subject_lower = subject.to_lowercase();
-
-    let direct: Vec<MemoryFact> = all_facts
-        .iter()
-        .filter(|f| {
-            f.subject.to_lowercase().contains(&subject_lower)
-                || f.object.to_lowercase().contains(&subject_lower)
-        })
-        .cloned()
+    let raw_facts = store.traverse_graph(subject, max_hops)?;
+    let facts: Vec<MemoryFact> = raw_facts
+        .into_iter()
         .take(max_results)
+        .map(|f| MemoryFact {
+            id: f.id,
+            subject: f.subject,
+            predicate: f.predicate,
+            object: f.object,
+            confidence: f.confidence,
+            source: Some(f.source),
+            created_at: chrono::DateTime::from_timestamp(f.created_at, 0)
+                .map(|dt| dt.to_rfc3339())
+                .unwrap_or_default(),
+            updated_at: chrono::DateTime::from_timestamp(f.updated_at, 0)
+                .map(|dt| dt.to_rfc3339())
+                .unwrap_or_default(),
+        })
         .collect();
-
-    Ok(direct)
+    Ok(facts)
 }
 
-/// Apply confidence decay to all facts (placeholder — marks files with decay timestamp).
-async fn decay_memory(memory_dir: &std::path::Path) -> anyhow::Result<usize> {
-    if !memory_dir.exists() {
-        return Ok(0);
-    }
-    let mut entries = tokio::fs::read_dir(memory_dir).await?;
-    let mut affected = 0usize;
-    while let Some(entry) = entries.next_entry().await? {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("md") {
-            continue;
-        }
-        let content = tokio::fs::read_to_string(&path).await?;
-        let noted_date = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("unknown");
-        let facts = extract_facts(&content, noted_date);
-        affected += facts.len();
-    }
-    Ok(affected)
+/// Apply confidence decay to facts in the unified store.
+fn decay_memory_in_store(store: &MemoryStore) -> anyhow::Result<usize> {
+    store.decay_facts(0.01)
 }
 
-/// Prune facts below a confidence threshold (placeholder).
-async fn prune_memory(memory_dir: &std::path::Path, min_confidence: f64) -> anyhow::Result<usize> {
-    if !memory_dir.exists() {
-        return Ok(0);
-    }
-    let all_facts = collect_all_facts(memory_dir).await?;
-    let pruned = all_facts.iter().filter(|f| f.confidence < min_confidence).count();
-    Ok(pruned)
-}
-
-/// Helper: scan all .md files in memory dir, extract facts as MemoryFact.
-async fn collect_all_facts(memory_dir: &std::path::Path) -> anyhow::Result<Vec<MemoryFact>> {
-    if !memory_dir.exists() {
-        return Ok(Vec::new());
-    }
-
-    let mut entries = tokio::fs::read_dir(memory_dir).await?;
-    let mut all_facts = Vec::new();
-
-    while let Some(entry) = entries.next_entry().await? {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("md") {
-            continue;
-        }
-        let content = tokio::fs::read_to_string(&path).await?;
-        let noted_date = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("unknown");
-        let facts = extract_facts(&content, noted_date);
-        for (i, fact) in facts.iter().enumerate() {
-            all_facts.push(MemoryFact {
-                id: format!("{}-{}", noted_date, i),
-                subject: fact.category.clone(),
-                predicate: fact.predicate().to_string(),
-                object: fact.content.clone(),
-                confidence: fact.confidence,
-                source: Some(noted_date.to_string()),
-                created_at: fact.source_date.clone(),
-                updated_at: fact.valid_from.clone(),
-            });
-        }
-    }
-
-    all_facts.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-    Ok(all_facts)
+/// Prune facts below a confidence threshold in the unified store.
+fn prune_memory_in_store(store: &MemoryStore, min_confidence: f64) -> anyhow::Result<usize> {
+    store.prune_facts(min_confidence)
 }
 
 /// Mirror one event in a stable multi-line format.
@@ -5720,6 +5662,9 @@ fn mirror_server_message(msg: &ServerMessage) {
         }
         ServerMessage::ApiKeyTestResult { ok, model, provider, latency_ms, error } => {
             eprintln!("[frontend][api_key_test_result] ok={ok} model={model} provider={provider} latency={latency_ms}ms error={:?}", error);
+        }
+        ServerMessage::SupportedModels { models } => {
+            eprintln!("[frontend][supported_models] count={}", models.len());
         }
     }
 }
@@ -6753,10 +6698,10 @@ async fn ws_session_with_timeout(
 
                     ClientMessage::GetMemoryStats => {
                         if let RuntimeState::Ready(hub) = state.runtime_snapshot().await {
-                            let memory_dir = hub.workspace_root.join("memory");
+                            let store = hub.memory_store.clone();
                             let out_tx = out_tx.clone();
                             tokio::spawn(async move {
-                                let result = compute_memory_stats(&memory_dir).await;
+                                let result = compute_memory_stats_from_store(&store);
                                 match result {
                                     Ok((total_facts, unique_subjects, unique_predicates, avg_confidence, oldest_fact, newest_fact)) => {
                                         send_direct_server_message(
@@ -6786,10 +6731,10 @@ async fn ws_session_with_timeout(
 
                     ClientMessage::GetMemoryFacts { query, limit, offset } => {
                         if let RuntimeState::Ready(hub) = state.runtime_snapshot().await {
-                            let memory_dir = hub.workspace_root.join("memory");
+                            let store = hub.memory_store.clone();
                             let out_tx = out_tx.clone();
                             tokio::spawn(async move {
-                                let result = query_memory_facts(&memory_dir, query.as_deref(), limit, offset).await;
+                                let result = query_memory_facts_from_store(&store, query.as_deref(), limit, offset);
                                 match result {
                                     Ok((facts, total)) => {
                                         send_direct_server_message(
@@ -6812,10 +6757,10 @@ async fn ws_session_with_timeout(
 
                     ClientMessage::TraverseMemoryGraph { subject, max_hops, max_results } => {
                         if let RuntimeState::Ready(hub) = state.runtime_snapshot().await {
-                            let memory_dir = hub.workspace_root.join("memory");
+                            let store = hub.memory_store.clone();
                             let out_tx = out_tx.clone();
                             tokio::spawn(async move {
-                                let result = traverse_memory(&memory_dir, &subject, max_hops, max_results).await;
+                                let result = traverse_memory_from_store(&store, &subject, max_hops, max_results);
                                 match result {
                                     Ok(facts) => {
                                         send_direct_server_message(
@@ -6842,10 +6787,10 @@ async fn ws_session_with_timeout(
 
                     ClientMessage::DecayMemoryFacts => {
                         if let RuntimeState::Ready(hub) = state.runtime_snapshot().await {
-                            let memory_dir = hub.workspace_root.join("memory");
+                            let store = hub.memory_store.clone();
                             let out_tx = out_tx.clone();
                             tokio::spawn(async move {
-                                let result = decay_memory(&memory_dir).await;
+                                let result = decay_memory_in_store(&store);
                                 match result {
                                     Ok(affected) => {
                                         send_direct_server_message(
@@ -6872,10 +6817,10 @@ async fn ws_session_with_timeout(
 
                     ClientMessage::PruneMemoryFacts { min_confidence } => {
                         if let RuntimeState::Ready(hub) = state.runtime_snapshot().await {
-                            let memory_dir = hub.workspace_root.join("memory");
+                            let store = hub.memory_store.clone();
                             let out_tx = out_tx.clone();
                             tokio::spawn(async move {
-                                let result = prune_memory(&memory_dir, min_confidence).await;
+                                let result = prune_memory_in_store(&store, min_confidence);
                                 match result {
                                     Ok(affected) => {
                                         send_direct_server_message(
@@ -7368,6 +7313,40 @@ async fn ws_session_with_timeout(
                             }
                         });
                     }
+
+                    ClientMessage::GetSupportedModels => {
+                        use sa_core::cost_budget::ModelPricing;
+                        use sa_core::ws_protocol::SupportedModelInfo;
+
+                        fn info(id: &str, display: &str, provider: &str, p: ModelPricing) -> SupportedModelInfo {
+                            SupportedModelInfo {
+                                id: id.to_string(),
+                                display_name: display.to_string(),
+                                provider: provider.to_string(),
+                                cache_hit_price_per_million: p.cache_hit_price_per_million,
+                                cache_miss_price_per_million: p.cache_miss_price_per_million,
+                                output_price_per_million: p.output_price_per_million,
+                                has_cache_discount: (p.cache_hit_price_per_million - p.cache_miss_price_per_million).abs() > 0.001,
+                            }
+                        }
+
+                        let models = vec![
+                            info("deepseek-v4-flash", "DeepSeek V4 Flash", "deepseek", ModelPricing::deepseek_v4_flash()),
+                            info("deepseek-v4-pro", "DeepSeek V4 Pro", "deepseek", ModelPricing::deepseek_v4_pro()),
+                            info("xiaomi/mimo-v2.5-pro", "MiMo V2.5 Pro", "mimo", ModelPricing::mimo_v25_pro()),
+                            info("xiaomi/mimo-v2.5", "MiMo V2.5", "mimo", ModelPricing::mimo_v25()),
+                            info("xiaomi/mimo-v2-pro", "MiMo V2 Pro", "mimo", ModelPricing::mimo_v2_pro()),
+                            info("xiaomi/mimo-v2-omni", "MiMo V2 Omni", "mimo", ModelPricing::mimo_v2_omni()),
+                            info("xiaomi/mimo-v2-flash", "MiMo V2 Flash", "mimo", ModelPricing::mimo_v2_flash()),
+                            info("gpt-4o", "GPT-4o", "openai", ModelPricing::gpt_4o()),
+                            info("gpt-4o-mini", "GPT-4o Mini", "openai", ModelPricing::gpt_4o_mini()),
+                            info("claude-3-5-sonnet", "Claude 3.5 Sonnet", "anthropic", ModelPricing::claude_35_sonnet()),
+                            info("claude-3-5-haiku", "Claude 3.5 Haiku", "anthropic", ModelPricing::claude_35_haiku()),
+                            info("gemini-1.5-pro", "Gemini 1.5 Pro", "google", ModelPricing::gemini_15_pro()),
+                            info("gemini-1.5-flash", "Gemini 1.5 Flash", "google", ModelPricing::gemini_15_flash()),
+                        ];
+                        send_direct_server_message(&out_tx, ServerMessage::SupportedModels { models });
+                    }
                 }
             }
             Message::Close(_) => break,
@@ -7581,6 +7560,10 @@ mod tests {
             ))
             .expect("root agent state should persist");
 
+        let memory_store = Arc::new(
+            sa_core::memory_store::MemoryStore::new_in_memory()
+                .expect("in-memory MemoryStore should build"),
+        );
         Hub::new(
             workspace.path().join("sa.toml"),
             "127.0.0.1:8765".to_string(),
@@ -7599,6 +7582,7 @@ mod tests {
             task_audit_store,
             runtime_store,
             team_state,
+            memory_store,
         )
     }
 
