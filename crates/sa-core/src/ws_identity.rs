@@ -115,11 +115,19 @@ pub fn build_client_hello(client_version: &str) -> anyhow::Result<ClientHello> {
         time_bucket,
         client_nonce,
         proof,
+        token: None,
     })
 }
 
 /// Verify the client's mandatory hello packet.
-pub fn verify_client_hello(hello: &ClientHello, now: SystemTime) -> anyhow::Result<()> {
+///
+/// If `auth_key` is `Some`, the client's `token` field must be a valid
+/// HMAC-SHA256 of `client_nonce` keyed with `auth_key`.
+pub fn verify_client_hello(
+    hello: &ClientHello,
+    now: SystemTime,
+    auth_key: Option<&str>,
+) -> anyhow::Result<()> {
     verify_common_fields(
         &hello.protocol,
         &hello.hash_algo,
@@ -151,6 +159,25 @@ pub fn verify_client_hello(hello: &ClientHello, now: SystemTime) -> anyhow::Resu
     );
     if hello.proof != expected {
         bail!("Client hello proof mismatch")
+    }
+
+    // If auth key is configured, verify the token
+    if let Some(auth_key) = auth_key {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        type HmacSha256 = Hmac<Sha256>;
+
+        let token = hello
+            .token
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("Missing authentication token"))?;
+
+        let mut mac =
+            HmacSha256::new_from_slice(auth_key.as_bytes()).map_err(|_| anyhow::anyhow!("Invalid auth key"))?;
+        mac.update(hello.client_nonce.as_bytes());
+        let token_bytes = hex::decode(token).map_err(|_| anyhow::anyhow!("Invalid token format"))?;
+        mac.verify_slice(&token_bytes)
+            .map_err(|_| anyhow::anyhow!("Invalid authentication token"))?;
     }
 
     Ok(())
@@ -336,9 +363,10 @@ mod tests {
             time_bucket,
             client_nonce: "nonce-a".to_string(),
             proof: build_client_proof("0.1.0", time_bucket, "nonce-a"),
+            token: None,
         };
 
-        verify_client_hello(&hello, now).expect("client hello should verify");
+        verify_client_hello(&hello, now, None).expect("client hello should verify");
     }
 
     #[test]
@@ -355,9 +383,10 @@ mod tests {
             time_bucket: now_bucket + 2,
             client_nonce: "nonce-a".to_string(),
             proof: build_client_proof("0.1.0", now_bucket + 2, "nonce-a"),
+            token: None,
         };
 
-        let err = verify_client_hello(&hello, now).expect_err("bucket should fail");
+        let err = verify_client_hello(&hello, now, None).expect_err("bucket should fail");
         assert!(err.to_string().contains("outside the accepted window"));
     }
 

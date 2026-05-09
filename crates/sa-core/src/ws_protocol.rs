@@ -768,6 +768,9 @@ pub struct ClientHello {
     pub client_nonce: String,
     /// Hex-encoded SHA-256 proof.
     pub proof: String,
+    /// Optional authentication token (HMAC-SHA256 of nonce with auth key).
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "auth_token")]
+    pub token: Option<String>,
 }
 
 /// The server's proof-of-identity packet.

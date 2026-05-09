@@ -79,6 +79,8 @@ use tokio::sync::{Mutex as AsyncMutex, Semaphore, broadcast, mpsc, oneshot};
 use tracing::Level;
 use uuid::Uuid;
 
+mod memory_panel;
+
 /// Max number of events buffered in memory.
 ///
 /// The buffer is used so a CLI can reconnect and request event history.
@@ -278,6 +280,8 @@ struct PreparedRuntime {
     ws_path: String,
     /// Canonical workspace root.
     workspace_root: PathBuf,
+    /// Optional shared key for WebSocket authentication.
+    ws_auth_key: Option<String>,
     /// Components that may be hot-swapped into an existing hub.
     reloadable: RuntimeReloadState,
     /// Dream scheduler manager built from the same config.
@@ -363,6 +367,9 @@ struct Hub {
     /// Stable canonical workspace root. Hot reload may not change this.
     workspace_root: PathBuf,
 
+    /// Optional shared key for WebSocket authentication.
+    ws_auth_key: Option<String>,
+
     /// Context used for safe path resolution when preloading files.
     preload_ctx: RwLock<ToolContext>,
 
@@ -405,6 +412,7 @@ impl Hub {
         bind: String,
         ws_path: String,
         workspace_root: PathBuf,
+        ws_auth_key: Option<String>,
         reloadable: RuntimeReloadState,
         session_store: Arc<SessionStore>,
         interaction_store: Arc<InteractionStore>,
@@ -449,6 +457,7 @@ impl Hub {
             bind,
             ws_path,
             workspace_root,
+            ws_auth_key,
             preload_ctx: RwLock::new(reloadable.preload_ctx),
             runner: RwLock::new(reloadable.runner),
             agents_md_path: RwLock::new(reloadable.agents_md_path),
@@ -4651,6 +4660,7 @@ async fn prepare_runtime_from_config(
         bind,
         ws_path,
         workspace_root: preload_ctx.workspace_root.clone(),
+        ws_auth_key: cfg.server.ws_auth_key.clone(),
         reloadable: RuntimeReloadState {
             runner,
             preload_ctx,
@@ -4714,6 +4724,7 @@ async fn build_runtime_from_config(
         prepared.bind.clone(),
         prepared.ws_path.clone(),
         prepared.workspace_root.clone(),
+        prepared.ws_auth_key.clone(),
         prepared.reloadable,
         session_store,
         interaction_store,
@@ -5311,96 +5322,9 @@ fn validate_user_answer(
     Ok(())
 }
 
-// ── Memory panel helpers ────────────────────────────────────────────────────────
+// ── Mirror helpers ──────────────────────────────────────────────────────────────
 
 use sa_core::memory_store::MemoryStore;
-use sa_core::ws_protocol::MemoryFact;
-
-/// Get aggregate memory statistics from the unified store.
-fn compute_memory_stats_from_store(
-    store: &MemoryStore,
-) -> anyhow::Result<(usize, usize, usize, f64, Option<String>, Option<String>)> {
-    let stats = store.stats()?;
-    Ok((
-        stats.total_facts as usize,
-        stats.unique_subjects as usize,
-        stats.unique_predicates as usize,
-        stats.avg_confidence,
-        None, // oldest_fact — not tracked in MemoryStats
-        None, // newest_fact — not tracked in MemoryStats
-    ))
-}
-
-/// Query memory facts from the unified store with optional search and pagination.
-fn query_memory_facts_from_store(
-    store: &MemoryStore,
-    query: Option<&str>,
-    limit: usize,
-    offset: usize,
-) -> anyhow::Result<(Vec<MemoryFact>, usize)> {
-    let effective_limit = limit + offset;
-    let raw_facts = store.query_facts(query.unwrap_or(""), effective_limit)?;
-    let total = raw_facts.len();
-    let page: Vec<MemoryFact> = raw_facts
-        .into_iter()
-        .skip(offset)
-        .take(limit)
-        .map(|f| MemoryFact {
-            id: f.id,
-            subject: f.subject,
-            predicate: f.predicate,
-            object: f.object,
-            confidence: f.confidence,
-            source: Some(f.source),
-            created_at: chrono::DateTime::from_timestamp(f.created_at, 0)
-                .map(|dt| dt.to_rfc3339())
-                .unwrap_or_default(),
-            updated_at: chrono::DateTime::from_timestamp(f.updated_at, 0)
-                .map(|dt| dt.to_rfc3339())
-                .unwrap_or_default(),
-        })
-        .collect();
-    Ok((page, total))
-}
-
-/// Traverse memory graph from the unified store.
-fn traverse_memory_from_store(
-    store: &MemoryStore,
-    subject: &str,
-    max_hops: usize,
-    max_results: usize,
-) -> anyhow::Result<Vec<MemoryFact>> {
-    let raw_facts = store.traverse_graph(subject, max_hops)?;
-    let facts: Vec<MemoryFact> = raw_facts
-        .into_iter()
-        .take(max_results)
-        .map(|f| MemoryFact {
-            id: f.id,
-            subject: f.subject,
-            predicate: f.predicate,
-            object: f.object,
-            confidence: f.confidence,
-            source: Some(f.source),
-            created_at: chrono::DateTime::from_timestamp(f.created_at, 0)
-                .map(|dt| dt.to_rfc3339())
-                .unwrap_or_default(),
-            updated_at: chrono::DateTime::from_timestamp(f.updated_at, 0)
-                .map(|dt| dt.to_rfc3339())
-                .unwrap_or_default(),
-        })
-        .collect();
-    Ok(facts)
-}
-
-/// Apply confidence decay to facts in the unified store.
-fn decay_memory_in_store(store: &MemoryStore) -> anyhow::Result<usize> {
-    store.decay_facts(0.01)
-}
-
-/// Prune facts below a confidence threshold in the unified store.
-fn prune_memory_in_store(store: &MemoryStore, min_confidence: f64) -> anyhow::Result<usize> {
-    store.prune_facts(min_confidence)
-}
 
 /// Mirror one event in a stable multi-line format.
 fn mirror_event_line(prefix: &str, event: &Event) {
@@ -5913,7 +5837,13 @@ async fn ws_session_with_timeout(
         }
     };
 
-    if let Err(err) = verify_client_hello(&client_hello, std::time::SystemTime::now()) {
+    // Extract ws_auth_key from hub (if runtime is ready).
+    let auth_key = match state.runtime_snapshot().await {
+        RuntimeState::Ready(ref hub) => hub.ws_auth_key.clone(),
+        _ => None,
+    };
+
+    if let Err(err) = verify_client_hello(&client_hello, std::time::SystemTime::now(), auth_key.as_deref()) {
         reject_handshake(
             connection_id,
             "client_hello_verification_failed",
@@ -6701,7 +6631,7 @@ async fn ws_session_with_timeout(
                             let store = hub.memory_store.clone();
                             let out_tx = out_tx.clone();
                             tokio::spawn(async move {
-                                let result = compute_memory_stats_from_store(&store);
+                                let result = memory_panel::compute_memory_stats_from_store(&store);
                                 match result {
                                     Ok((total_facts, unique_subjects, unique_predicates, avg_confidence, oldest_fact, newest_fact)) => {
                                         send_direct_server_message(
@@ -6734,7 +6664,7 @@ async fn ws_session_with_timeout(
                             let store = hub.memory_store.clone();
                             let out_tx = out_tx.clone();
                             tokio::spawn(async move {
-                                let result = query_memory_facts_from_store(&store, query.as_deref(), limit, offset);
+                                let result = memory_panel::query_memory_facts_from_store(&store, query.as_deref(), limit, offset);
                                 match result {
                                     Ok((facts, total)) => {
                                         send_direct_server_message(
@@ -6760,7 +6690,7 @@ async fn ws_session_with_timeout(
                             let store = hub.memory_store.clone();
                             let out_tx = out_tx.clone();
                             tokio::spawn(async move {
-                                let result = traverse_memory_from_store(&store, &subject, max_hops, max_results);
+                                let result = memory_panel::traverse_memory_from_store(&store, &subject, max_hops, max_results);
                                 match result {
                                     Ok(facts) => {
                                         send_direct_server_message(
@@ -6790,7 +6720,7 @@ async fn ws_session_with_timeout(
                             let store = hub.memory_store.clone();
                             let out_tx = out_tx.clone();
                             tokio::spawn(async move {
-                                let result = decay_memory_in_store(&store);
+                                let result = memory_panel::decay_memory_in_store(&store);
                                 match result {
                                     Ok(affected) => {
                                         send_direct_server_message(
@@ -6820,7 +6750,7 @@ async fn ws_session_with_timeout(
                             let store = hub.memory_store.clone();
                             let out_tx = out_tx.clone();
                             tokio::spawn(async move {
-                                let result = prune_memory_in_store(&store, min_confidence);
+                                let result = memory_panel::prune_memory_in_store(&store, min_confidence);
                                 match result {
                                     Ok(affected) => {
                                         send_direct_server_message(
@@ -7569,6 +7499,7 @@ mod tests {
             "127.0.0.1:8765".to_string(),
             "/ws".to_string(),
             preload_ctx.workspace_root.clone(),
+            None,
             RuntimeReloadState {
                 runner,
                 preload_ctx,
@@ -7966,6 +7897,7 @@ description: Teaches patiently
             time_bucket,
             client_nonce: client_nonce.to_string(),
             proof: compute_client_proof(client_version, time_bucket, client_nonce),
+            token: None,
         }
     }
 

@@ -11,6 +11,7 @@ blake3 = "1.5"
 chrono = { version = "0.4.42", features = ["serde"] }
 fs4 = "0.13.1"
 hex = "0.4.3"
+hmac = "0.12"
 hostname = "0.4.1"
 mac_address = "1.1.8"
 sha2 = "0.10.9"

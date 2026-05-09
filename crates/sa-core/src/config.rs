@@ -560,6 +560,9 @@ impl Config {
         let mut server = toml::Table::new();
         server.insert("bind".to_string(), toml::Value::String(self.server.bind.clone()));
         server.insert("ws_path".to_string(), toml::Value::String(self.server.ws_path.clone()));
+        if let Some(ref key) = self.server.ws_auth_key {
+            server.insert("ws_auth_key".to_string(), toml::Value::String(mask_secret(key, 4)));
+        }
 
         let mut workspace = toml::Table::new();
         workspace.insert("root_dir".to_string(), toml::Value::String(self.workspace.root_dir.clone()));
@@ -668,11 +671,19 @@ impl Config {
             .and_then(|v| v.as_table())
             .context("config.server must be an object")?;
 
+        let ws_auth_key = match get_str(server_tbl, "ws_auth_key") {
+            Some(raw) if raw.starts_with("***") => current.server.ws_auth_key.clone(),
+            Some(raw) if raw.trim().is_empty() => current.server.ws_auth_key.clone(),
+            Some(raw) => Some(raw),
+            None => current.server.ws_auth_key.clone(),
+        };
+
         let server = ServerConfig {
             bind: get_str(server_tbl, "bind")
                 .context("config.server.bind is required")?,
             ws_path: get_str(server_tbl, "ws_path")
                 .context("config.server.ws_path is required")?,
+            ws_auth_key,
         };
 
         // --- [workspace] ---
@@ -713,6 +724,12 @@ pub struct ServerConfig {
 
     /// WebSocket path (example: `/ws`).
     pub ws_path: String,
+
+    /// Optional shared key for WebSocket authentication.
+    /// If set, clients must present a valid HMAC-SHA256 token derived from
+    /// this key and their client nonce.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ws_auth_key: Option<String>,
 }
 
 /// Workspace configuration (`[workspace]` section).
