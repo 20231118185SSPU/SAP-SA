@@ -3,6 +3,7 @@
 /dist/
 node_modules/
 WebUI/node_modules/
+crates/sa-core/bindings/
 
 # === OS/Editor ===
 .DS_Store

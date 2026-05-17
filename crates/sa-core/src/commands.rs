@@ -403,7 +403,6 @@ impl CommandRegistry {
         items
     }
 
-
     /// Return model-visible commands in stable order.
     ///
     /// Commands gated by `paths` only appear once their names are present in
@@ -527,7 +526,11 @@ impl CommandRegistry {
     pub fn match_triggers(&self, user_message: &str) -> Option<&CommandSpec> {
         let lower = user_message.to_lowercase();
         self.by_name.values().find(|cmd| {
-            !cmd.triggers.is_empty() && cmd.triggers.iter().any(|t| lower.contains(&t.to_lowercase()))
+            !cmd.triggers.is_empty()
+                && cmd
+                    .triggers
+                    .iter()
+                    .any(|t| lower.contains(&t.to_lowercase()))
         })
     }
 }
@@ -1004,6 +1007,8 @@ description: Explicit namespaced skill
                 paths: Vec::new(),
                 hooks: None,
                 shell: None,
+                triggers: Vec::new(),
+                orchestration: None,
                 source: CommandSource::Bundled,
                 content: CommandContent::Markdown {
                     root_dir: None,
@@ -1028,6 +1033,8 @@ description: Explicit namespaced skill
                 paths: Vec::new(),
                 hooks: None,
                 shell: None,
+                triggers: Vec::new(),
+                orchestration: None,
                 source: CommandSource::Bundled,
                 content: CommandContent::Markdown {
                     root_dir: None,
@@ -1052,6 +1059,8 @@ description: Explicit namespaced skill
                 paths: vec!["src/**".to_string()],
                 hooks: None,
                 shell: None,
+                triggers: Vec::new(),
+                orchestration: None,
                 source: CommandSource::Bundled,
                 content: CommandContent::Markdown {
                     root_dir: None,
@@ -1096,6 +1105,8 @@ description: Explicit namespaced skill
             paths: Vec::new(),
             hooks: None,
             shell: None,
+            triggers: Vec::new(),
+            orchestration: None,
             source: CommandSource::Bundled,
             content: CommandContent::Markdown {
                 root_dir: Some(root.clone()),
@@ -1141,6 +1152,8 @@ description: Explicit namespaced skill
                 paths: vec!["docs/**".to_string()],
                 hooks: None,
                 shell: None,
+                triggers: Vec::new(),
+                orchestration: None,
                 source: CommandSource::Bundled,
                 content: CommandContent::Markdown {
                     root_dir: None,

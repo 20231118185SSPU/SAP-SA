@@ -191,13 +191,13 @@ impl NoiseAssessor {
                 .text_content()
                 .unwrap_or_default()
                 .to_lowercase();
-            
+
             // Use first 200 chars as fingerprint
             let fingerprint: String = text.chars().take(200).collect();
-            
+
             let count = seen_texts.entry(fingerprint).or_insert(0);
             *count += 1;
-            
+
             // If we've seen this content before, count as duplicate
             if *count > 1 {
                 duplicate_chars += entry.char_count;
@@ -213,9 +213,7 @@ impl NoiseAssessor {
 
         for entry in entries {
             // Low importance + not consolidation candidate = potentially stale
-            if entry.importance < self.config.min_importance
-                && !entry.is_consolidation_candidate
-            {
+            if entry.importance < self.config.min_importance && !entry.is_consolidation_candidate {
                 stale_chars += entry.char_count;
             }
         }
@@ -238,7 +236,7 @@ impl NoiseAssessor {
 
         for entry in entries {
             let text = entry.message.text_content().unwrap_or_default();
-            
+
             // Tool outputs are typically verbose if they:
             // 1. Start with common tool prefixes
             // 2. Are very long (>500 chars)
@@ -265,10 +263,7 @@ impl NoiseAssessor {
 
         let mut report = String::new();
         report.push_str("## 上下文噪音评估\n\n");
-        report.push_str(&format!(
-            "- 总字符数: {}\n",
-            assessment.total_chars
-        ));
+        report.push_str(&format!("- 总字符数: {}\n", assessment.total_chars));
         report.push_str(&format!(
             "- 噪音字符数: {} ({:.1}%)\n",
             assessment.noise_chars,

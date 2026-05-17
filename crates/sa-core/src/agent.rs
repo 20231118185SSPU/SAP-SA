@@ -1,4 +1,4 @@
-﻿//! Minimal autonomous agent loop (tool-calling).
+//! Minimal autonomous agent loop (tool-calling).
 //!
 //! This is the "heart" of the StudyAdministrator (SA) agent extracted from the large
 //! `zeroclaw` codebase:
@@ -15,7 +15,10 @@ use crate::cancel::CancelToken;
 use crate::compact::{
     CompactionConfig, CompactionState, build_request_messages, maybe_compact_history,
 };
-use crate::openai::{ChatCompletionsRequest, ChatMessage, ContentPart, ImageUrl, MessageContent, OpenAiClient, ToolCall};
+use crate::openai::{
+    ChatCompletionsRequest, ChatMessage, ContentPart, ImageUrl, MessageContent, OpenAiClient,
+    ToolCall,
+};
 use crate::retry::retry_delay;
 use crate::session::SessionStore;
 use crate::skills::SkillRegistry;
@@ -23,9 +26,9 @@ use crate::tools::{
     AskRequest, PromptProfile, ReloadRuntimeFn, ToolControl, ToolExecutionResult, ToolExecutor,
     ToolRuntime, ToolSession,
 };
-use std::collections::HashMap;
 use crate::ws_protocol::EventKind;
 use anyhow::Context as _;
+use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
 static SUMMARY_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
@@ -54,10 +57,7 @@ const STATIC_SUBAGENT_PROMPT_TEMPLATE: &str = include_str!("../../../SubAgents.m
 /// pre-processing: the system can inject file content directly into prompts
 /// without the model needing to call a file-read tool first. Maximum 1000 lines
 /// per expansion to prevent context blow-up.
-fn expand_file_refs(
-    messages: &mut [ChatMessage],
-    workspace_root: &std::path::Path,
-) {
+fn expand_file_refs(messages: &mut [ChatMessage], workspace_root: &std::path::Path) {
     for msg in messages.iter_mut() {
         let Some(MessageContent::Text(text)) = &msg.content else {
             continue;
@@ -91,14 +91,12 @@ fn expand_file_refs(
                     .join("\n");
                 let limit = 1000.min(lines.len());
                 let truncated = if end - start + 1 > limit {
-                    format!(
-                        "… (showing first {limit} of {} lines) …\n",
-                        end - start + 1
-                    )
+                    format!("… (showing first {limit} of {} lines) …\n", end - start + 1)
                 } else {
                     String::new()
                 };
-                let replacement = format!("[expanded {{file:{file_path}}}:]\n{truncated}{excerpt}\n[/expanded]");
+                let replacement =
+                    format!("[expanded {{file:{file_path}}}:]\n{truncated}{excerpt}\n[/expanded]");
                 let Some(full_match) = caps.get(0) else {
                     tracing::warn!(target: "file_expand", "capture group 0 missing in file ref match");
                     continue;
@@ -547,9 +545,7 @@ impl AgentRunner {
                                 (emit)(
                                     EventKind::Log,
                                     task_id,
-                                    format!(
-                                        "配额耗尽，自动切换至 fallback 模型: {fallback}"
-                                    ),
+                                    format!("配额耗尽，自动切换至 fallback 模型: {fallback}"),
                                 );
                                 req.model = fallback.clone();
                                 model_error_count = 0;
@@ -563,11 +559,10 @@ impl AgentRunner {
 
                     // Total retry cap: prevent infinite retries.
                     if total_retries >= self.cfg.max_retries.max(1) {
-                        return Err(anyhow::Error::new(err))
-                            .context(format!(
-                                "达到最大重试次数上限（{}/{}），任务终止",
-                                total_retries, self.cfg.max_retries
-                            ));
+                        return Err(anyhow::Error::new(err)).context(format!(
+                            "达到最大重试次数上限（{}/{}），任务终止",
+                            total_retries, self.cfg.max_retries
+                        ));
                     }
 
                     let delay = retry_delay(model_error_count);
@@ -598,7 +593,13 @@ impl AgentRunner {
         assistant.request_usage = response_usage;
 
         // Emit context usage info after successful LLM response.
-        self.emit_context_info(&system_message, &compaction_state, &messages, &runtime, task_id);
+        self.emit_context_info(
+            &system_message,
+            &compaction_state,
+            &messages,
+            &runtime,
+            task_id,
+        );
 
         let assistant_text = assistant.text_content();
         if let Some(text) = assistant_text.as_deref() {
@@ -611,7 +612,11 @@ impl AgentRunner {
             // Empty assistant messages (no content and no tool calls) violate
             // OpenAI API requirements and will cause 400 Bad Request.
             if assistant.text_content().is_some() {
-                append_message_and_persist(&mut messages, assistant, persistent_session.as_deref())?;
+                append_message_and_persist(
+                    &mut messages,
+                    assistant,
+                    persistent_session.as_deref(),
+                )?;
             }
             return Ok(AgentQuantumResult {
                 tool_session,
@@ -730,8 +735,7 @@ impl AgentRunner {
                 Ok(ref image @ ToolExecutionResult::ImagePayload { .. }) => {
                     // Image payload: inject as a multimodal user message so the
                     // LLM can "see" the image on the next request.
-                    let (tool_msg, user_msg) =
-                        build_image_payload_messages(&call.id, image);
+                    let (tool_msg, user_msg) = build_image_payload_messages(&call.id, image);
                     let b64_len = match image {
                         ToolExecutionResult::ImagePayload { data_url, .. } => data_url.len(),
                         _ => 0,
@@ -864,7 +868,12 @@ impl AgentRunner {
         // The checkpoint file is consumed (deleted) after reading so it only
         // applies to the first run after a crash/interrupt.
         {
-            let checkpoint_path = self.tools.ctx.workspace_root.join("runtime").join("checkpoint.md");
+            let checkpoint_path = self
+                .tools
+                .ctx
+                .workspace_root
+                .join("runtime")
+                .join("checkpoint.md");
             if checkpoint_path.exists() {
                 match tokio::fs::read_to_string(&checkpoint_path).await {
                     Ok(content) => {
@@ -884,11 +893,7 @@ impl AgentRunner {
                         );
                     }
                     Err(e) => {
-                        (emit)(
-                            EventKind::Error,
-                            task_id,
-                            format!("读取检查点失败: {e}"),
-                        );
+                        (emit)(EventKind::Error, task_id, format!("读取检查点失败: {e}"));
                     }
                 }
             }
@@ -957,8 +962,7 @@ impl AgentRunner {
                     match tokio::fs::read_to_string(&intervene_path).await {
                         Ok(content) => {
                             let _ = tokio::fs::remove_file(&intervene_path).await;
-                            let inject =
-                                format!("[外部干预] {content}");
+                            let inject = format!("[外部干预] {content}");
                             append_message_and_persist(
                                 &mut messages,
                                 ChatMessage::text("user", &inject),
@@ -982,22 +986,14 @@ impl AgentRunner {
                     "user",
                     "[System] 禁止无效重试，必须切换策略。现在已执行 {step} 轮，如果当前方法不奏效，请尝试不同方法。",
                 );
-                append_message_and_persist(
-                    &mut messages,
-                    warning,
-                    persistent_session.as_deref(),
-                )?;
+                append_message_and_persist(&mut messages, warning, persistent_session.as_deref())?;
             }
             if step > 0 && step % 10 == 0 {
                 let reminder = ChatMessage::text(
                     "user",
                     "[System] 已执行 {step} 轮。请回顾任务目标，确认当前方向正确，必要时使用 memory 工具重新上下文化。",
                 );
-                append_message_and_persist(
-                    &mut messages,
-                    reminder,
-                    persistent_session.as_deref(),
-                )?;
+                append_message_and_persist(&mut messages, reminder, persistent_session.as_deref())?;
             }
 
             match maybe_compact_history(
@@ -1190,9 +1186,7 @@ impl AgentRunner {
                                     (emit)(
                                         EventKind::Log,
                                         task_id,
-                                        format!(
-                                            "配额耗尽，自动切换至 fallback 模型: {fallback}"
-                                        ),
+                                        format!("配额耗尽，自动切换至 fallback 模型: {fallback}"),
                                     );
                                     req.model = fallback;
                                     model_error_count = 0;
@@ -1200,9 +1194,7 @@ impl AgentRunner {
                                 }
                             }
                             // No fallback or already on fallback: terminate.
-                            let msg = format!(
-                                "配额耗尽，请切换模型：{err}"
-                            );
+                            let msg = format!("配额耗尽，请切换模型：{err}");
                             (emit)(EventKind::Error, task_id, msg.clone());
                             (emit)(EventKind::Final, task_id, msg.clone());
                             return Ok(msg);
@@ -1291,7 +1283,13 @@ impl AgentRunner {
             assistant.request_usage = response_usage;
 
             // Emit context usage info after successful LLM response.
-            self.emit_context_info(&system_message, &compaction_state, &messages, &runtime, task_id);
+            self.emit_context_info(
+                &system_message,
+                &compaction_state,
+                &messages,
+                &runtime,
+                task_id,
+            );
 
             // Emit assistant content (if present).
             let assistant_text = assistant.text_content();
@@ -1299,7 +1297,11 @@ impl AgentRunner {
                 // If LLM returned tool calls, the text is intermediate reasoning (→ Log);
                 // if no tool calls, the text is the final reply (→ Message, rendered in chat).
                 let has_tools = !assistant.tool_calls.as_ref().map_or(true, |v| v.is_empty());
-                let kind = if has_tools { EventKind::Log } else { EventKind::Message };
+                let kind = if has_tools {
+                    EventKind::Log
+                } else {
+                    EventKind::Message
+                };
                 (emit)(kind, task_id, content.clone());
             }
 
@@ -1309,7 +1311,11 @@ impl AgentRunner {
             // Persist assistant message in history (only if it has content or tool calls).
             let has_content = assistant_text.is_some();
             if has_content || !tool_calls.is_empty() {
-                append_message_and_persist(&mut messages, assistant, persistent_session.as_deref())?;
+                append_message_and_persist(
+                    &mut messages,
+                    assistant,
+                    persistent_session.as_deref(),
+                )?;
             }
 
             // 5.1 <summary> protocol: detect missing summary tag and inject warning.
@@ -1350,7 +1356,8 @@ impl AgentRunner {
                         }
                         Some(text) if text.len() < 50 && !text.contains("完成") => {
                             // Short response that doesn't claim completion.
-                            "[System] 请继续执行任务。使用工具完成实际操作，不要只描述计划。".to_string()
+                            "[System] 请继续执行任务。使用工具完成实际操作，不要只描述计划。"
+                                .to_string()
                         }
                         _ => {
                             // Had content but no tools — inject verification prompt.
@@ -1360,7 +1367,11 @@ impl AgentRunner {
                 };
 
                 let retry_msg = ChatMessage::text("user", &injection);
-                append_message_and_persist(&mut messages, retry_msg, persistent_session.as_deref())?;
+                append_message_and_persist(
+                    &mut messages,
+                    retry_msg,
+                    persistent_session.as_deref(),
+                )?;
                 continue;
             }
 
@@ -1419,8 +1430,7 @@ impl AgentRunner {
                     }
                     Ok(ref image @ ToolExecutionResult::ImagePayload { .. }) => {
                         // Image payload: inject as a multimodal user message.
-                        let (tool_msg, user_msg) =
-                            build_image_payload_messages(&call.id, image);
+                        let (tool_msg, user_msg) = build_image_payload_messages(&call.id, image);
                         let b64_len = match image {
                             ToolExecutionResult::ImagePayload { data_url, .. } => data_url.len(),
                             _ => 0,
@@ -1465,14 +1475,10 @@ impl AgentRunner {
                                     .into_iter()
                                     .rev()
                                     .collect();
-                                let model = runtime
-                                    .model_override
-                                    .as_deref()
-                                    .unwrap_or(&self.cfg.model);
+                                let model =
+                                    runtime.model_override.as_deref().unwrap_or(&self.cfg.model);
                                 match crate::adversary::run_adversary_review(
-                                    &self.llm,
-                                    model,
-                                    &recent,
+                                    &self.llm, model, &recent,
                                 )
                                 .await
                                 {
@@ -1491,10 +1497,7 @@ impl AgentRunner {
                                         (emit)(
                                             EventKind::Log,
                                             task_id,
-                                            format!(
-                                                "[质量审查] 通过 (score={})",
-                                                review.score
-                                            ),
+                                            format!("[质量审查] 通过 (score={})", review.score),
                                         );
                                     }
                                     Err(e) => {
@@ -1527,14 +1530,10 @@ impl AgentRunner {
                                     .into_iter()
                                     .rev()
                                     .collect();
-                                let model = runtime
-                                    .model_override
-                                    .as_deref()
-                                    .unwrap_or(&self.cfg.model);
+                                let model =
+                                    runtime.model_override.as_deref().unwrap_or(&self.cfg.model);
                                 match crate::adversary::run_adversary_review(
-                                    &self.llm,
-                                    model,
-                                    &recent,
+                                    &self.llm, model, &recent,
                                 )
                                 .await
                                 {
@@ -1553,10 +1552,7 @@ impl AgentRunner {
                                         (emit)(
                                             EventKind::Log,
                                             task_id,
-                                            format!(
-                                                "[质量审查] 通过 (score={})",
-                                                review.score
-                                            ),
+                                            format!("[质量审查] 通过 (score={})", review.score),
                                         );
                                     }
                                     Err(e) => {
@@ -2323,9 +2319,7 @@ fn build_image_payload_messages(
 
     // Build a multimodal user message carrying the image.
     if let ToolExecutionResult::ImagePayload {
-        data_url,
-        prompt,
-        ..
+        data_url, prompt, ..
     } = payload
     {
         let analysis_prompt = prompt
@@ -2390,8 +2384,6 @@ fn append_message_and_persist(
     messages.push(message);
     Ok(())
 }
-
-
 
 /// Drain any queued follow-up user messages and append them to the current
 /// conversation history as fresh user turns.
@@ -2709,6 +2701,7 @@ mod tests {
             allow_user_ask: false,
             allow_input_transfer_target: false,
             existing_agent_id: None,
+            category: None,
         };
         let context = build_internal_memory_refresh_subagent_context(
             "## Base\n\n- compact 后上下文",

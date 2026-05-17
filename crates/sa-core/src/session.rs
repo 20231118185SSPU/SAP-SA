@@ -34,7 +34,7 @@ use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write as _;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use uuid::Uuid;
 
 /// Directory name used for persistent session files under the workspace root.
@@ -47,6 +47,11 @@ const CURRENT_SESSION_POINTER_FILE_NAME: &str = ".current";
 /// Lock file used to guard one workspace session directory from concurrent
 /// backend ownership.
 const SESSION_STORE_LOCK_FILE_NAME: &str = ".sa-session.lock";
+
+/// In-process guard for platforms whose advisory file locks do not reject a
+/// second lock attempt made by the same process.
+static LIVE_SESSION_LOCKS: LazyLock<Mutex<HashSet<PathBuf>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
 
 /// JSONL schema version for session files.
 const SESSION_SCHEMA_VERSION: u32 = 1;
@@ -110,7 +115,7 @@ pub struct SessionStore {
     /// `<workspace>/sessions/.current`.
     pointer_path: PathBuf,
     /// File handle that keeps the cross-process lock alive.
-    _process_lock: Arc<File>,
+    _process_lock: Arc<SessionProcessLock>,
     /// Mutable pointer to the currently active segment.
     state: Arc<Mutex<SessionState>>,
 }
@@ -295,7 +300,7 @@ impl SessionStore {
             )
         })?;
         let pointer_path = sessions_dir.join(CURRENT_SESSION_POINTER_FILE_NAME);
-        let process_lock = acquire_session_store_lock(&sessions_dir)?;
+        let process_lock = SessionProcessLock::acquire(sessions_dir.clone())?;
         let state = resolve_or_create_current_state(&workspace_root, &sessions_dir, &pointer_path)?;
 
         Ok(Self {
@@ -902,17 +907,66 @@ fn resolve_session_segment_path(
     Ok(canonical)
 }
 
-/// Acquire one exclusive lock for the whole persistent session directory.
-///
-/// If the lock is held by a process that is no longer running (stale lock),
-/// the lock file is removed and acquisition is retried once.
-fn acquire_session_store_lock(sessions_dir: &Path) -> anyhow::Result<File> {
+/// Owned session-directory lock.
+#[derive(Debug)]
+struct SessionProcessLock {
+    /// Canonical session directory reserved by this process.
+    sessions_dir: PathBuf,
+    /// Advisory OS file lock handle.
+    _file: File,
+}
+
+impl SessionProcessLock {
+    /// Acquire one exclusive lock for the whole persistent session directory.
+    fn acquire(sessions_dir: PathBuf) -> anyhow::Result<Self> {
+        reserve_live_session_lock(&sessions_dir)?;
+        match acquire_session_store_lock_file(&sessions_dir) {
+            Ok(file) => Ok(Self {
+                sessions_dir,
+                _file: file,
+            }),
+            Err(err) => {
+                release_live_session_lock(&sessions_dir);
+                Err(err)
+            }
+        }
+    }
+}
+
+impl Drop for SessionProcessLock {
+    fn drop(&mut self) {
+        release_live_session_lock(&self.sessions_dir);
+    }
+}
+
+/// Reserve one session directory inside the current process.
+fn reserve_live_session_lock(sessions_dir: &Path) -> anyhow::Result<()> {
+    let mut live = LIVE_SESSION_LOCKS
+        .lock()
+        .expect("live session lock registry mutex poisoned");
+    if !live.insert(sessions_dir.to_path_buf()) {
+        anyhow::bail!(
+            "Another SA backend instance is already using session storage under {}",
+            sessions_dir.display()
+        );
+    }
+    Ok(())
+}
+
+/// Release one in-process session-directory reservation.
+fn release_live_session_lock(sessions_dir: &Path) {
+    if let Ok(mut live) = LIVE_SESSION_LOCKS.lock() {
+        live.remove(sessions_dir);
+    }
+}
+
+/// Acquire one OS-level exclusive lock for the session directory.
+fn acquire_session_store_lock_file(sessions_dir: &Path) -> anyhow::Result<File> {
     let lock_path = sessions_dir.join(SESSION_STORE_LOCK_FILE_NAME);
 
     // First attempt: try to acquire the lock normally.
-    match try_lock_file(&lock_path) {
-        Ok(file) => return Ok(file),
-        Err(_) => {}
+    if let Ok(file) = try_lock_file(&lock_path) {
+        return Ok(file);
     }
 
     // Lock held — check if it's a stale lock from a dead process.
@@ -1240,7 +1294,7 @@ mod tests {
         let (_workspace, store) = create_store();
         let assistant = ChatMessage {
             role: "assistant".to_string(),
-            content: Some("need tool".to_string()),
+            content: Some(MessageContent::Text("need tool".to_string())),
             tool_calls: Some(vec![ToolCall {
                 id: "call_1".to_string(),
                 kind: "function".to_string(),
@@ -1290,7 +1344,10 @@ mod tests {
             .load_snapshot()
             .expect("snapshot should recover from truncated final line");
         assert_eq!(snapshot.messages.len(), 1);
-        assert_eq!(snapshot.messages[0].content.as_deref(), Some("hello"));
+        assert_eq!(
+            snapshot.messages[0].text_content().as_deref(),
+            Some("hello")
+        );
 
         let repaired = fs::read_to_string(&current_path).expect("repaired session should read");
         assert_eq!(repaired.lines().count(), 2);

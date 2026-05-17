@@ -63,6 +63,7 @@ impl ToolExecutor {
             allow_user_ask: args.allow_user_ask,
             allow_input_transfer_target: args.allow_input_transfer_target,
             existing_agent_id: args.existing_agent_id,
+            category: None,
         };
         request.validate()?;
 

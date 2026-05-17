@@ -1,4 +1,4 @@
-﻿//! Configuration loading for StudyAdministrator (SA).
+//! Configuration loading for StudyAdministrator (SA).
 //!
 //! The user request explicitly asked for:
 //! - A TOML configuration file.
@@ -12,8 +12,8 @@
 use crate::compact::CompactionConfig;
 use crate::dream::DreamConfig;
 use crate::openai::{AuthStyle, WireApi};
-use anyhow::Context as _;
 use crate::pii_detector::SanitizePolicy;
+use anyhow::Context as _;
 use serde::de::Error as SerdeError;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -63,7 +63,6 @@ pub struct Config {
     #[serde(default)]
     pub search: SearchConfig,
 }
-
 
 /// Model routing configuration (`[model_routing]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -510,9 +509,18 @@ impl Config {
     pub fn to_toml_value(&self) -> toml::Value {
         // Build each section as a TOML table.
         let mut llm = toml::Table::new();
-        llm.insert("base_url".to_string(), toml::Value::String(self.llm.base_url.clone()));
-        llm.insert("api_key".to_string(), toml::Value::String(mask_secret(&self.llm.api_key, 4)));
-        llm.insert("model".to_string(), toml::Value::String(self.llm.model.clone()));
+        llm.insert(
+            "base_url".to_string(),
+            toml::Value::String(self.llm.base_url.clone()),
+        );
+        llm.insert(
+            "api_key".to_string(),
+            toml::Value::String(mask_secret(&self.llm.api_key, 4)),
+        );
+        llm.insert(
+            "model".to_string(),
+            toml::Value::String(self.llm.model.clone()),
+        );
         if let Some(ref wire_api) = self.llm.wire_api {
             // Use serde serialization (lowercase) instead of Debug format.
             let s = serde_json::to_string(wire_api).unwrap_or_else(|_| format!("{wire_api:?}"));
@@ -526,10 +534,16 @@ impl Config {
             llm.insert("auth_style".to_string(), toml::Value::String(s));
         }
         if let Some(ref role) = self.llm.system_role_name {
-            llm.insert("system_role_name".to_string(), toml::Value::String(role.clone()));
+            llm.insert(
+                "system_role_name".to_string(),
+                toml::Value::String(role.clone()),
+            );
         }
         if let Some(ref effort) = self.llm.reasoning_effort {
-            llm.insert("reasoning_effort".to_string(), toml::Value::String(effort.clone()));
+            llm.insert(
+                "reasoning_effort".to_string(),
+                toml::Value::String(effort.clone()),
+            );
         }
         if let Some(temp) = self.llm.temperature {
             llm.insert("temperature".to_string(), toml::Value::Float(temp));
@@ -538,18 +552,36 @@ impl Config {
             llm.insert("top_p".to_string(), toml::Value::Float(tp));
         }
         if let Some(max_tok) = self.llm.max_output_tokens {
-            llm.insert("max_output_tokens".to_string(), toml::Value::Integer(max_tok as i64));
+            llm.insert(
+                "max_output_tokens".to_string(),
+                toml::Value::Integer(max_tok as i64),
+            );
         }
         if let Some(ref fallback) = self.llm.fallback_model {
-            llm.insert("fallback_model".to_string(), toml::Value::String(fallback.clone()));
+            llm.insert(
+                "fallback_model".to_string(),
+                toml::Value::String(fallback.clone()),
+            );
         }
-        llm.insert("max_consecutive_failures".to_string(), toml::Value::Integer(self.llm.max_consecutive_failures as i64));
-        llm.insert("max_retries".to_string(), toml::Value::Integer(self.llm.max_retries as i64));
+        llm.insert(
+            "max_consecutive_failures".to_string(),
+            toml::Value::Integer(self.llm.max_consecutive_failures as i64),
+        );
+        llm.insert(
+            "max_retries".to_string(),
+            toml::Value::Integer(self.llm.max_retries as i64),
+        );
         if let Some(ref thinking) = self.llm.thinking {
             let mut tbl = toml::Table::new();
-            tbl.insert("type".to_string(), toml::Value::String(thinking.kind.clone()));
+            tbl.insert(
+                "type".to_string(),
+                toml::Value::String(thinking.kind.clone()),
+            );
             if let Some(budget) = thinking.budget_tokens {
-                tbl.insert("budget_tokens".to_string(), toml::Value::Integer(budget as i64));
+                tbl.insert(
+                    "budget_tokens".to_string(),
+                    toml::Value::Integer(budget as i64),
+                );
             }
             llm.insert("thinking".to_string(), toml::Value::Table(tbl));
         }
@@ -558,15 +590,30 @@ impl Config {
         }
 
         let mut server = toml::Table::new();
-        server.insert("bind".to_string(), toml::Value::String(self.server.bind.clone()));
-        server.insert("ws_path".to_string(), toml::Value::String(self.server.ws_path.clone()));
+        server.insert(
+            "bind".to_string(),
+            toml::Value::String(self.server.bind.clone()),
+        );
+        server.insert(
+            "ws_path".to_string(),
+            toml::Value::String(self.server.ws_path.clone()),
+        );
         if let Some(ref key) = self.server.ws_auth_key {
-            server.insert("ws_auth_key".to_string(), toml::Value::String(mask_secret(key, 4)));
+            server.insert(
+                "ws_auth_key".to_string(),
+                toml::Value::String(mask_secret(key, 4)),
+            );
         }
 
         let mut workspace = toml::Table::new();
-        workspace.insert("root_dir".to_string(), toml::Value::String(self.workspace.root_dir.clone()));
-        workspace.insert("agents_md".to_string(), toml::Value::String(self.workspace.agents_md.clone()));
+        workspace.insert(
+            "root_dir".to_string(),
+            toml::Value::String(self.workspace.root_dir.clone()),
+        );
+        workspace.insert(
+            "agents_md".to_string(),
+            toml::Value::String(self.workspace.agents_md.clone()),
+        );
 
         let mut root = toml::Table::new();
         root.insert("llm".to_string(), toml::Value::Table(llm));
@@ -591,7 +638,10 @@ impl Config {
 
         // Helper to read a string field from a toml::Value table.
         let get_str = |table: &toml::Table, key: &str| -> Option<String> {
-            table.get(key).and_then(|v| v.as_str()).map(|s| s.to_string())
+            table
+                .get(key)
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
         };
 
         // --- [llm] ---
@@ -600,10 +650,8 @@ impl Config {
             .and_then(|v| v.as_table())
             .context("config.llm must be an object")?;
 
-        let base_url = get_str(llm_tbl, "base_url")
-            .context("config.llm.base_url is required")?;
-        let model = get_str(llm_tbl, "model")
-            .context("config.llm.model is required")?;
+        let base_url = get_str(llm_tbl, "base_url").context("config.llm.base_url is required")?;
+        let model = get_str(llm_tbl, "model").context("config.llm.model is required")?;
 
         // If the client sent a masked api_key, keep the current real one.
         let raw_api_key = get_str(llm_tbl, "api_key").unwrap_or_default();
@@ -623,11 +671,11 @@ impl Config {
             .transpose()
             .context("config.llm.auth_style is invalid")?;
 
-        let system_role_name = get_str(llm_tbl, "system_role_name")
-            .filter(|s| !s.trim().is_empty());
+        let system_role_name =
+            get_str(llm_tbl, "system_role_name").filter(|s| !s.trim().is_empty());
 
-        let reasoning_effort = get_str(llm_tbl, "reasoning_effort")
-            .filter(|s| !s.trim().is_empty());
+        let reasoning_effort =
+            get_str(llm_tbl, "reasoning_effort").filter(|s| !s.trim().is_empty());
 
         let temperature = llm_tbl.get("temperature").and_then(|v| v.as_float());
         let top_p = llm_tbl.get("top_p").and_then(|v| v.as_float());
@@ -640,8 +688,14 @@ impl Config {
         let thinking = llm_tbl.get("thinking").and_then(|v| {
             let tbl = v.as_table()?;
             let kind = tbl.get("type")?.as_str()?.to_string();
-            let budget_tokens = tbl.get("budget_tokens").and_then(|v| v.as_integer()).map(|v| v as u32);
-            Some(ThinkingConfig { kind, budget_tokens })
+            let budget_tokens = tbl
+                .get("budget_tokens")
+                .and_then(|v| v.as_integer())
+                .map(|v| v as u32);
+            Some(ThinkingConfig {
+                kind,
+                budget_tokens,
+            })
         });
 
         // Parse vision flag
@@ -679,10 +733,8 @@ impl Config {
         };
 
         let server = ServerConfig {
-            bind: get_str(server_tbl, "bind")
-                .context("config.server.bind is required")?,
-            ws_path: get_str(server_tbl, "ws_path")
-                .context("config.server.ws_path is required")?,
+            bind: get_str(server_tbl, "bind").context("config.server.bind is required")?,
+            ws_path: get_str(server_tbl, "ws_path").context("config.server.ws_path is required")?,
             ws_auth_key,
         };
 

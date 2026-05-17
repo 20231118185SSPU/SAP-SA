@@ -91,8 +91,12 @@ pub struct RetryPolicy {
     pub backoff_ms: u64,
 }
 
-fn default_max_attempts() -> u32 { 1 }
-fn default_backoff_ms() -> u64 { 1000 }
+fn default_max_attempts() -> u32 {
+    1
+}
+fn default_backoff_ms() -> u64 {
+    1000
+}
 
 impl Default for RetryPolicy {
     fn default() -> Self {
@@ -114,7 +118,9 @@ pub struct LoopCondition {
     pub max_iterations: usize,
 }
 
-fn default_max_iterations() -> usize { 5 }
+fn default_max_iterations() -> usize {
+    5
+}
 
 /// How to determine if a node is ready when multiple dependencies exist.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]

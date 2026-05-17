@@ -26,15 +26,15 @@
 //!     and `memory/dreams/**/*.md` are readable
 //!   - path traversal and symlink escapes are rejected
 
+use crate::cache::MemoryCache;
+use crate::memory_filter::WriteFilterResult;
+use crate::memory_scope::MemoryScope;
 use anyhow::Context as _;
-use serde::{Deserialize, Serialize};
 use chrono;
+use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use crate::cache::MemoryCache;
-use crate::memory_scope::MemoryScope;
-use crate::memory_filter::WriteFilterResult;
 
 /// Primary long-term memory filename used by OpenClaw-style workspaces.
 pub const PRIMARY_MEMORY_FILE: &str = "MEMORY.md";
@@ -179,9 +179,7 @@ pub async fn build_prompt_block(workspace_root: &Path) -> anyhow::Result<String>
 
     let raw = tokio::fs::read_to_string(&main_path)
         .await
-        .with_context(|| {
-            format!("Failed to read memory file: {}", main_path.display())
-        })?;
+        .with_context(|| format!("Failed to read memory file: {}", main_path.display()))?;
 
     let trimmed = raw.trim();
     if !trimmed.is_empty() {
@@ -255,7 +253,10 @@ pub fn is_memory_reference(raw: &str) -> bool {
 
 /// Build a set of line ranges (0-indexed) in `content` that correspond to entries
 /// matching the given `filter_tags`. If `filter_tags` is None, returns None (no filter).
-fn tagged_line_ranges(content: &str, filter_tags: Option<&[String]>) -> Option<Vec<(usize, usize)>> {
+fn tagged_line_ranges(
+    content: &str,
+    filter_tags: Option<&[String]>,
+) -> Option<Vec<(usize, usize)>> {
     let tags = filter_tags?;
     if tags.is_empty() {
         return None;
@@ -661,7 +662,9 @@ pub enum FactType {
 }
 
 impl Default for FactType {
-    fn default() -> Self { FactType::Dynamic }
+    fn default() -> Self {
+        FactType::Dynamic
+    }
 }
 
 impl std::fmt::Display for FactType {
@@ -700,21 +703,26 @@ impl Fact {
 // D3 — Importance Scoring & Emotion Detection
 // =============================================================================
 
-const PREFERENCE_KEYWORDS: &[&str] = &[
-    "喜欢", "不喜欢", "偏好", "习惯", "爱好", "爱",
-];
-const EXPLICIT_MARKERS: &[&str] = &[
-    "remember", "记住", "切记", "不要忘", "牢记", "重要",
-];
+const PREFERENCE_KEYWORDS: &[&str] = &["喜欢", "不喜欢", "偏好", "习惯", "爱好", "爱"];
+const EXPLICIT_MARKERS: &[&str] = &["remember", "记住", "切记", "不要忘", "牢记", "重要"];
 const EMOTION_KEYWORDS: &[(&str, f64)] = &[
-    ("开心", 0.8), ("高兴", 0.7), ("难过", 0.6), ("伤心", 0.7),
-    ("生气", 0.7), ("焦虑", 0.6), ("紧张", 0.5), ("兴奋", 0.9),
-    ("失望", 0.5), ("害怕", 0.6), ("快乐", 0.8), ("愤怒", 0.8),
-    ("沮丧", 0.5), ("感动", 0.7), ("温暖", 0.5),
+    ("开心", 0.8),
+    ("高兴", 0.7),
+    ("难过", 0.6),
+    ("伤心", 0.7),
+    ("生气", 0.7),
+    ("焦虑", 0.6),
+    ("紧张", 0.5),
+    ("兴奋", 0.9),
+    ("失望", 0.5),
+    ("害怕", 0.6),
+    ("快乐", 0.8),
+    ("愤怒", 0.8),
+    ("沮丧", 0.5),
+    ("感动", 0.7),
+    ("温暖", 0.5),
 ];
-const ENTITY_SIGNALS: &[&str] = &[
-    "昨天", "前天", "今天", "最近", "上次",
-];
+const ENTITY_SIGNALS: &[&str] = &["昨天", "前天", "今天", "最近", "上次"];
 
 pub fn score_content_importance(content: &str) -> f64 {
     let mut score = 0.0_f64;
@@ -751,12 +759,18 @@ pub fn detect_emotion(content: &str) -> (f64, f64) {
         }
     }
 
-    let valence = if count > 0 { valence_sum / count as f64 } else { 0.0 };
+    let valence = if count > 0 {
+        valence_sum / count as f64
+    } else {
+        0.0
+    };
     (valence.clamp(-1.0, 1.0), max_arousal)
 }
 
 pub fn extract_entities_simple(content: &str) -> Vec<String> {
-    let skip: &[&str] = &["我", "你", "他", "她", "它", "我们", "是", "的", "了", "在", "和", "与"];
+    let skip: &[&str] = &[
+        "我", "你", "他", "她", "它", "我们", "是", "的", "了", "在", "和", "与",
+    ];
     content
         .split(|c: char| !c.is_alphanumeric() && c != '_' && !c.is_ascii())
         .filter(|w| !w.is_empty() && w.len() > 1)
@@ -774,7 +788,10 @@ pub fn enrich_metadata(metadata: &MemoryMetadata, content: &str) -> MemoryMetada
     if meta.emotion.is_none() {
         let (valence, arousal) = detect_emotion(content);
         if arousal > 0.0 {
-            meta.emotion = Some(Emotion { valence: Some(valence), arousal: Some(arousal) });
+            meta.emotion = Some(Emotion {
+                valence: Some(valence),
+                arousal: Some(arousal),
+            });
         }
     }
     if meta.entities.is_none() {
@@ -806,68 +823,105 @@ pub fn extract_facts(content: &str, noted_date: &str) -> Vec<Fact> {
             continue;
         }
 
-        let category = if line.contains("决定") || line.contains("选择")
-            || line.contains("改为") || line.contains("切换到")
-            || line.contains("启用") || line.contains("禁用")
-            || line.contains("统一使用") || line.contains("结论")
+        let category = if line.contains("决定")
+            || line.contains("选择")
+            || line.contains("改为")
+            || line.contains("切换到")
+            || line.contains("启用")
+            || line.contains("禁用")
+            || line.contains("统一使用")
+            || line.contains("结论")
         {
             "decision"
         } else if PREFERENCE_KEYWORDS.iter().any(|k| line.contains(k)) {
             "preference"
-        } else if line.contains("生日是") || line.contains("出生于")
-            || line.contains("工作单位") || line.contains("公司是")
-            || line.contains("简历") || line.contains("姓名")
+        } else if line.contains("生日是")
+            || line.contains("出生于")
+            || line.contains("工作单位")
+            || line.contains("公司是")
+            || line.contains("简历")
+            || line.contains("姓名")
         {
             "person"
-        } else if line.contains("项目") || line.contains("计划")
-            || line.contains("待办") || line.contains("TODO")
-            || line.contains("任务") || line.contains("产出")
+        } else if line.contains("项目")
+            || line.contains("计划")
+            || line.contains("待办")
+            || line.contains("TODO")
+            || line.contains("任务")
+            || line.contains("产出")
         {
             "project"
-        } else if line.contains("配置") || line.contains("sa.toml")
-            || line.contains("模型") || line.contains("参数")
-            || line.contains("tokens") || line.contains("预算")
-            || line.contains("窗口") || line.contains("设置")
+        } else if line.contains("配置")
+            || line.contains("sa.toml")
+            || line.contains("模型")
+            || line.contains("参数")
+            || line.contains("tokens")
+            || line.contains("预算")
+            || line.contains("窗口")
+            || line.contains("设置")
         {
             "config"
-        } else if line.contains("根因") || line.contains("Bug")
-            || line.contains("报错") || line.contains("错误")
-            || line.contains("修复") || line.contains("排查")
-            || line.contains("失败") || line.contains("重复")
+        } else if line.contains("根因")
+            || line.contains("Bug")
+            || line.contains("报错")
+            || line.contains("错误")
+            || line.contains("修复")
+            || line.contains("排查")
+            || line.contains("失败")
+            || line.contains("重复")
         {
             "bug"
-        } else if line.contains("教训") || line.contains("经验")
-            || line.contains("总结") || line.contains("注意")
-            || line.contains("避免") || line.contains("小心")
+        } else if line.contains("教训")
+            || line.contains("经验")
+            || line.contains("总结")
+            || line.contains("注意")
+            || line.contains("避免")
+            || line.contains("小心")
             || line.contains("小结")
         {
             "lesson"
-        } else if line.contains("上下文") || line.contains("压缩")
-            || line.contains("session") || line.contains("摘要")
-            || line.contains("分段") || line.contains("缓存")
+        } else if line.contains("上下文")
+            || line.contains("压缩")
+            || line.contains("session")
+            || line.contains("摘要")
+            || line.contains("分段")
+            || line.contains("缓存")
         {
             "context"
-        } else if line.contains("启动") || line.contains("恢复")
-            || line.contains("重载") || line.contains("Reload")
-            || line.contains("skills") || line.contains("MCP")
-            || line.contains("模块") || line.contains("技能")
-            || line.contains("注册") || line.contains("创建")
-            || line.contains("更新") || line.contains("已更新")
+        } else if line.contains("启动")
+            || line.contains("恢复")
+            || line.contains("重载")
+            || line.contains("Reload")
+            || line.contains("skills")
+            || line.contains("MCP")
+            || line.contains("模块")
+            || line.contains("技能")
+            || line.contains("注册")
+            || line.contains("创建")
+            || line.contains("更新")
+            || line.contains("已更新")
         {
             "system"
-        } else if line.contains("完成") || line.contains("成功")
-            || line.contains("读取") || line.contains("分析")
-            || line.contains("提供") || line.contains("确认")
-            || line.contains("检查") || line.contains("清理")
-            || line.contains("补充") || line.contains("新增")
+        } else if line.contains("完成")
+            || line.contains("成功")
+            || line.contains("读取")
+            || line.contains("分析")
+            || line.contains("提供")
+            || line.contains("确认")
+            || line.contains("检查")
+            || line.contains("清理")
+            || line.contains("补充")
+            || line.contains("新增")
         {
             "task"
         } else {
             continue;
         };
 
-        let fact_type = if line.contains("永远") || line.contains("一直")
-            || line.contains("统一") || line.contains("始终")
+        let fact_type = if line.contains("永远")
+            || line.contains("一直")
+            || line.contains("统一")
+            || line.contains("始终")
         {
             FactType::Static
         } else {
@@ -924,17 +978,24 @@ fn ngrams(text: &str, n: usize) -> std::collections::HashSet<String> {
 pub fn compute_similarity(a: &str, b: &str) -> f64 {
     let a_lower = a.to_ascii_lowercase();
     let b_lower = b.to_ascii_lowercase();
-    if a_lower == b_lower { return 1.0; }
+    if a_lower == b_lower {
+        return 1.0;
+    }
 
     let ga = ngrams(&a_lower, SIMILARITY_NGRAM_WINDOW);
     let gb = ngrams(&b_lower, SIMILARITY_NGRAM_WINDOW);
     let intersection = ga.intersection(&gb).count();
     let union = ga.union(&gb).count();
-    if union == 0 { return 0.0; }
+    if union == 0 {
+        return 0.0;
+    }
     intersection as f64 / union as f64
 }
 
-pub fn check_write_gate(entries: &[(String, MemoryMetadata)], new_content: &str) -> (WriteGateAction, Option<usize>) {
+pub fn check_write_gate(
+    entries: &[(String, MemoryMetadata)],
+    new_content: &str,
+) -> (WriteGateAction, Option<usize>) {
     let mut best_sim = 0.0_f64;
     let mut best_idx = None;
 
@@ -1074,9 +1135,15 @@ fn rebuild_daily_with_updated_entry(
 ) -> anyhow::Result<()> {
     let mut content = String::new();
     for (idx, (body, meta)) in entries.iter().enumerate() {
-        let meta_to_use = if idx == update_idx { updated_meta } else { meta };
+        let meta_to_use = if idx == update_idx {
+            updated_meta
+        } else {
+            meta
+        };
         let created_at = meta_to_use.created_at.clone().unwrap_or_else(|| {
-            chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S+08:00").to_string()
+            chrono::Utc::now()
+                .format("%Y-%m-%dT%H:%M:%S+08:00")
+                .to_string()
         });
         let fm = generate_yaml_front_matter(meta_to_use, &created_at);
         content.push_str(&fm);
@@ -1100,7 +1167,9 @@ pub(crate) fn rebuild_daily_with_edited_entry(
     for (idx, (body, meta)) in entries.iter().enumerate() {
         let meta_to_use = if idx == edit_idx { updated_meta } else { meta };
         let created_at = meta_to_use.created_at.clone().unwrap_or_else(|| {
-            chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S+08:00").to_string()
+            chrono::Utc::now()
+                .format("%Y-%m-%dT%H:%M:%S+08:00")
+                .to_string()
         });
         let body_to_use = if idx == edit_idx {
             new_content.unwrap_or(body)
@@ -1136,8 +1205,11 @@ fn write_topic_memory_blocking(
         .open(&file_path)?;
 
     for fact in facts {
-        writeln!(file, "- [{}] {} (confidence: {}, from: {})",
-            fact.fact_type, fact.content, fact.confidence, fact.source_date)?;
+        writeln!(
+            file,
+            "- [{}] {} (confidence: {}, from: {})",
+            fact.fact_type, fact.content, fact.confidence, fact.source_date
+        )?;
     }
     Ok(())
 }
@@ -1163,7 +1235,8 @@ pub fn write_daily_memory(
     // D5: Extract facts and write to topic memory
     let facts = extract_facts(content, date);
     if !facts.is_empty() {
-        let mut topics: std::collections::HashMap<String, Vec<Fact>> = std::collections::HashMap::new();
+        let mut topics: std::collections::HashMap<String, Vec<Fact>> =
+            std::collections::HashMap::new();
         for fact in facts {
             let topic = match fact.category.as_str() {
                 "decision" => "decisions",
@@ -1187,7 +1260,9 @@ pub fn write_daily_memory(
             .with_context(|| format!("Failed to create memory dir: {}", memory_dir.display()))?;
     }
     let file_path = memory_dir.join(format!("{}.md", date));
-    let created_at = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S+08:00").to_string();
+    let created_at = chrono::Utc::now()
+        .format("%Y-%m-%dT%H:%M:%S+08:00")
+        .to_string();
 
     // D4 Write Gate: check similarity against existing entries
     if file_path.exists() {
@@ -1221,9 +1296,6 @@ pub fn write_daily_memory(
     Ok(())
 }
 
-
-
-
 // ── D10: Similar Memory Clustering ─────────────────────────────────────────
 
 /// Cluster similar entries across recent daily memory files.
@@ -1237,7 +1309,7 @@ pub fn find_similar_clusters(
     lookback_days: usize,
     threshold: f64,
 ) -> Vec<Vec<(String, String)>> {
-    use chrono::{Local, Duration};
+    use chrono::{Duration, Local};
 
     let memory_dir = workspace_root.join(MEMORY_DIR);
     if !memory_dir.is_dir() {
@@ -1254,13 +1326,19 @@ pub fn find_similar_clusters(
         if !file_path.is_file() {
             continue;
         }
-        let Ok(text) = std::fs::read_to_string(&file_path) else { continue };
+        let Ok(text) = std::fs::read_to_string(&file_path) else {
+            continue;
+        };
         let rel = format!("memory/{}.md", &date);
 
         // Split by YAML front matter delimiters.
-        let parts: Vec<&str> = text.split("
+        let parts: Vec<&str> = text
+            .split(
+                "
 ---
-").collect();
+",
+            )
+            .collect();
         for chunk in parts {
             let trimmed = chunk.trim();
             if trimmed.len() < 20 {
@@ -1312,7 +1390,7 @@ pub fn search_semantic_facts(
     query: &str,
     max_results: usize,
 ) -> Vec<(String, String, String, f64, Option<String>)> {
-    use rusqlite::{params, Connection, OpenFlags};
+    use rusqlite::{Connection, OpenFlags, params};
     let db_path = workspace_root.join("memory/semantic.db");
     if !db_path.exists() {
         return Vec::new();
@@ -1423,9 +1501,16 @@ mod tests {
         )
         .expect("write dream audit");
 
-        let hits = search_markdown_memory(&workspace, "skill sandbox host paths", Some(5), None, None, None)
-            .await
-            .expect("memory search");
+        let hits = search_markdown_memory(
+            &workspace,
+            "skill sandbox host paths",
+            Some(5),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("memory search");
         assert!(!hits.is_empty());
         assert!(hits.iter().any(|hit| hit.path == "memory/2026-03-06.md"));
         assert!(
@@ -1434,10 +1519,16 @@ mod tests {
                 .any(|hit| hit.path == "memory/dreams/2026-03-06.md")
         );
 
-        let topic_hits =
-            search_markdown_memory(&workspace, "concise progress updates", Some(5), None, None, None)
-                .await
-                .expect("topic memory search");
+        let topic_hits = search_markdown_memory(
+            &workspace,
+            "concise progress updates",
+            Some(5),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("topic memory search");
         assert!(
             topic_hits
                 .iter()

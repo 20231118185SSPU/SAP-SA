@@ -9,7 +9,7 @@
 //! Full-text search via FTS5 for BM25-ranked retrieval.
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Mutex;
@@ -776,7 +776,9 @@ mod tests {
         let mut entry = sample_entry("rust programming");
         entry.content = "learning Rust for systems programming".into();
         store.insert_memory(&entry).unwrap();
-        store.insert_memory(&sample_entry("cooking recipe")).unwrap();
+        store
+            .insert_memory(&sample_entry("cooking recipe"))
+            .unwrap();
 
         let results = store.search_memories("rust", None, 10).unwrap();
         assert_eq!(results.len(), 1);
@@ -833,8 +835,12 @@ mod tests {
     #[test]
     fn pin_unpin_list() {
         let store = test_store();
-        store.pin("task", "Current Task", "build the feature", None).unwrap();
-        store.pin("identity", "User Identity", "senior dev", None).unwrap();
+        store
+            .pin("task", "Current Task", "build the feature", None)
+            .unwrap();
+        store
+            .pin("identity", "User Identity", "senior dev", None)
+            .unwrap();
 
         let pins = store.list_pins().unwrap();
         assert_eq!(pins.len(), 2);

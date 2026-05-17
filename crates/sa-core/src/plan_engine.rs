@@ -204,7 +204,10 @@ pub async fn execute_plan_step(
     let req = ChatCompletionsRequest {
         model: llm_config.model.clone(),
         messages: vec![
-            ChatMessage::text("system", "You are a plan execution assistant. Execute the given step and output only the result."),
+            ChatMessage::text(
+                "system",
+                "You are a plan execution assistant. Execute the given step and output only the result.",
+            ),
             ChatMessage::text("user", &prompt),
         ],
         max_tokens: Some(4096),
@@ -252,7 +255,7 @@ pub async fn load_plan(workspace_root: &PathBuf, plan_id: &Uuid) -> Result<Plan,
 
 // ── Workflow Generation via LLM ─────────────────────────────────────────
 
-use crate::workflow::{WorkflowDef, WorkflowNodeDef, NodeType};
+use crate::workflow::{NodeType, WorkflowDef, WorkflowNodeDef};
 
 /// Generate a workflow DAG from a user request using LLM.
 ///
@@ -390,7 +393,10 @@ fn parse_workflow_def(content: &str) -> Result<WorkflowDef, anyhow::Error> {
             // If the LLM generated a bash node with a command, convert it to a prompt.
             let prompt = if let Some(cmd) = n.command {
                 if n.prompt.is_none() {
-                    Some(format!("Execute the following task and report the result: {}", cmd))
+                    Some(format!(
+                        "Execute the following task and report the result: {}",
+                        cmd
+                    ))
                 } else {
                     n.prompt
                 }
@@ -421,7 +427,9 @@ fn parse_workflow_def(content: &str) -> Result<WorkflowDef, anyhow::Error> {
 
     Ok(WorkflowDef {
         name: raw.name,
-        description: raw.description.unwrap_or_else(|| "LLM-generated workflow".to_string()),
+        description: raw
+            .description
+            .unwrap_or_else(|| "LLM-generated workflow".to_string()),
         nodes,
         default_model: None,
     })

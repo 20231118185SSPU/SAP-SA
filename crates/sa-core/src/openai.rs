@@ -13,10 +13,10 @@ use anyhow::Context as _;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
-use ts_rs::TS;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use tokio_stream::StreamExt;
+use ts_rs::TS;
 use uuid::Uuid;
 
 /// Wire protocol used for one OpenAI-compatible endpoint.
@@ -244,7 +244,12 @@ impl OpenAiClient {
     }
 
     /// Resolve the model name based on category and routing table.
-    pub fn resolve_model(&self, category: Option<&str>, routing: Option<&HashMap<String, String>>, default_model: &str) -> String {
+    pub fn resolve_model(
+        &self,
+        category: Option<&str>,
+        routing: Option<&HashMap<String, String>>,
+        default_model: &str,
+    ) -> String {
         if let Some(cat) = category {
             if let Some(routing_table) = routing {
                 if let Some(model) = routing_table.get(cat) {
@@ -1591,7 +1596,10 @@ impl AnthropicMessage {
     fn user_text(text: String) -> Self {
         Self {
             role: "user".to_string(),
-            content: vec![AnthropicContentOut::Text { text, cache_control: None }],
+            content: vec![AnthropicContentOut::Text {
+                text,
+                cache_control: None,
+            }],
         }
     }
 }
@@ -1607,7 +1615,9 @@ struct CacheControl {
 impl CacheControl {
     /// Create an ephemeral cache control directive.
     fn ephemeral() -> Self {
-        Self { type_: "ephemeral".to_string() }
+        Self {
+            type_: "ephemeral".to_string(),
+        }
     }
 }
 
@@ -1788,7 +1798,15 @@ fn inject_anthropic_cache_breakpoints(messages: &mut [AnthropicMessage]) {
     // Mark the last user message's content blocks (skip if already marked above).
     if let Some(last_user_msg) = messages.iter_mut().rev().find(|m| {
         m.role == "user"
-            && !m.content.iter().any(|c| matches!(c, AnthropicContentOut::ToolResult { cache_control: Some(_), .. }))
+            && !m.content.iter().any(|c| {
+                matches!(
+                    c,
+                    AnthropicContentOut::ToolResult {
+                        cache_control: Some(_),
+                        ..
+                    }
+                )
+            })
     }) {
         if let Some(last_block) = last_user_msg.content.last_mut() {
             match last_block {
@@ -1833,7 +1851,10 @@ fn build_anthropic_user_message(message: &ChatMessage) -> Option<AnthropicMessag
                     }
                     ContentPart::Image { image_url } => {
                         if let Some(source) = parse_data_url_to_anthropic_source(&image_url.url) {
-                            blocks.push(AnthropicContentOut::Image { source, cache_control: None });
+                            blocks.push(AnthropicContentOut::Image {
+                                source,
+                                cache_control: None,
+                            });
                             has_content = true;
                         }
                     }
@@ -1883,7 +1904,10 @@ fn build_anthropic_assistant_message(message: &ChatMessage) -> Option<AnthropicM
     let mut content = Vec::<AnthropicContentOut>::new();
 
     if let Some(text) = message.text_content() {
-        content.push(AnthropicContentOut::Text { text, cache_control: None });
+        content.push(AnthropicContentOut::Text {
+            text,
+            cache_control: None,
+        });
     }
 
     if let Some(tool_calls) = message.tool_calls.as_ref() {
@@ -2075,9 +2099,7 @@ impl ResponsesRequest {
                                     .iter()
                                     .map(|part| match part {
                                         ContentPart::Text { text } => {
-                                            ResponsesContentItem::InputText {
-                                                text: text.clone(),
-                                            }
+                                            ResponsesContentItem::InputText { text: text.clone() }
                                         }
                                         ContentPart::Image { image_url } => {
                                             ResponsesContentItem::InputImage {
@@ -2947,10 +2969,7 @@ fn build_assistant_responses_items(message: &ChatMessage) -> Vec<ResponsesInputI
     let mut items = Vec::<ResponsesInputItem>::new();
 
     if let Some(text) = message.text_content() {
-        items.push(ResponsesInputItem::message_output_text(
-            "assistant",
-            text,
-        ));
+        items.push(ResponsesInputItem::message_output_text("assistant", text));
     }
 
     if let Some(tool_calls) = message.tool_calls.as_ref() {
@@ -3065,11 +3084,11 @@ mod tests {
     use super::{
         AnthropicMessagesRequest, AuthStyle, ChatCompletionsRequest, ChatCompletionsResponse,
         ChatCompletionsStreamAccumulator, ChatCompletionsStreamChunk, ChatMessage, ChatUsage,
-        InputTokenDetails, OutputTokenDetails, ResponsesFunctionCallOutputContentItem,
-        ResponsesInputItem, ResponsesReasoningContentItem, ResponsesReasoningSummaryItem,
-        ResponsesRequest, ResponsesStreamAccumulator, ToolCall, ToolDefinition, ToolFunctionCall,
-        ToolFunctionDefinition, WireApi, build_auth_headers, normalize_anthropic_messages_response,
-        normalize_responses_response, process_sse_line,
+        InputTokenDetails, MessageContent, OutputTokenDetails,
+        ResponsesFunctionCallOutputContentItem, ResponsesInputItem, ResponsesReasoningContentItem,
+        ResponsesReasoningSummaryItem, ResponsesRequest, ResponsesStreamAccumulator, ToolCall,
+        ToolDefinition, ToolFunctionCall, ToolFunctionDefinition, WireApi, build_auth_headers,
+        normalize_anthropic_messages_response, normalize_responses_response, process_sse_line,
     };
 
     #[test]
@@ -3272,7 +3291,10 @@ mod tests {
         let response = acc.synthetic_response();
         let normalized = normalize_responses_response(response);
         let choice = normalized.first_choice().expect("choice should exist");
-        assert_eq!(choice.message.text_content().as_deref(), Some("hello world"));
+        assert_eq!(
+            choice.message.text_content().as_deref(),
+            Some("hello world")
+        );
     }
 
     #[test]
@@ -3312,6 +3334,8 @@ mod tests {
             }]),
             tool_choice: Some(serde_json::json!("auto")),
             stream: Some(true),
+            temperature: None,
+            top_p: None,
         };
 
         let wire = AnthropicMessagesRequest::from_chat_request(&req);
@@ -3431,6 +3455,8 @@ mod tests {
             tools: None,
             tool_choice: None,
             stream: Some(false),
+            temperature: None,
+            top_p: None,
         };
 
         let value = serde_json::to_value(req).expect("serialize request");
@@ -3447,6 +3473,8 @@ mod tests {
             tools: None,
             tool_choice: None,
             stream: Some(false),
+            temperature: None,
+            top_p: None,
         };
 
         let value = serde_json::to_value(req).expect("serialize request");
@@ -3512,6 +3540,8 @@ mod tests {
             }]),
             tool_choice: Some(serde_json::json!("auto")),
             stream: Some(false),
+            temperature: None,
+            top_p: None,
         };
 
         let wire = ResponsesRequest::from_chat_request(&req);
@@ -3658,7 +3688,10 @@ mod tests {
         let choice = normalized
             .first_choice()
             .expect("normalized choice should exist");
-        assert_eq!(choice.message.text_content().as_deref(), Some("第一行\n第二行"));
+        assert_eq!(
+            choice.message.text_content().as_deref(),
+            Some("第一行\n第二行")
+        );
     }
 
     #[test]

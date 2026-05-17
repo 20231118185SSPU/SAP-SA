@@ -1,4 +1,4 @@
-﻿//! PII (Personally Identifiable Information) detection and sanitization.
+//! PII (Personally Identifiable Information) detection and sanitization.
 //!
 //! This module provides regex-based and heuristic detection of sensitive data
 //! (Chinese ID card numbers, phone numbers, emails, bank card numbers) and
@@ -72,32 +72,26 @@ impl Default for SanitizePolicy {
 ///
 /// Note: Rust regex does not support lookaround. We match broad patterns
 /// and use `is_word_boundary()` to filter false positives at post-match time.
-static RE_IDCARD: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\d{17}[\dXx]").expect("valid ID card regex")
-});
+static RE_IDCARD: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\d{17}[\dXx]").expect("valid ID card regex"));
 
-static RE_PHONE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"1[3-9]\d{9}").expect("valid phone regex")
-});
+static RE_PHONE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"1[3-9]\d{9}").expect("valid phone regex"));
 
 static RE_EMAIL: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
-        .expect("valid email regex")
+    Regex::new(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}").expect("valid email regex")
 });
 
-static RE_BANKCARD: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\d{16,19}").expect("valid bank card regex")
-});
+static RE_BANKCARD: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\d{16,19}").expect("valid bank card regex"));
 
 /// Check that `start..end` is not embedded inside a longer ASCII word/number.
 fn is_isolated(text: &str, start: usize, end: usize) -> bool {
     let before = text[..start].chars().last();
     let after = text[end..].chars().next();
-    let not_word = |c: Option<char>| {
-        match c {
-            None => true,
-            Some(ch) => !ch.is_ascii_alphanumeric() && ch != '_',
-        }
+    let not_word = |c: Option<char>| match c {
+        None => true,
+        Some(ch) => !ch.is_ascii_alphanumeric() && ch != '_',
     };
     not_word(before) && not_word(after)
 }
@@ -127,18 +121,21 @@ fn validate_idcard(s: &str) -> bool {
 
 /// Validate bank card number via Luhn algorithm.
 fn validate_luhn(s: &str) -> bool {
-    let digits: Vec<u32> = s
-        .chars()
-        .rev()
-        .filter_map(|c| c.to_digit(10))
-        .collect();
+    let digits: Vec<u32> = s.chars().rev().filter_map(|c| c.to_digit(10)).collect();
     if digits.len() < 13 || digits.len() > 19 {
         return false;
     }
     let sum: u32 = digits
         .iter()
         .enumerate()
-        .map(|(i, &d)| if i % 2 == 1 { let d2 = d * 2; if d2 > 9 { d2 - 9 } else { d2 } } else { d })
+        .map(|(i, &d)| {
+            if i % 2 == 1 {
+                let d2 = d * 2;
+                if d2 > 9 { d2 - 9 } else { d2 }
+            } else {
+                d
+            }
+        })
         .sum();
     sum % 10 == 0
 }
@@ -166,7 +163,10 @@ pub fn detect_pii(text: &str) -> PiiDetectionResult {
         if !is_isolated(text, cap.start(), cap.end()) {
             continue;
         }
-        if detections.iter().any(|d| cap.start() < d.end && cap.end() > d.start) {
+        if detections
+            .iter()
+            .any(|d| cap.start() < d.end && cap.end() > d.start)
+        {
             continue;
         }
         let confidence = if validate_idcard(matched) { 0.99 } else { 0.6 };
@@ -186,7 +186,10 @@ pub fn detect_pii(text: &str) -> PiiDetectionResult {
         if !is_isolated(text, cap.start(), cap.end()) {
             continue;
         }
-        if detections.iter().any(|d| cap.start() < d.end && cap.end() > d.start) {
+        if detections
+            .iter()
+            .any(|d| cap.start() < d.end && cap.end() > d.start)
+        {
             continue;
         }
         detections.push(PiiSpan {
@@ -204,7 +207,10 @@ pub fn detect_pii(text: &str) -> PiiDetectionResult {
         if !is_isolated(text, cap.start(), cap.end()) {
             continue;
         }
-        if detections.iter().any(|d| cap.start() < d.end && cap.end() > d.start) {
+        if detections
+            .iter()
+            .any(|d| cap.start() < d.end && cap.end() > d.start)
+        {
             continue;
         }
         if validate_luhn(matched) {
@@ -291,7 +297,12 @@ mod tests {
         let text = "联系我：13812345678";
         let result = detect_pii(text);
         assert!(result.has_pii);
-        assert!(result.detections.iter().any(|d| d.pii_type == PiiType::PhoneNumber));
+        assert!(
+            result
+                .detections
+                .iter()
+                .any(|d| d.pii_type == PiiType::PhoneNumber)
+        );
     }
 
     #[test]
@@ -299,7 +310,12 @@ mod tests {
         let text = "邮箱 user@example.com 欢迎联系";
         let result = detect_pii(text);
         assert!(result.has_pii);
-        assert!(result.detections.iter().any(|d| d.pii_type == PiiType::Email));
+        assert!(
+            result
+                .detections
+                .iter()
+                .any(|d| d.pii_type == PiiType::Email)
+        );
     }
 
     #[test]
@@ -362,7 +378,12 @@ mod tests {
         let text = "user1234@example.com";
         let result = detect_pii(text);
         // Should detect as email, not as bank card
-        assert!(result.detections.iter().any(|d| d.pii_type == PiiType::Email));
+        assert!(
+            result
+                .detections
+                .iter()
+                .any(|d| d.pii_type == PiiType::Email)
+        );
     }
 
     #[test]

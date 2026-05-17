@@ -70,7 +70,9 @@ pub async fn multi_backend_search(
         let backend = match build_backend(backend_name, config, &client) {
             Some(b) => b,
             None => {
-                errors.push(format!("{backend_name}: skipped (missing config/credentials)"));
+                errors.push(format!(
+                    "{backend_name}: skipped (missing config/credentials)"
+                ));
                 continue;
             }
         };
@@ -95,7 +97,11 @@ pub async fn multi_backend_search(
                 errors.push(format!("{}: {e}", backend.name()));
             }
             Err(_) => {
-                errors.push(format!("{}: timeout ({}s)", backend.name(), config.timeout_secs));
+                errors.push(format!(
+                    "{}: timeout ({}s)",
+                    backend.name(),
+                    config.timeout_secs
+                ));
             }
         }
     }
@@ -285,11 +291,8 @@ impl SearchBackend for SogouBackend {
         max_results: usize,
         cancel: &CancelToken,
     ) -> anyhow::Result<Vec<SearchResult>> {
-        let url = reqwest::Url::parse_with_params(
-            "https://www.sogou.com/web",
-            &[("query", query)],
-        )
-        .context("Failed to build Sogou URL")?;
+        let url = reqwest::Url::parse_with_params("https://www.sogou.com/web", &[("query", query)])
+            .context("Failed to build Sogou URL")?;
 
         if cancel.is_cancelled() {
             bail!("Search cancelled");
@@ -417,8 +420,7 @@ fn extract_sogou_title_link(fragment: &str) -> (String, String) {
         .unwrap_or(h3_content.len());
 
     let title = strip_html_tags(&h3_content[a_tag_end..a_close]);
-    let href = extract_href_from_tag(&h3_content[a_start..a_tag_end])
-        .unwrap_or_default();
+    let href = extract_href_from_tag(&h3_content[a_start..a_tag_end]).unwrap_or_default();
 
     (title, href)
 }
@@ -648,11 +650,7 @@ impl SearchBackend for SearXngBackend {
     ) -> anyhow::Result<Vec<SearchResult>> {
         let url = reqwest::Url::parse_with_params(
             &format!("{}/search", self.base_url),
-            &[
-                ("q", query),
-                ("format", "json"),
-                ("pageno", "1"),
-            ],
+            &[("q", query), ("format", "json"), ("pageno", "1")],
         )
         .context("Failed to build SearXNG URL")?;
 
@@ -748,7 +746,10 @@ impl SearchBackend for SemanticScholarBackend {
                     .to_string();
                 let abstract_text = paper["abstract"].as_str().unwrap_or("");
                 let venue = paper["venue"].as_str().unwrap_or("");
-                let year = paper["year"].as_u64().map(|y| y.to_string()).unwrap_or_default();
+                let year = paper["year"]
+                    .as_u64()
+                    .map(|y| y.to_string())
+                    .unwrap_or_default();
                 let authors: Vec<String> = paper["authors"]
                     .as_array()
                     .map(|arr| {
@@ -798,11 +799,7 @@ impl SearchBackend for SemanticScholarBackend {
 ///
 /// For top-level arrays (like SerpApi's `organic_results` or SearXNG's
 /// `results`), pass `section = ""`.
-fn extract_api_results(
-    body: &serde_json::Value,
-    section: &str,
-    key: &str,
-) -> Vec<SearchResult> {
+fn extract_api_results(body: &serde_json::Value, section: &str, key: &str) -> Vec<SearchResult> {
     let array = if section.is_empty() {
         body.get(key).and_then(|v| v.as_array())
     } else {

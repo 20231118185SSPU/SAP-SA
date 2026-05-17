@@ -172,10 +172,11 @@ pub fn verify_client_hello(
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("Missing authentication token"))?;
 
-        let mut mac =
-            HmacSha256::new_from_slice(auth_key.as_bytes()).map_err(|_| anyhow::anyhow!("Invalid auth key"))?;
+        let mut mac = HmacSha256::new_from_slice(auth_key.as_bytes())
+            .map_err(|_| anyhow::anyhow!("Invalid auth key"))?;
         mac.update(hello.client_nonce.as_bytes());
-        let token_bytes = hex::decode(token).map_err(|_| anyhow::anyhow!("Invalid token format"))?;
+        let token_bytes =
+            hex::decode(token).map_err(|_| anyhow::anyhow!("Invalid token format"))?;
         mac.verify_slice(&token_bytes)
             .map_err(|_| anyhow::anyhow!("Invalid authentication token"))?;
     }

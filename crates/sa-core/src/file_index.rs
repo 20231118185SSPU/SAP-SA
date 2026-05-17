@@ -40,10 +40,9 @@ const SKIP_DIRS: &[&str] = &[
 
 /// File extensions to skip during indexing (binary / generated).
 const SKIP_EXTENSIONS: &[&str] = &[
-    "exe", "dll", "so", "dylib", "o", "a", "lib", "pdb", "wasm",
-    "png", "jpg", "jpeg", "gif", "webp", "bmp", "ico", "svg",
-    "zip", "tar", "gz", "bz2", "xz", "7z", "rar",
-    "mp3", "mp4", "avi", "mkv", "mov", "wav", "flac",
+    "exe", "dll", "so", "dylib", "o", "a", "lib", "pdb", "wasm", "png", "jpg", "jpeg", "gif",
+    "webp", "bmp", "ico", "svg", "zip", "tar", "gz", "bz2", "xz", "7z", "rar", "mp3", "mp4", "avi",
+    "mkv", "mov", "wav", "flac",
     "pdf", // PDFs are handled via MCP OCR, skip raw content indexing
     "pyc",
 ];
@@ -143,8 +142,7 @@ impl FileIndex {
         if let Some(parent) = index_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let data = serde_json::to_string_pretty(self)
-            .context("Failed to serialize file index")?;
+        let data = serde_json::to_string_pretty(self).context("Failed to serialize file index")?;
         std::fs::write(index_path, data)?;
         Ok(())
     }
@@ -352,7 +350,15 @@ fn walk_dir_index(
             if SKIP_DIRS.contains(&file_name_str.as_ref()) {
                 continue;
             }
-            walk_dir_index(base, &path, depth + 1, index, new_count, updated_count, skipped_count)?;
+            walk_dir_index(
+                base,
+                &path,
+                depth + 1,
+                index,
+                new_count,
+                updated_count,
+                skipped_count,
+            )?;
             continue;
         }
 
@@ -437,12 +443,55 @@ fn walk_dir_index(
 /// Classify a file and extract a text preview.
 fn classify_and_preview(path: &Path, ext: &str) -> (String, Option<String>) {
     let text_extensions = [
-        "txt", "md", "rst", "log",
-        "rs", "py", "js", "ts", "jsx", "tsx", "go", "java", "c", "cpp", "h", "hpp",
-        "css", "scss", "less", "html", "htm", "xml", "yaml", "yml", "toml", "json", "jsonl",
-        "csv", "tsv", "sql", "sh", "bash", "zsh", "fish", "ps1", "bat", "cmd",
-        "makefile", "dockerfile", "gitignore", "env",
-        "rb", "php", "swift", "kt", "scala", "lua", "vim", "el",
+        "txt",
+        "md",
+        "rst",
+        "log",
+        "rs",
+        "py",
+        "js",
+        "ts",
+        "jsx",
+        "tsx",
+        "go",
+        "java",
+        "c",
+        "cpp",
+        "h",
+        "hpp",
+        "css",
+        "scss",
+        "less",
+        "html",
+        "htm",
+        "xml",
+        "yaml",
+        "yml",
+        "toml",
+        "json",
+        "jsonl",
+        "csv",
+        "tsv",
+        "sql",
+        "sh",
+        "bash",
+        "zsh",
+        "fish",
+        "ps1",
+        "bat",
+        "cmd",
+        "makefile",
+        "dockerfile",
+        "gitignore",
+        "env",
+        "rb",
+        "php",
+        "swift",
+        "kt",
+        "scala",
+        "lua",
+        "vim",
+        "el",
     ];
 
     if text_extensions.contains(&ext)
@@ -452,14 +501,14 @@ fn classify_and_preview(path: &Path, ext: &str) -> (String, Option<String>) {
             name == "makefile" || name == "dockerfile" || name == "license" || name == "readme"
         })
     {
-            let preview = std::fs::read_to_string(path).ok().map(|content| {
-                let chars: Vec<char> = content.chars().take(PREVIEW_CHARS).collect();
-                let mut result: String = chars.into_iter().collect();
-                if content.chars().count() > PREVIEW_CHARS {
-                    result.push_str("...");
-                }
-                result
-            });
+        let preview = std::fs::read_to_string(path).ok().map(|content| {
+            let chars: Vec<char> = content.chars().take(PREVIEW_CHARS).collect();
+            let mut result: String = chars.into_iter().collect();
+            if content.chars().count() > PREVIEW_CHARS {
+                result.push_str("...");
+            }
+            result
+        });
         ("text".to_string(), preview)
     } else {
         ("binary".to_string(), None)

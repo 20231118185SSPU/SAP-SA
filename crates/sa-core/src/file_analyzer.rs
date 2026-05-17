@@ -112,7 +112,9 @@ fn detect_mime_type(path: &Path) -> &'static str {
         Some("epub") => "application/epub+zip",
         Some("pptx") => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
         Some("docx") => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        Some("xlsx") | Some("xls") => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        Some("xlsx") | Some("xls") => {
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        }
         _ => "application/octet-stream",
     }
 }
@@ -152,8 +154,7 @@ pub async fn execute_analyze_file(
         preview_lines: Option<usize>,
     }
 
-    let args: Args =
-        serde_json::from_value(args).context("Invalid arguments for AnalyzeFile")?;
+    let args: Args = serde_json::from_value(args).context("Invalid arguments for AnalyzeFile")?;
     validate_tool_path_input(&args.path, PathOperation::Read)?;
     let path = path_resolver.resolve_under_workspace(&args.path)?;
     validate_resolved_tool_path(workspace_root, &path, PathOperation::Read)?;
@@ -179,10 +180,7 @@ pub async fn execute_analyze_file(
     let file_type = classify_file_type(&path);
     let mime_type = detect_mime_type(&path).to_string();
     let abs_path = path.display().to_string();
-    let preview_n = args
-        .preview_lines
-        .unwrap_or(PREVIEW_LINES)
-        .min(100);
+    let preview_n = args.preview_lines.unwrap_or(PREVIEW_LINES).min(100);
 
     let mut analysis = FileAnalysis {
         path: abs_path.clone(),
@@ -210,7 +208,12 @@ pub async fn execute_analyze_file(
             analysis.line_count = Some(lines.len() as u64);
 
             if preview_n > 0 {
-                let preview_lines: String = lines.iter().take(preview_n).cloned().collect::<Vec<_>>().join("\n");
+                let preview_lines: String = lines
+                    .iter()
+                    .take(preview_n)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("\n");
                 analysis.preview = Some(preview_lines);
             }
         }
@@ -229,9 +232,8 @@ pub async fn execute_analyze_file(
                 }
             }
             if analysis.ocr_text.is_none() {
-                analysis.ocr_text = Some(
-                    "[PDF content unavailable — no MCP OCR server configured]".to_string(),
-                );
+                analysis.ocr_text =
+                    Some("[PDF content unavailable — no MCP OCR server configured]".to_string());
             }
         }
         "image" => {
@@ -250,8 +252,7 @@ pub async fn execute_analyze_file(
         }
     }
 
-    Ok(serde_json::to_string_pretty(&analysis)
-        .context("Failed to serialize FileAnalysis")?)
+    Ok(serde_json::to_string_pretty(&analysis).context("Failed to serialize FileAnalysis")?)
 }
 
 /// Detect text encoding from raw bytes (BOM + heuristic) and decode.
@@ -263,17 +264,13 @@ fn detect_encoding_and_decode(raw_bytes: &[u8]) -> (String, String) {
     }
     // Check for UTF-16 LE BOM.
     if raw_bytes.len() >= 2 && raw_bytes[0] == 0xFF && raw_bytes[1] == 0xFE {
-        if let Ok(s) =
-            String::from_utf16(&u16_le_from_bytes(&raw_bytes[2..]))
-        {
+        if let Ok(s) = String::from_utf16(&u16_le_from_bytes(&raw_bytes[2..])) {
             return ("utf-16-le".to_string(), s);
         }
     }
     // Check for UTF-16 BE BOM.
     if raw_bytes.len() >= 2 && raw_bytes[0] == 0xFE && raw_bytes[1] == 0xFF {
-        if let Ok(s) =
-            String::from_utf16(&u16_be_from_bytes(&raw_bytes[2..]))
-        {
+        if let Ok(s) = String::from_utf16(&u16_be_from_bytes(&raw_bytes[2..])) {
             return ("utf-16-be".to_string(), s);
         }
     }
@@ -283,8 +280,7 @@ fn detect_encoding_and_decode(raw_bytes: &[u8]) -> (String, String) {
         return ("utf-8".to_string(), content);
     }
     // Try GBK for Chinese content.
-    let encoding = encoding_rs::Encoding::for_label(b"gbk")
-        .unwrap_or(encoding_rs::UTF_8);
+    let encoding = encoding_rs::Encoding::for_label(b"gbk").unwrap_or(encoding_rs::UTF_8);
     let (cow, _used, had_errors) = encoding.decode(raw_bytes);
     let label = if had_errors { "gbk (lossy)" } else { "gbk" };
     (label.to_string(), cow.into_owned())

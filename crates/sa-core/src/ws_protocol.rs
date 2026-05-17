@@ -14,9 +14,9 @@ use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 use uuid::Uuid;
 
-use crate::openai::{AuthStyle, WireApi};use crate::workflow::{WorkflowNodeDef, NodeStatus};
+use crate::openai::{AuthStyle, WireApi};
+use crate::workflow::{NodeStatus, WorkflowNodeDef};
 use std::collections::HashMap;
-
 
 /// Client -> server messages.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -94,7 +94,6 @@ pub enum ClientMessage {
         config: toml::Value,
     },
 
-
     /// Request the content of a skill's documentation file (SKILL.md).
     #[serde(rename = "get_skill_doc")]
     GetSkillDoc {
@@ -102,9 +101,7 @@ pub enum ClientMessage {
         name: String,
     },
 
-
     // ── Memory panel messages ────────────────────────────────────────
-
     /// Query semantic memory facts with optional search and pagination.
     #[serde(rename = "get_memory_facts")]
     GetMemoryFacts {
@@ -136,9 +133,7 @@ pub enum ClientMessage {
 
     /// Prune facts below a confidence threshold.
     #[serde(rename = "prune_memory_facts")]
-    PruneMemoryFacts {
-        min_confidence: f64,
-    },
+    PruneMemoryFacts { min_confidence: f64 },
     /// Request the content of a memory report file (dream / post-task).
     #[serde(rename = "get_memory_report")]
     GetMemoryReport {
@@ -147,7 +142,6 @@ pub enum ClientMessage {
     },
 
     // ── Workflow + Plan + ChatMode messages ───────────────────────────
-
     /// Start a named workflow execution.
     #[serde(rename = "start_workflow")]
     StartWorkflow {
@@ -158,22 +152,15 @@ pub enum ClientMessage {
 
     /// Cancel a running workflow.
     #[serde(rename = "cancel_workflow")]
-    CancelWorkflow {
-        run_id: Uuid,
-    },
+    CancelWorkflow { run_id: Uuid },
 
     /// Switch the chat mode (plan / chat / workflow).
     #[serde(rename = "set_chat_mode")]
-    SetChatMode {
-        mode: ChatMode,
-    },
+    SetChatMode { mode: ChatMode },
 
     /// Approve, step-execute, or request modification of a plan.
     #[serde(rename = "approve_plan")]
-    ApprovePlan {
-        plan_id: Uuid,
-        action: PlanAction,
-    },
+    ApprovePlan { plan_id: Uuid, action: PlanAction },
 
     /// Respond to an approval request from a workflow node.
     #[serde(rename = "respond_approval")]
@@ -195,15 +182,11 @@ pub enum ClientMessage {
 
     /// Pause a running workflow.
     #[serde(rename = "pause_workflow")]
-    PauseWorkflow {
-        run_id: Uuid,
-    },
+    PauseWorkflow { run_id: Uuid },
 
     /// Resume a paused workflow.
     #[serde(rename = "resume_workflow")]
-    ResumeWorkflow {
-        run_id: Uuid,
-    },
+    ResumeWorkflow { run_id: Uuid },
 
     /// Request the list of all available skills with metadata.
     #[serde(rename = "get_skills_list")]
@@ -221,9 +204,12 @@ pub enum ClientMessage {
     GetSupportedModels,
 }
 
-
-fn default_memory_limit() -> usize { 50 }
-fn default_memory_hops() -> usize { 3 }
+fn default_memory_limit() -> usize {
+    50
+}
+fn default_memory_hops() -> usize {
+    3
+}
 
 /// Server -> client messages.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -324,7 +310,6 @@ pub enum ServerMessage {
         detail: Option<String>,
     },
 
-
     /// Skill documentation content response.
     #[serde(rename = "skill_doc")]
     SkillDoc {
@@ -336,9 +321,7 @@ pub enum ServerMessage {
         content: String,
     },
 
-
     // ── Memory panel responses ──────────────────────────────────────
-
     /// Semantic memory facts response.
     #[serde(rename = "memory_facts")]
     MemoryFacts {
@@ -435,7 +418,6 @@ pub enum ServerMessage {
     },
 
     // ── Workflow engine responses ────────────────────────────────────
-
     /// A workflow has started execution.
     #[serde(rename = "workflow_started")]
     WorkflowStarted {
@@ -456,10 +438,7 @@ pub enum ServerMessage {
 
     /// Workflow completed successfully.
     #[serde(rename = "workflow_completed")]
-    WorkflowCompleted {
-        run_id: Uuid,
-        summary: String,
-    },
+    WorkflowCompleted { run_id: Uuid, summary: String },
 
     /// Workflow failed.
     #[serde(rename = "workflow_failed")]
@@ -479,13 +458,9 @@ pub enum ServerMessage {
     },
 
     // ── Plan mode responses ──────────────────────────────────────────
-
     /// A plan has been created (Plan mode).
     #[serde(rename = "plan_created")]
-    PlanCreated {
-        plan_id: Uuid,
-        steps: Vec<PlanStep>,
-    },
+    PlanCreated { plan_id: Uuid, steps: Vec<PlanStep> },
 
     /// A plan step's status has changed.
     #[serde(rename = "plan_step_update")]
@@ -497,9 +472,7 @@ pub enum ServerMessage {
 
     /// Chat mode has changed.
     #[serde(rename = "chat_mode_changed")]
-    ChatModeChanged {
-        mode: ChatMode,
-    },
+    ChatModeChanged { mode: ChatMode },
 
     /// Skill activated by trigger word matching.
     #[serde(rename = "skill_activated")]
@@ -513,17 +486,11 @@ pub enum ServerMessage {
 
     /// Full list of available skills with metadata.
     #[serde(rename = "skills_list")]
-    SkillsList {
-        skills: Vec<SkillListItem>,
-    },
-
+    SkillsList { skills: Vec<SkillListItem> },
 
     /// Verification step passed.
     #[serde(rename = "verify_pass")]
-    VerifyPass {
-        step: u32,
-        message: String,
-    },
+    VerifyPass { step: u32, message: String },
 
     /// Verification step failed.
     #[serde(rename = "verify_fail")]
@@ -547,9 +514,7 @@ pub enum ServerMessage {
 
     /// List of supported models with pricing information.
     #[serde(rename = "supported_models")]
-    SupportedModels {
-        models: Vec<SupportedModelInfo>,
-    },
+    SupportedModels { models: Vec<SupportedModelInfo> },
 }
 
 /// Cache statistics for a specific model.
@@ -613,8 +578,6 @@ pub enum SkillSource {
     /// Exposed by an MCP server.
     Mcp,
 }
-
-
 
 /// Workflow node representation.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -1019,4 +982,3 @@ impl Default for PlanStepStatus {
         Self::Pending
     }
 }
-

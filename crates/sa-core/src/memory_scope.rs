@@ -120,10 +120,22 @@ mod tests {
 
     #[test]
     fn test_promotion_requires_confirmation() {
-        assert!(MemoryScope::requires_promotion(MemoryScope::Session, MemoryScope::User));
-        assert!(MemoryScope::requires_promotion(MemoryScope::User, MemoryScope::Shared));
-        assert!(!MemoryScope::requires_promotion(MemoryScope::User, MemoryScope::Session));
-        assert!(!MemoryScope::requires_promotion(MemoryScope::Shared, MemoryScope::User));
+        assert!(MemoryScope::requires_promotion(
+            MemoryScope::Session,
+            MemoryScope::User
+        ));
+        assert!(MemoryScope::requires_promotion(
+            MemoryScope::User,
+            MemoryScope::Shared
+        ));
+        assert!(!MemoryScope::requires_promotion(
+            MemoryScope::User,
+            MemoryScope::Session
+        ));
+        assert!(!MemoryScope::requires_promotion(
+            MemoryScope::Shared,
+            MemoryScope::User
+        ));
     }
 
     #[test]

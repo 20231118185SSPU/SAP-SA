@@ -15,18 +15,19 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use chrono::Utc;
-use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
-use tokio::time::{timeout, Duration};
+use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
+use tokio::time::{Duration, timeout};
 use uuid::Uuid;
 
-use crate::workflow::{
-    ContextMode, NodeRun, NodeStatus, NodeType, TriggerRule, WorkflowDef, WorkflowNodeDef,
-    WorkflowRun, WorkflowStatus, render_template, RetryPolicy,
-};
-use crate::openai::{ChatCompletionsRequest, ChatMessage, MessageContent, OpenAiClient, ToolCall, ToolDefinition};
-use crate::tools::{ToolExecutor, ToolSession, ToolRuntime, ToolExecutionResult};
 use crate::cancel::CancelToken;
-
+use crate::openai::{
+    ChatCompletionsRequest, ChatMessage, MessageContent, OpenAiClient, ToolCall, ToolDefinition,
+};
+use crate::tools::{ToolExecutionResult, ToolExecutor, ToolRuntime, ToolSession};
+use crate::workflow::{
+    ContextMode, NodeRun, NodeStatus, NodeType, RetryPolicy, TriggerRule, WorkflowDef,
+    WorkflowNodeDef, WorkflowRun, WorkflowStatus, render_template,
+};
 
 /// Callback channel for reporting workflow progress to the caller (e.g. WebSocket).
 pub type ProgressSender = mpsc::UnboundedSender<WorkflowEvent>;
@@ -35,10 +36,7 @@ pub type ProgressSender = mpsc::UnboundedSender<WorkflowEvent>;
 #[derive(Debug, Clone)]
 pub enum WorkflowEvent {
     /// Workflow has started.
-    Started {
-        run_id: Uuid,
-        workflow_name: String,
-    },
+    Started { run_id: Uuid, workflow_name: String },
     /// A node's status changed.
     NodeUpdate {
         run_id: Uuid,
@@ -53,10 +51,7 @@ pub enum WorkflowEvent {
         prompt: String,
     },
     /// Workflow completed successfully.
-    Completed {
-        run_id: Uuid,
-        summary: String,
-    },
+    Completed { run_id: Uuid, summary: String },
     /// Workflow failed.
     Failed {
         run_id: Uuid,
@@ -93,7 +88,6 @@ pub struct WorkflowLlmConfig {
     pub api_key: String,
     pub default_model: String,
 }
-
 
 /// Run a workflow definition to completion.
 ///
@@ -241,7 +235,14 @@ pub async fn run_workflow(
             let progress_tx_clone = progress_tx.clone();
             let tools = tool_resources.clone();
             join_set.spawn(execute_node(
-                node_def, ctx, ws_root, llm, default_model, run_id, progress_tx_clone, tools,
+                node_def,
+                ctx,
+                ws_root,
+                llm,
+                default_model,
+                run_id,
+                progress_tx_clone,
+                tools,
             ));
         }
 
@@ -312,7 +313,11 @@ pub async fn run_workflow(
             // Collect all node outputs into the summary.
             let outputs = ctx.outputs.read().await;
             let mut parts: Vec<String> = Vec::new();
-            parts.push(format!("✅ 工作流 '{}' 执行完成，共 {} 个节点。", result.workflow_name, result.nodes.len()));
+            parts.push(format!(
+                "✅ 工作流 '{}' 执行完成，共 {} 个节点。",
+                result.workflow_name,
+                result.nodes.len()
+            ));
             parts.push(String::new());
             for node in &result.nodes {
                 if let Some(ref out) = outputs.get(&node.node_id) {
@@ -323,16 +328,10 @@ pub async fn run_workflow(
             }
             let summary = parts.join("\n");
             drop(outputs);
-            let _ = progress_tx.send(WorkflowEvent::Completed {
-                run_id,
-                summary,
-            });
+            let _ = progress_tx.send(WorkflowEvent::Completed { run_id, summary });
         }
         WorkflowStatus::Failed => {
-            let failed_node = result
-                .nodes
-                .iter()
-                .find(|n| n.status == NodeStatus::Failed);
+            let failed_node = result.nodes.iter().find(|n| n.status == NodeStatus::Failed);
             let _ = progress_tx.send(WorkflowEvent::Failed {
                 run_id,
                 node_id: failed_node.map(|n| n.node_id.clone()),
@@ -422,24 +421,21 @@ fn check_trigger_rule(
         .collect();
 
     // All dependencies must be in a terminal state
-    let all_terminal = dep_statuses
-        .iter()
-        .all(|s| matches!(s, NodeStatus::Completed | NodeStatus::Failed | NodeStatus::Skipped));
+    let all_terminal = dep_statuses.iter().all(|s| {
+        matches!(
+            s,
+            NodeStatus::Completed | NodeStatus::Failed | NodeStatus::Skipped
+        )
+    });
 
     if !all_terminal {
         return false;
     }
 
     match def.trigger_rule {
-        TriggerRule::AllSuccess => {
-            dep_statuses.iter().all(|s| *s == NodeStatus::Completed)
-        }
-        TriggerRule::OneSuccess => {
-            dep_statuses.iter().any(|s| *s == NodeStatus::Completed)
-        }
-        TriggerRule::NoneFailed => {
-            dep_statuses.iter().all(|s| *s != NodeStatus::Failed)
-        }
+        TriggerRule::AllSuccess => dep_statuses.iter().all(|s| *s == NodeStatus::Completed),
+        TriggerRule::OneSuccess => dep_statuses.iter().any(|s| *s == NodeStatus::Completed),
+        TriggerRule::NoneFailed => dep_statuses.iter().all(|s| *s != NodeStatus::Failed),
     }
 }
 
@@ -493,7 +489,10 @@ fn evaluate_when(expr: &str, outputs: &HashMap<String, String>) -> bool {
     }
 
     // Check `contains` / `not contains`
-    if let Some(rest) = expr.strip_prefix("output(").and_then(|s| s.strip_suffix(')')) {
+    if let Some(rest) = expr
+        .strip_prefix("output(")
+        .and_then(|s| s.strip_suffix(')'))
+    {
         // Direct output existence check: `output(node_id)`.
         // Also handle `output(node_id) contains 'value'` etc.
         // But the simple `output(node_id)` case — just check non-empty.
@@ -547,31 +546,31 @@ fn split_top_level_binary<'a>(expr: &'a str, op: &str) -> Option<(&'a str, &'a s
     // Find the last occurrence of `op` at depth 0 (outside quotes).
     let mut in_quote = false;
     let mut quote_char = '\0';
-    let chars: Vec<char> = expr.chars().collect();
-    let op_chars: Vec<char> = op.chars().collect();
+    let chars: Vec<(usize, char)> = expr.char_indices().collect();
 
-    for i in (0..expr.len().saturating_sub(op.len() - 1)).rev() {
-        let c = chars[i];
+    for (char_index, (byte_index, c)) in chars.iter().enumerate().rev() {
         if in_quote {
-            if c == quote_char {
+            if *c == quote_char {
                 in_quote = false;
             }
             continue;
         }
-        if c == '\'' || c == '"' {
+        if *c == '\'' || *c == '"' {
             in_quote = true;
-            quote_char = c;
+            quote_char = *c;
             continue;
         }
-        // Check if the substring matches the op.
-        if i + op.len() <= chars.len() {
-            let slice: String = chars[i..i + op.len()].iter().collect();
-            if slice == op {
-                let left = expr[..i].trim();
-                let right = expr[i + op.len()..].trim();
-                if !left.is_empty() && !right.is_empty() {
-                    return Some((left, right));
-                }
+
+        let remaining_chars = chars.len().saturating_sub(char_index);
+        if remaining_chars < op.chars().count() {
+            continue;
+        }
+        let tail = &expr[*byte_index..];
+        if tail.starts_with(op) {
+            let left = expr[..*byte_index].trim();
+            let right = expr[*byte_index + op.len()..].trim();
+            if !left.is_empty() && !right.is_empty() {
+                return Some((left, right));
             }
         }
     }
@@ -609,7 +608,10 @@ fn resolve_expr_value(expr: &str, outputs: &HashMap<String, String>) -> String {
     }
 
     // output(node_id) reference
-    if let Some(id) = expr.strip_prefix("output(").and_then(|s| s.strip_suffix(')')) {
+    if let Some(id) = expr
+        .strip_prefix("output(")
+        .and_then(|s| s.strip_suffix(')'))
+    {
         return outputs.get(id).cloned().unwrap_or_default();
     }
 
@@ -667,7 +669,13 @@ async fn execute_node(
     let mut last_result: Option<(NodeStatus, Option<String>, Option<String>)> = None;
 
     for attempt in 1..=retry_policy.max_attempts {
-        tracing::info!("Node '{}' attempt {}/{} — type={:?}", node_id, attempt, retry_policy.max_attempts, def.node_type);
+        tracing::info!(
+            "Node '{}' attempt {}/{} — type={:?}",
+            node_id,
+            attempt,
+            retry_policy.max_attempts,
+            def.node_type
+        );
 
         let result = execute_node_body(
             &def,
@@ -730,7 +738,6 @@ async fn execute_node(
     (node_id, status, output, error)
 }
 
-
 /// Inner node execution logic (single attempt).
 async fn execute_node_body(
     def: &WorkflowNodeDef,
@@ -746,10 +753,7 @@ async fn execute_node_body(
 ) -> Result<(NodeStatus, Option<String>, Option<String>), anyhow::Error> {
     match def.node_type {
         NodeType::Prompt => {
-            let prompt = def
-                .prompt
-                .as_deref()
-                .unwrap_or("No prompt specified");
+            let prompt = def.prompt.as_deref().unwrap_or("No prompt specified");
             let rendered = render_template(prompt, vars);
             let full_prompt = if context_str.is_empty() {
                 rendered
@@ -757,7 +761,9 @@ async fn execute_node_body(
                 format!("{context_str}\n\n{rendered}")
             };
 
-            let model = def.model.as_deref()
+            let model = def
+                .model
+                .as_deref()
                 .or(default_model.as_deref())
                 .unwrap_or("default");
             tracing::info!("Prompt node '{}' using model={}", def.id, model);
@@ -766,10 +772,7 @@ async fn execute_node_body(
         }
 
         NodeType::Loop => {
-            let prompt = def
-                .prompt
-                .as_deref()
-                .unwrap_or("No prompt specified");
+            let prompt = def.prompt.as_deref().unwrap_or("No prompt specified");
             let rendered = render_template(prompt, vars);
             let full_prompt = if context_str.is_empty() {
                 rendered
@@ -777,17 +780,27 @@ async fn execute_node_body(
                 format!("{context_str}\n\n{rendered}")
             };
 
-            let model = def.model.as_deref()
+            let model = def
+                .model
+                .as_deref()
                 .or(default_model.as_deref())
                 .unwrap_or("sensenova-6.7-flash-lite");
 
-            let max_iter = def.loop_condition.as_ref()
+            let max_iter = def
+                .loop_condition
+                .as_ref()
                 .map(|lc| lc.max_iterations)
                 .unwrap_or(5);
-            let condition = def.loop_condition.as_ref()
-                .map(|lc| lc.condition.clone());
+            let condition = def.loop_condition.as_ref().map(|lc| lc.condition.clone());
 
-            execute_loop_node(&full_prompt, max_iter, condition.as_deref(), model, llm_config.as_ref()).await
+            execute_loop_node(
+                &full_prompt,
+                max_iter,
+                condition.as_deref(),
+                model,
+                llm_config.as_ref(),
+            )
+            .await
         }
 
         NodeType::Bash => {
@@ -801,10 +814,7 @@ async fn execute_node_body(
         }
 
         NodeType::Approval => {
-            let prompt = def
-                .prompt
-                .as_deref()
-                .unwrap_or("Please review and approve");
+            let prompt = def.prompt.as_deref().unwrap_or("Please review and approve");
             let rendered = render_template(prompt, vars);
 
             // Create a oneshot channel for this approval.
@@ -890,9 +900,9 @@ async fn execute_prompt_node(
         .map_err(|e| anyhow::anyhow!("Failed to create LLM client: {e}"))?;
 
     // Get tool definitions if available.
-    let tool_defs: Option<Vec<ToolDefinition>> = tool_resources.as_ref().map(|(executor, runtime, _)| {
-        executor.tool_definitions(runtime)
-    });
+    let tool_defs: Option<Vec<ToolDefinition>> = tool_resources
+        .as_ref()
+        .map(|(executor, runtime, _)| executor.tool_definitions(runtime));
 
     let system_prompt = "你是一个专业的 AI 助手，具备文件读取、命令执行等工具能力。\
         请根据用户的指令完成任务。善用工具获取实际信息，然后基于真实数据给出结果。\
@@ -914,7 +924,11 @@ async fn execute_prompt_node(
             max_tokens: Some(4096),
             reasoning_effort: None,
             tools: tool_defs.clone(),
-            tool_choice: if tool_defs.is_some() { Some(serde_json::json!("auto")) } else { None },
+            tool_choice: if tool_defs.is_some() {
+                Some(serde_json::json!("auto"))
+            } else {
+                None
+            },
             stream: Some(false),
             temperature: Some(0.3),
             top_p: None,
@@ -929,7 +943,11 @@ async fn execute_prompt_node(
         let resp = match result {
             Ok(Ok(resp)) => resp,
             Ok(Err(e)) => return Err(anyhow::anyhow!("LLM API error: {e}")),
-            Err(_) => return Err(anyhow::anyhow!("LLM request timed out after {NODE_TIMEOUT_SECS}s")),
+            Err(_) => {
+                return Err(anyhow::anyhow!(
+                    "LLM request timed out after {NODE_TIMEOUT_SECS}s"
+                ));
+            }
         };
 
         let choice = match resp.choices.first() {
@@ -954,16 +972,24 @@ async fn execute_prompt_node(
         }
 
         // Has tool calls — execute them.
-        tracing::info!("Prompt node tool round {}: {} tool call(s)", round + 1, tool_calls.len());
+        tracing::info!(
+            "Prompt node tool round {}: {} tool call(s)",
+            round + 1,
+            tool_calls.len()
+        );
         messages.push(assistant_msg);
 
         let (executor, runtime, cancel) = match tool_resources {
             Some(r) => r,
             None => {
                 // No tool executor but LLM requested tools — return what we have.
-                let text = messages.last()
+                let text = messages
+                    .last()
                     .and_then(|m| m.content.as_ref())
-                    .and_then(|c| match c { MessageContent::Text(s) => Some(s.clone()), _ => None })
+                    .and_then(|c| match c {
+                        MessageContent::Text(s) => Some(s.clone()),
+                        _ => None,
+                    })
                     .unwrap_or_default();
                 return Ok((NodeStatus::Completed, Some(text), None));
             }
@@ -977,15 +1003,21 @@ async fn execute_prompt_node(
             let args_json: serde_json::Value = serde_json::from_str(&call.function.arguments)
                 .unwrap_or_else(|_| serde_json::json!({}));
 
-            tracing::info!("  Tool: {}({})", call.function.name, truncate(&call.function.arguments, 100));
+            tracing::info!(
+                "  Tool: {}({})",
+                call.function.name,
+                truncate(&call.function.arguments, 100)
+            );
 
-            let exec_result = executor.execute(
-                &mut tool_session,
-                runtime,
-                &call.function.name,
-                args_json,
-                cancel,
-            ).await;
+            let exec_result = executor
+                .execute(
+                    &mut tool_session,
+                    runtime,
+                    &call.function.name,
+                    args_json,
+                    cancel,
+                )
+                .await;
 
             let output = match exec_result {
                 Ok(ToolExecutionResult::Observation(text)) => text,
@@ -1000,7 +1032,9 @@ async fn execute_prompt_node(
     }
 
     // Exhausted all rounds — extract whatever text we have.
-    let final_text = messages.iter().rev()
+    let final_text = messages
+        .iter()
+        .rev()
         .find_map(|m| {
             if m.role == "assistant" {
                 m.content.as_ref().and_then(|c| match c {
@@ -1014,8 +1048,6 @@ async fn execute_prompt_node(
         .unwrap_or_else(|| "(max tool rounds exceeded)".to_string());
     Ok((NodeStatus::Completed, Some(final_text), None))
 }
-
-
 
 /// Execute a bash node with timeout.
 /// Decode command output bytes to UTF-8 string.
@@ -1037,7 +1069,6 @@ fn decode_output(bytes: &[u8]) -> String {
         }
     }
 }
-
 
 async fn execute_bash_node(
     command: &str,
@@ -1074,11 +1105,7 @@ async fn execute_bash_node(
             if output.status.success() {
                 Ok((NodeStatus::Completed, Some(stdout), None))
             } else {
-                Ok((
-                    NodeStatus::Failed,
-                    Some(stdout),
-                    Some(stderr),
-                ))
+                Ok((NodeStatus::Failed, Some(stdout), Some(stderr)))
             }
         }
         Ok(Err(e)) => Err(anyhow::anyhow!("Failed to execute command: {e}")),
@@ -1103,7 +1130,10 @@ async fn execute_loop_node(
     for i in 0..max_iterations {
         let iteration_prompt = format!(
             "(Iteration {}/{}) {}\n\nPrevious output:\n{}",
-            i + 1, max_iterations, prompt, last_output
+            i + 1,
+            max_iterations,
+            prompt,
+            last_output
         );
         let result = execute_prompt_node(&iteration_prompt, model, llm_config, None).await?;
         match result {
@@ -1182,11 +1212,7 @@ fn evaluate_loop_condition(condition: &str, output: &str) -> bool {
 
 /// Truncate a string to a maximum length.
 fn truncate(s: &str, max_len: usize) -> &str {
-    if s.len() <= max_len {
-        s
-    } else {
-        &s[..max_len]
-    }
+    if s.len() <= max_len { s } else { &s[..max_len] }
 }
 
 /// Load a workflow definition from a YAML file.
@@ -1240,7 +1266,10 @@ pub async fn discover_incomplete_workflows(
             if path.extension().and_then(|e| e.to_str()) == Some("json") {
                 if let Ok(content) = tokio::fs::read_to_string(&path).await {
                     if let Ok(run) = serde_json::from_str::<WorkflowRun>(&content) {
-                        if matches!(run.status, WorkflowStatus::Running | WorkflowStatus::Pending) {
+                        if matches!(
+                            run.status,
+                            WorkflowStatus::Running | WorkflowStatus::Pending
+                        ) {
                             incomplete.push((run, path));
                         }
                     }
@@ -1290,10 +1319,16 @@ mod tests {
     #[test]
     fn test_evaluate_when_contains() {
         let mut outputs = HashMap::new();
-        outputs.insert("step1".to_string(), "ERROR: something went wrong".to_string());
+        outputs.insert(
+            "step1".to_string(),
+            "ERROR: something went wrong".to_string(),
+        );
         assert!(evaluate_when("output(step1) contains 'ERROR'", &outputs));
         assert!(!evaluate_when("output(step1) contains 'SUCCESS'", &outputs));
-        assert!(evaluate_when("output(step1) not contains 'SUCCESS'", &outputs));
+        assert!(evaluate_when(
+            "output(step1) not contains 'SUCCESS'",
+            &outputs
+        ));
     }
 
     #[test]
@@ -1310,15 +1345,24 @@ mod tests {
         let mut outputs = HashMap::new();
         outputs.insert("a".to_string(), "hello".to_string());
         outputs.insert("b".to_string(), "world".to_string());
-        assert!(evaluate_when("output(a) == 'hello' and output(b) == 'world'", &outputs));
-        assert!(!evaluate_when("output(a) == 'hello' and output(b) == 'nope'", &outputs));
+        assert!(evaluate_when(
+            "output(a) == 'hello' and output(b) == 'world'",
+            &outputs
+        ));
+        assert!(!evaluate_when(
+            "output(a) == 'hello' and output(b) == 'nope'",
+            &outputs
+        ));
     }
 
     #[test]
     fn test_evaluate_when_or() {
         let mut outputs = HashMap::new();
         outputs.insert("a".to_string(), "hello".to_string());
-        assert!(evaluate_when("output(a) == 'hello' or output(b) == 'world'", &outputs));
+        assert!(evaluate_when(
+            "output(a) == 'hello' or output(b) == 'world'",
+            &outputs
+        ));
         assert!(evaluate_when("output(a) == 'nope' or output(b) == 'world'", &outputs) == false);
     }
 
@@ -1326,10 +1370,22 @@ mod tests {
     fn test_evaluate_loop_condition() {
         assert!(evaluate_loop_condition("true", "anything"));
         assert!(!evaluate_loop_condition("false", "anything"));
-        assert!(evaluate_loop_condition("output contains DONE", "Step completed DONE"));
-        assert!(!evaluate_loop_condition("output contains DONE", "Still running"));
-        assert!(evaluate_loop_condition("output not contains ERROR", "Success"));
-        assert!(!evaluate_loop_condition("output not contains ERROR", "ERROR: failed"));
+        assert!(evaluate_loop_condition(
+            "output contains DONE",
+            "Step completed DONE"
+        ));
+        assert!(!evaluate_loop_condition(
+            "output contains DONE",
+            "Still running"
+        ));
+        assert!(evaluate_loop_condition(
+            "output not contains ERROR",
+            "Success"
+        ));
+        assert!(!evaluate_loop_condition(
+            "output not contains ERROR",
+            "ERROR: failed"
+        ));
         assert!(evaluate_loop_condition("output len > 5", "hello world"));
         assert!(!evaluate_loop_condition("output len > 100", "short"));
     }

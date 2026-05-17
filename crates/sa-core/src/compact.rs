@@ -312,22 +312,17 @@ pub fn build_request_messages(
 
     // Append conversation messages, filtering out empty assistant turns that
     // would cause provider 400 errors.
-    request_messages.extend(
-        conversation_messages
-            .iter()
-            .cloned()
-            .filter(|m| {
-                if m.role != "assistant" {
-                    return true;
-                }
-                let has_content = m.content.as_ref().is_some_and(|c| match c {
-                    MessageContent::Text(s) => !s.is_empty(),
-                    MessageContent::Parts(p) => !p.is_empty(),
-                });
-                let has_tool_calls = m.tool_calls.as_ref().is_some_and(|t| !t.is_empty());
-                has_content || has_tool_calls
-            }),
-    );
+    request_messages.extend(conversation_messages.iter().cloned().filter(|m| {
+        if m.role != "assistant" {
+            return true;
+        }
+        let has_content = m.content.as_ref().is_some_and(|c| match c {
+            MessageContent::Text(s) => !s.is_empty(),
+            MessageContent::Parts(p) => !p.is_empty(),
+        });
+        let has_tool_calls = m.tool_calls.as_ref().is_some_and(|t| !t.is_empty());
+        has_content || has_tool_calls
+    }));
     request_messages
 }
 
@@ -338,7 +333,6 @@ pub fn build_compaction_summary_message(summary: &str) -> ChatMessage {
         format!("{COMPACTION_SUMMARY_PREFIX}{summary}{COMPACTION_SUMMARY_SUFFIX}"),
     )
 }
-
 
 /// Opportunistically compact the conversation history when it becomes large.
 ///
@@ -1081,7 +1075,7 @@ fn map_summarization_error(prefix: &str, err: ChatCompletionsError) -> anyhow::E
 mod tests {
     use super::*;
     use crate::openai::{
-        ChatUsage, InputTokenDetails, ToolCall, ToolDefinition, ToolFunctionCall,
+        ChatUsage, InputTokenDetails, MessageContent, ToolCall, ToolDefinition, ToolFunctionCall,
         ToolFunctionDefinition,
     };
 
@@ -1089,7 +1083,7 @@ mod tests {
     fn assistant_with_tool_call(name: &str, arguments: serde_json::Value) -> ChatMessage {
         ChatMessage {
             role: "assistant".to_string(),
-            content: Some("准备调用工具。".to_string()),
+            content: Some(MessageContent::Text("准备调用工具。".to_string())),
             tool_calls: Some(vec![ToolCall {
                 id: "call_1".to_string(),
                 kind: "function".to_string(),
@@ -1136,12 +1130,15 @@ mod tests {
         assert_eq!(request_messages[1].role, "user");
         assert!(
             request_messages[1]
-                .content
+                .text_content()
                 .as_deref()
                 .unwrap_or_default()
                 .contains("历史摘要")
         );
-        assert_eq!(request_messages[2].content.as_deref(), Some("最新消息"));
+        assert_eq!(
+            request_messages[2].text_content().as_deref(),
+            Some("最新消息")
+        );
     }
 
     #[test]
@@ -1169,7 +1166,7 @@ mod tests {
         assert_eq!(req.messages.len(), 2);
         assert_eq!(req.messages[0].role, "developer");
         assert_eq!(
-            req.messages[0].content.as_deref(),
+            req.messages[0].text_content().as_deref(),
             Some(SUMMARIZATION_SYSTEM_PROMPT)
         );
         assert_eq!(req.messages[1].role, "user");

@@ -8,7 +8,7 @@
 
 use crate::config::PrivacyConfig;
 use crate::memory_scope::MemoryScope;
-use crate::pii_detector::{detect_pii, sanitize_text, PiiSpan, SanitizePolicy};
+use crate::pii_detector::{PiiSpan, SanitizePolicy, detect_pii, sanitize_text};
 
 /// Result of the write filter pipeline.
 #[derive(Debug, Clone)]

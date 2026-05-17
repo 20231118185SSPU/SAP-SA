@@ -227,11 +227,13 @@ pub async fn execute_glob_search(
         anyhow::bail!("Glob cancelled");
     }
 
-    let args: GlobArgs =
-        serde_json::from_value(args).context("Invalid arguments for Glob")?;
+    let args: GlobArgs = serde_json::from_value(args).context("Invalid arguments for Glob")?;
 
     if args.pattern.contains("..") {
-        anyhow::bail!("Glob pattern must not contain '..' path traversal: {}", args.pattern);
+        anyhow::bail!(
+            "Glob pattern must not contain '..' path traversal: {}",
+            args.pattern
+        );
     }
 
     let base_dir = match &args.path {
@@ -252,8 +254,8 @@ pub async fn execute_glob_search(
 
     let mut entries: Vec<String> = Vec::new();
 
-    for entry in glob::glob(pattern_str)
-        .with_context(|| format!("Invalid glob pattern: {}", pattern_str))?
+    for entry in
+        glob::glob(pattern_str).with_context(|| format!("Invalid glob pattern: {}", pattern_str))?
     {
         if cancel.is_cancelled() {
             anyhow::bail!("Glob cancelled");
@@ -321,8 +323,7 @@ pub async fn execute_grep_search(
         anyhow::bail!("Grep cancelled");
     }
 
-    let args: GrepArgs =
-        serde_json::from_value(args).context("Invalid arguments for Grep")?;
+    let args: GrepArgs = serde_json::from_value(args).context("Invalid arguments for Grep")?;
 
     let re = regex::Regex::new(&args.pattern)
         .with_context(|| format!("Invalid regex pattern: {}", args.pattern))?;
@@ -349,7 +350,10 @@ pub async fn execute_grep_search(
                 format!("*{glob_str}")
             };
             Some(glob::Pattern::new(&pat).with_context(|| {
-                format!("Invalid include glob pattern: {}", args.include.as_deref().unwrap())
+                format!(
+                    "Invalid include glob pattern: {}",
+                    args.include.as_deref().unwrap()
+                )
             })?)
         }
         None => None,
@@ -358,9 +362,9 @@ pub async fn execute_grep_search(
     let mut matches: Vec<GrepMatch> = Vec::new();
 
     // Check if target is a single file or a directory
-    let target_meta = tokio::fs::metadata(&target_path).await.with_context(|| {
-        format!("Failed to stat path: {}", target_path.display())
-    })?;
+    let target_meta = tokio::fs::metadata(&target_path)
+        .await
+        .with_context(|| format!("Failed to stat path: {}", target_path.display()))?;
 
     if target_meta.is_file() {
         grep_file(
@@ -392,10 +396,7 @@ pub async fn execute_grep_search(
     }
 
     if matches.is_empty() {
-        return Ok(format!(
-            "No matches found for pattern: {}",
-            args.pattern
-        ));
+        return Ok(format!("No matches found for pattern: {}", args.pattern));
     }
 
     let truncated = matches.len() >= max_matches;
@@ -508,13 +509,13 @@ async fn list_dir_flat(dir: &Path) -> anyhow::Result<String> {
     }
 
     // Sort: directories first, then files, alphabetically within each group
-    entries.sort_by(|a, b| {
-        match (a.entry_type.as_str(), b.entry_type.as_str()) {
+    entries.sort_by(
+        |a, b| match (a.entry_type.as_str(), b.entry_type.as_str()) {
             ("dir", "file") | ("dir", "symlink") => std::cmp::Ordering::Less,
             ("file", "dir") | ("symlink", "dir") => std::cmp::Ordering::Greater,
             _ => a.name.cmp(&b.name),
-        }
-    });
+        },
+    );
 
     let output = entries
         .iter()
@@ -552,7 +553,9 @@ async fn list_dir_recursive(
     cancel: &CancelToken,
 ) -> anyhow::Result<String> {
     let pattern_matcher = match pattern {
-        Some(p) => Some(glob::Pattern::new(p).with_context(|| format!("Invalid glob pattern: {p}"))?),
+        Some(p) => {
+            Some(glob::Pattern::new(p).with_context(|| format!("Invalid glob pattern: {p}"))?)
+        }
         None => None,
     };
 
@@ -594,16 +597,15 @@ async fn list_dir_recursive(
         let path = entry.path();
 
         let rel = match path.strip_prefix(root_dir) {
-            Ok(r) => r.to_str().with_context(|| format!("Invalid path: {}", path.display()))?,
+            Ok(r) => r
+                .to_str()
+                .with_context(|| format!("Invalid path: {}", path.display()))?,
             Err(_) => continue,
         };
 
         // Apply glob filter if provided
         if let Some(matcher) = pattern_matcher.as_ref() {
-            let file_name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("");
+            let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             if !matcher.matches(file_name) && !matcher.matches(rel.replace('\\', "/").as_str()) {
                 continue;
             }
@@ -666,19 +668,16 @@ async fn grep_file(
 ) -> anyhow::Result<()> {
     // Check include filter
     if let Some(matcher) = include_matcher.as_ref() {
-        let file_name = file_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("");
+        let file_name = file_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
         if !matcher.matches(file_name) {
             return Ok(());
         }
     }
 
     // Read file content (async)
-    let content = tokio::fs::read(file_path).await.with_context(|| {
-        format!("Failed to read file: {}", file_path.display())
-    })?;
+    let content = tokio::fs::read(file_path)
+        .await
+        .with_context(|| format!("Failed to read file: {}", file_path.display()))?;
 
     // Binary detection
     if is_binary_content(&content) {
@@ -724,20 +723,18 @@ async fn grep_directory(
     // Phase 1: collect candidate file paths synchronously via walkdir
     let mut candidate_files: Vec<PathBuf> = Vec::new();
 
-    let walk_iter = walkdir::WalkDir::new(dir)
-        .into_iter()
-        .filter_entry(|e| {
-            let path = e.path();
-            if is_hidden_entry(path) {
+    let walk_iter = walkdir::WalkDir::new(dir).into_iter().filter_entry(|e| {
+        let path = e.path();
+        if is_hidden_entry(path) {
+            return false;
+        }
+        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            if SKIP_DIRS.contains(&name) && e.file_type().is_dir() {
                 return false;
             }
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if SKIP_DIRS.contains(&name) && e.file_type().is_dir() {
-                    return false;
-                }
-            }
-            true
-        });
+        }
+        true
+    });
 
     for entry in walk_iter {
         if cancel.is_cancelled() {

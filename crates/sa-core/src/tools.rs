@@ -940,7 +940,6 @@ impl ToolContext {
         self
     }
 
-
     /// Resolve a user-provided path into an absolute path under `workspace_root`.
     ///
     /// This must work for both existing and not-yet-existing paths.
@@ -1165,7 +1164,11 @@ struct ImageAnalyzeOutput {
 impl ToolExecutor {
     /// Create a new executor.
     pub fn new(ctx: ToolContext, mcp_registry: Option<Arc<McpRegistry>>) -> Self {
-        Self { ctx, mcp_registry, memory_store: None }
+        Self {
+            ctx,
+            mcp_registry,
+            memory_store: None,
+        }
     }
 
     /// Attach a memory store to this executor.
@@ -2034,16 +2037,14 @@ impl ToolExecutor {
                 .reload(runtime, args, cancel)
                 .await
                 .map(ToolExecutionResult::Observation),
-            "ImageAnalyze" => {
-                match self.image_analyze(session, args, cancel).await {
-                    Ok(out) => Ok(ToolExecutionResult::ImagePayload {
-                        data_url: out.data_url,
-                        media_type: out.media_type,
-                        prompt: out.prompt,
-                    }),
-                    Err(e) => Err(e),
-                }
-            }
+            "ImageAnalyze" => match self.image_analyze(session, args, cancel).await {
+                Ok(out) => Ok(ToolExecutionResult::ImagePayload {
+                    data_url: out.data_url,
+                    media_type: out.media_type,
+                    prompt: out.prompt,
+                }),
+                Err(e) => Err(e),
+            },
             "Wait" => self.wait(args, cancel).await,
             "GetTask" => self
                 .get_task(runtime, args, cancel)
@@ -2387,10 +2388,7 @@ impl ToolExecutor {
         tokio::fs::write(&checkpoint_path, content.as_bytes())
             .await
             .with_context(|| {
-                format!(
-                    "Failed to write checkpoint: {}",
-                    checkpoint_path.display()
-                )
+                format!("Failed to write checkpoint: {}", checkpoint_path.display())
             })?;
 
         Ok(serde_json::json!({
@@ -2494,9 +2492,12 @@ impl ToolExecutor {
             .with_context(|| format!("Failed to write edited file: {}", path.display()))?;
 
         // 5.7 Atomic replace verification: confirm new_text is actually in the file.
-        let verify = tokio::fs::read_to_string(&path)
-            .await
-            .with_context(|| format!("Failed to read back file for verification: {}", path.display()))?;
+        let verify = tokio::fs::read_to_string(&path).await.with_context(|| {
+            format!(
+                "Failed to read back file for verification: {}",
+                path.display()
+            )
+        })?;
         if !verify.contains(&args.new_text) {
             anyhow::bail!(
                 "Edit 写入验证失败：替换后文件中未找到 new_text，文件可能未正确更新: {}",
@@ -3931,7 +3932,7 @@ mod tests {
             .await
             .expect_err("sensitive config path must fail");
 
-        assert!(err.to_string().contains("dangerous configuration files"));
+        assert!(err.to_string().contains("sensitive configuration files"));
     }
 
     #[tokio::test]

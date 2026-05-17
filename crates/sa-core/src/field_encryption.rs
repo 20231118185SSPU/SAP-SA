@@ -24,8 +24,8 @@
 //! unique ciphertext even for identical plaintexts.
 
 use aes_gcm::{
-    aead::{Aead, KeyInit, OsRng},
     Aes256Gcm, Nonce,
+    aead::{Aead, KeyInit, OsRng},
 };
 use anyhow::Context as _;
 use base64::Engine;
@@ -91,8 +91,8 @@ impl FieldEncryptor {
             return Ok(Self { cipher: None });
         }
 
-        let key_bytes = hex::decode(&key_hex)
-            .with_context(|| "master_key_hex must be valid hex")?;
+        let key_bytes =
+            hex::decode(&key_hex).with_context(|| "master_key_hex must be valid hex")?;
 
         if key_bytes.len() != 32 {
             anyhow::bail!(
@@ -275,7 +275,10 @@ mod tests {
 
         let ct1 = enc.encrypt("same plaintext").unwrap();
         let ct2 = enc.encrypt("same plaintext").unwrap();
-        assert_ne!(ct1, ct2, "same plaintext should produce different ciphertexts");
+        assert_ne!(
+            ct1, ct2,
+            "same plaintext should produce different ciphertexts"
+        );
     }
 
     #[test]
@@ -292,16 +295,20 @@ mod tests {
         let tampered = base64::engine::general_purpose::STANDARD.encode(&packed);
 
         let result = enc.decrypt(&tampered);
-        assert!(result.is_err(), "tampered ciphertext should fail decryption");
+        assert!(
+            result.is_err(),
+            "tampered ciphertext should fail decryption"
+        );
     }
 
     #[test]
     fn wrong_key_fails_decryption() {
-        let enc1 = FieldEncryptor::from_config(&test_config(&sample_key()))
-            .expect("enc1 should build");
-        let other_key = "ffeeddccbbaa00112233445566778899ffeeddccbbaa00112233445566778899".to_string();
-        let enc2 = FieldEncryptor::from_config(&test_config(&other_key))
-            .expect("enc2 should build");
+        let enc1 =
+            FieldEncryptor::from_config(&test_config(&sample_key())).expect("enc1 should build");
+        let other_key =
+            "ffeeddccbbaa00112233445566778899ffeeddccbbaa00112233445566778899".to_string();
+        let enc2 =
+            FieldEncryptor::from_config(&test_config(&other_key)).expect("enc2 should build");
 
         let ct = enc1.encrypt("cross-decrypt").unwrap();
         let result = enc2.decrypt(&ct);

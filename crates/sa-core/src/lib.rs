@@ -12,9 +12,9 @@
 pub mod adversary;
 pub mod agent;
 pub mod agents_md;
+pub mod bash_safety;
 pub mod cache;
 pub mod cache_monitor;
-pub mod bash_safety;
 pub mod cancel;
 pub mod commands;
 pub mod compact;
@@ -33,7 +33,6 @@ pub mod mcp_transport;
 pub mod memory;
 pub mod memory_filter;
 pub mod memory_scope;
-pub mod skill_metabolism;
 pub mod noise_assessment;
 pub mod openai;
 pub mod path_guard;
@@ -42,17 +41,17 @@ pub mod retry;
 pub mod runtime;
 pub mod search_backends;
 pub mod session;
+pub mod skill_metabolism;
 
-
-pub mod skills;
+pub mod memory_store;
+pub mod plan_engine;
 pub mod skill_search;
+pub mod skills;
 pub mod task_audit;
 pub mod tool_cache;
 pub mod tools;
+pub mod workflow;
+pub mod workflow_engine;
 pub mod working_memory;
 pub mod ws_identity;
-pub mod ws_protocol;pub mod workflow;
-pub mod workflow_engine;
-pub mod plan_engine;
-pub mod memory_store;
-
+pub mod ws_protocol;

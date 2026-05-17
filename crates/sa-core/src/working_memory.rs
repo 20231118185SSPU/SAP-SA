@@ -127,19 +127,60 @@ fn contains_entity_signal(text: &str) -> bool {
 
 fn contains_preference_signal(text: &str) -> bool {
     let keywords = [
-        "i prefer", "i like", "i dislike", "i hate", "always", "never",
-        "我喜欢", "我讨厌", "我偏好", "我一般", "习惯了", "不要",
-        "please", "don't", "avoid", "better", "worse", "最好", "不要",
-        "remember", "note that", "keep in mind", "重要的是", "切记",
+        "i prefer",
+        "i like",
+        "i dislike",
+        "i hate",
+        "always",
+        "never",
+        "我喜欢",
+        "我讨厌",
+        "我偏好",
+        "我一般",
+        "习惯了",
+        "不要",
+        "please",
+        "don't",
+        "avoid",
+        "better",
+        "worse",
+        "最好",
+        "不要",
+        "remember",
+        "note that",
+        "keep in mind",
+        "重要的是",
+        "切记",
     ];
     keywords.iter().any(|kw| text.contains(kw))
 }
 
 fn contains_emotion_signal(text: &str) -> f64 {
-    let high = ["angry", "frustrated", "terrible", "hate", "disappointed",
-                "愤怒", "失望", "糟糕", "讨厌", "生气", "郁闷"];
-    let medium = ["unhappy", "annoyed", "concerned", "worry", "hope",
-                  "不太满意", "担心", "希望", "烦恼", "犹豫"];
+    let high = [
+        "angry",
+        "frustrated",
+        "terrible",
+        "hate",
+        "disappointed",
+        "愤怒",
+        "失望",
+        "糟糕",
+        "讨厌",
+        "生气",
+        "郁闷",
+    ];
+    let medium = [
+        "unhappy",
+        "annoyed",
+        "concerned",
+        "worry",
+        "hope",
+        "不太满意",
+        "担心",
+        "希望",
+        "烦恼",
+        "犹豫",
+    ];
     let low = ["okay", "fine", "alright", "ok", "还好", "一般"];
 
     if high.iter().any(|kw| text.contains(kw)) {
@@ -155,8 +196,15 @@ fn contains_emotion_signal(text: &str) -> f64 {
 
 fn contains_explicit_marker(text: &str) -> bool {
     let markers = [
-        "remember", "note that", "keep in mind", "important",
-        "切记", "重要的是", "请记住", "提醒", "别忘了",
+        "remember",
+        "note that",
+        "keep in mind",
+        "important",
+        "切记",
+        "重要的是",
+        "请记住",
+        "提醒",
+        "别忘了",
     ];
     markers.iter().any(|m| text.contains(m))
 }
@@ -210,9 +258,13 @@ pub struct WorkingMemoryEntry {
 }
 
 impl WorkingMemoryEntry {
-    fn new(message: ChatMessage, config: &WorkingMemoryConfig) -> Self {
+    pub(crate) fn new(message: ChatMessage, config: &WorkingMemoryConfig) -> Self {
         let importance = score_importance(&message);
-        let char_count = message.text_content().unwrap_or("".to_string()).chars().count();
+        let char_count = message
+            .text_content()
+            .unwrap_or("".to_string())
+            .chars()
+            .count();
         Self {
             message,
             importance,
@@ -382,30 +434,39 @@ impl WorkingMemory {
         self.hot_buffer
             .iter()
             .filter(|e| {
-                e.is_consolidation_candidate || self.effective_importance(e) < self.config.importance_threshold
+                e.is_consolidation_candidate
+                    || self.effective_importance(e) < self.config.importance_threshold
             })
             .collect()
     }
 
     /// D8: Decay scanner — call this periodically (e.g. per quantum or heartbeat).
     pub fn scan_and_decay(&mut self) -> usize {
-        let Some(ref cfg) = self.config.decay else { return 0 };
+        let Some(ref cfg) = self.config.decay else {
+            return 0;
+        };
         let now_ms = chrono::Utc::now().timestamp_millis();
         let threshold = self.config.importance_threshold;
         let mut weakened = 0;
         for i in 0..self.hot_buffer.len() {
             let last_access = self.hot_buffer[i].last_access.unwrap_or(0);
-            if last_access == 0 { continue; }
+            if last_access == 0 {
+                continue;
+            }
             let elapsed_days = ((now_ms - last_access) / 86_400_000) as f64;
-            if elapsed_days <= cfg.decay_after_days as f64 { continue; }
+            if elapsed_days <= cfg.decay_after_days as f64 {
+                continue;
+            }
             let decay_days = elapsed_days - cfg.decay_after_days as f64;
             let strength = cfg.decay_base.powf(-decay_days);
             let freq_boost = cfg.alpha * (1.0 + self.hot_buffer[i].access_count as f64).ln();
-            let effective = (strength * self.hot_buffer[i].importance + cfg.min_importance + freq_boost)
-                .min(1.0)
-                .max(cfg.min_importance);
+            let effective =
+                (strength * self.hot_buffer[i].importance + cfg.min_importance + freq_boost)
+                    .min(1.0)
+                    .max(cfg.min_importance);
             if effective < threshold {
-                let new_imp = (self.hot_buffer[i].importance - cfg.access_boost).max(cfg.min_importance);
+                let new_imp =
+                    (self.hot_buffer[i].importance - cfg.access_boost).max(cfg.min_importance);
                 self.hot_buffer[i].importance = new_imp;
                 weakened += 1;
             }
@@ -445,7 +506,9 @@ impl WorkingMemory {
 
     /// Apply a weaken action to an entry (reduce importance after decay).
     pub fn weaken(&mut self, index: usize) {
-        let Some(ref cfg) = self.config.decay else { return };
+        let Some(ref cfg) = self.config.decay else {
+            return;
+        };
         if index < self.hot_buffer.len() {
             let entry = &mut self.hot_buffer[index];
             let new_imp = (entry.importance - cfg.access_boost).max(cfg.min_importance);
@@ -464,7 +527,9 @@ impl WorkingMemory {
 
     /// Apply a strengthen boost to an entry after positive feedback.
     pub fn strengthen(&mut self, index: usize) {
-        let Some(ref cfg) = self.config.decay else { return };
+        let Some(ref cfg) = self.config.decay else {
+            return;
+        };
         if index < self.hot_buffer.len() {
             let entry = &mut self.hot_buffer[index];
             let new_imp = (entry.importance + cfg.access_boost).min(1.0);
@@ -496,22 +561,23 @@ impl WorkingMemory {
         let mut out = String::new();
         for (i, entry) in &candidates {
             let eff = self.effective_importance(entry);
-            let last = entry.last_access.map(|ts| {
-                let dt = chrono::DateTime::from_timestamp_millis(ts)
-                    .unwrap_or_default();
-                dt.format("%Y-%m-%d").to_string()
-            }).unwrap_or_else(|| "从未访问".to_string());
-            let content = entry.message.text_content()
+            let last = entry
+                .last_access
+                .map(|ts| {
+                    let dt = chrono::DateTime::from_timestamp_millis(ts).unwrap_or_default();
+                    dt.format("%Y-%m-%d").to_string()
+                })
+                .unwrap_or_else(|| "从未访问".to_string());
+            let content = entry
+                .message
+                .text_content()
                 .unwrap_or_default()
                 .chars()
                 .take(80)
                 .collect::<String>();
             out.push_str(&format!(
                 "- [{i}] importance={:.2} effective={:.2} last_access={} content={}\n",
-                entry.importance,
-                eff,
-                last,
-                content
+                entry.importance, eff, last, content
             ));
         }
         out
@@ -524,7 +590,10 @@ impl WorkingMemory {
         }
         let mut out = String::from("\n## Pinned Memory\n\n");
         for (key, slot) in &self.pinned_slots {
-            out.push_str(&format!("**{}** ({})\n{}\n\n", slot.label, key, slot.content));
+            out.push_str(&format!(
+                "**{}** ({})\n{}\n\n",
+                slot.label, key, slot.content
+            ));
         }
         out
     }
@@ -605,9 +674,15 @@ mod tests {
 
     #[test]
     fn importance_preference_keywords() {
-        let msg = make_message("user", "I prefer working in the morning, please remember that");
+        let msg = make_message(
+            "user",
+            "I prefer working in the morning, please remember that",
+        );
         let score = score_importance(&msg);
-        assert!(score >= 0.5, "preference + explicit marker should score >= 0.5, got {score}");
+        assert!(
+            score >= 0.5,
+            "preference + explicit marker should score >= 0.5, got {score}"
+        );
     }
 
     #[test]
@@ -663,12 +738,7 @@ mod tests {
     #[test]
     fn pin_and_unpin() {
         let mut wm = WorkingMemory::new();
-        wm.pin(
-            "user_name".into(),
-            "User Name".into(),
-            "小明".into(),
-            None,
-        );
+        wm.pin("user_name".into(), "User Name".into(), "小明".into(), None);
 
         assert!(wm.is_pinned("user_name"));
         assert!(!wm.is_pinned("nonexistent"));
@@ -689,9 +759,15 @@ mod tests {
         // Low importance
         wm.push_message(make_message("user", "hello"));
         // High importance (preference keyword)
-        wm.push_message(make_message("user", "I prefer to work in the morning (9am start)"));
+        wm.push_message(make_message(
+            "user",
+            "I prefer to work in the morning (9am start)",
+        ));
 
         let candidates = wm.consolidation_candidates();
-        assert!(!candidates.is_empty(), "preference message should be a candidate");
+        assert!(
+            !candidates.is_empty(),
+            "preference message should be a candidate"
+        );
     }
 }

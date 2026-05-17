@@ -34,9 +34,7 @@ use sa_core::interaction_history::{
     InteractionPayload, InteractionStore, show_payload_from_visible_file,
 };
 use sa_core::mcp_client::McpRegistry;
-use sa_core::memory::{
-    build_prompt_block as build_memory_prompt_block, is_memory_reference,
-};
+use sa_core::memory::{build_prompt_block as build_memory_prompt_block, is_memory_reference};
 use sa_core::openai::{AuthStyle, ChatMessage, OpenAiClient, WireApi};
 use sa_core::runtime::state::AgentStatus;
 use sa_core::runtime::state::{
@@ -58,17 +56,17 @@ use sa_core::tools::{
     TerminalTaskHandle, TerminalTaskInfo, ToolContext, ToolExecutor, ToolRuntime, TransferInputFn,
     TransferInputReceipt, TransferInputRequest,
 };
+use sa_core::workflow::NodeStatus;
 use sa_core::ws_identity::{
     LocalIdentity, WS_HANDSHAKE_TIMEOUT_SECS, build_hello_reject, build_server_hello,
     load_local_identity, verify_client_hello,
 };
 use sa_core::ws_protocol::{
-    AgentIdentity, ChatMode, ClientMessage, Event, EventKind, InitCompleted, InitFailed, InitMethod,
-    InitMethodOption, InitRequired, InitializeConfigRequest, PlanAction, PlanStepStatus,
-    QuestionMode, ServerMessage, UserQuestion, UserQuestionAnswer, UserVisibleFile,
+    AgentIdentity, ChatMode, ClientMessage, Event, EventKind, InitCompleted, InitFailed,
+    InitMethod, InitMethodOption, InitRequired, InitializeConfigRequest, PlanAction,
+    PlanStepStatus, QuestionMode, ServerMessage, UserQuestion, UserQuestionAnswer, UserVisibleFile,
     UserVisibleFileEncoding,
 };
-use sa_core::workflow::NodeStatus;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -468,7 +466,9 @@ impl Hub {
             permissions: RwLock::new(reloadable.permissions),
             dream_scheduler: Mutex::new(None),
             memory_store,
-            cache_monitor: Mutex::new(sa_core::cache_monitor::CacheMonitor::for_model(&model_name_for_cache)),
+            cache_monitor: Mutex::new(sa_core::cache_monitor::CacheMonitor::for_model(
+                &model_name_for_cache,
+            )),
         });
 
         // Wire up the context info callback so the agent can push real-time
@@ -477,13 +477,11 @@ impl Hub {
             let hub_for_ctx = Arc::clone(&hub);
             let context_info_emit: EmitContextInfoFn =
                 Arc::new(move |used_tokens, max_tokens, message_count| {
-                    hub_for_ctx.broadcast_server_message(
-                        ServerMessage::ContextInfo {
-                            used_tokens,
-                            max_tokens,
-                            message_count,
-                        },
-                    );
+                    hub_for_ctx.broadcast_server_message(ServerMessage::ContextInfo {
+                        used_tokens,
+                        max_tokens,
+                        message_count,
+                    });
                 });
             hub.runner
                 .write()
@@ -640,13 +638,11 @@ impl Hub {
             let hub_for_ctx = Arc::clone(self);
             let context_info_emit: EmitContextInfoFn =
                 Arc::new(move |used_tokens, max_tokens, message_count| {
-                    hub_for_ctx.broadcast_server_message(
-                        ServerMessage::ContextInfo {
-                            used_tokens,
-                            max_tokens,
-                            message_count,
-                        },
-                    );
+                    hub_for_ctx.broadcast_server_message(ServerMessage::ContextInfo {
+                        used_tokens,
+                        max_tokens,
+                        message_count,
+                    });
                 });
             self.runner
                 .write()
@@ -656,10 +652,16 @@ impl Hub {
 
         // Update cache monitor pricing to match the new model.
         {
-            let new_model = self.runner.read().expect("runner rwlock poisoned").model_name().to_string();
-            self.cache_monitor.lock().unwrap_or_else(|e| e.into_inner()).set_pricing(
-                sa_core::cost_budget::ModelPricing::for_model(&new_model),
-            );
+            let new_model = self
+                .runner
+                .read()
+                .expect("runner rwlock poisoned")
+                .model_name()
+                .to_string();
+            self.cache_monitor
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .set_pricing(sa_core::cost_budget::ModelPricing::for_model(&new_model));
         }
 
         self.replace_dream_scheduler(prepared.dream_manager);
@@ -730,7 +732,11 @@ impl Hub {
         mirror_server_message(&msg);
         match &msg {
             ServerMessage::MemoryUpdated { source, report } => {
-                tracing::info!("[broadcast] MemoryUpdated source={} report={:?}", source, report);
+                tracing::info!(
+                    "[broadcast] MemoryUpdated source={} report={:?}",
+                    source,
+                    report
+                );
             }
             _ => {}
         }
@@ -739,10 +745,7 @@ impl Hub {
 
     /// Broadcast current cache performance statistics to all clients.
     fn broadcast_cache_stats(&self) {
-        let monitor = self
-            .cache_monitor
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let monitor = self.cache_monitor.lock().unwrap_or_else(|e| e.into_inner());
         let report = monitor.generate_report();
         let model_breakdown = monitor
             .get_model_breakdown()
@@ -2585,11 +2588,15 @@ impl Hub {
 
                 // Record cache/token usage from this quantum.
                 let assistant_usage = match &quantum.outcome {
-                    AgentQuantumOutcome::Ask { assistant_message, .. }
-                    | AgentQuantumOutcome::Wait { assistant_message, .. }
-                    | AgentQuantumOutcome::Finish { assistant_message, .. } => {
-                        assistant_message.request_usage.clone()
+                    AgentQuantumOutcome::Ask {
+                        assistant_message, ..
                     }
+                    | AgentQuantumOutcome::Wait {
+                        assistant_message, ..
+                    }
+                    | AgentQuantumOutcome::Finish {
+                        assistant_message, ..
+                    } => assistant_message.request_usage.clone(),
                     AgentQuantumOutcome::Continue { .. } => None,
                 };
                 if let Some(usage) = &assistant_usage {
@@ -4198,13 +4205,26 @@ impl Hub {
                     sa_core::ws_protocol::ServerMessage::SkillActivated {
                         skill_name: skill.name.clone(),
                         description: skill.description.clone(),
-                        trigger: skill.triggers.iter().find(|t| req.task.to_lowercase().contains(&t.to_lowercase())).cloned().unwrap_or_default(),
-                        orchestration_mode: skill.orchestration.as_ref().and_then(|o| o.mode.clone()),
+                        trigger: skill
+                            .triggers
+                            .iter()
+                            .find(|t| req.task.to_lowercase().contains(&t.to_lowercase()))
+                            .cloned()
+                            .unwrap_or_default(),
+                        orchestration_mode: skill
+                            .orchestration
+                            .as_ref()
+                            .and_then(|o| o.mode.clone()),
                     },
                 );
                 // Inject skill instructions into extra_system_prompt.
-                if let Ok(expanded) = skill.expand_invocation(Some(&req.task), &req.task_id.to_string()) {
-                    extra_prompt = format!("{extra_prompt}\n\n## Skill Activation: {}\n\n{}", skill.name, expanded.instructions);
+                if let Ok(expanded) =
+                    skill.expand_invocation(Some(&req.task), &req.task_id.to_string())
+                {
+                    extra_prompt = format!(
+                        "{extra_prompt}\n\n## Skill Activation: {}\n\n{}",
+                        skill.name, expanded.instructions
+                    );
                 }
             }
 
@@ -5498,7 +5518,10 @@ fn mirror_server_message(msg: &ServerMessage) {
         ServerMessage::Error { message } => {
             eprintln!("[frontend][error] {message}");
         }
-        ServerMessage::ImageUploaded { upload_id, saved_path } => {
+        ServerMessage::ImageUploaded {
+            upload_id,
+            saved_path,
+        } => {
             eprintln!("[frontend][image_uploaded] upload_id={upload_id} saved={saved_path}");
         }
         ServerMessage::ConfigSnapshot { config_path, .. } => {
@@ -5510,89 +5533,204 @@ fn mirror_server_message(msg: &ServerMessage) {
         ServerMessage::ConfigUpdateFailed { message, .. } => {
             eprintln!("[frontend][config_update_failed] {message}");
         }
-        ServerMessage::MemoryFacts { facts, total, offset } => {
-            eprintln!("[frontend][memory_facts] count={} total={} offset={}", facts.len(), total, offset);
+        ServerMessage::MemoryFacts {
+            facts,
+            total,
+            offset,
+        } => {
+            eprintln!(
+                "[frontend][memory_facts] count={} total={} offset={}",
+                facts.len(),
+                total,
+                offset
+            );
         }
-        ServerMessage::MemoryGraph { subject, facts, hops } => {
-            eprintln!("[frontend][memory_graph] subject={subject} facts={} hops={hops}", facts.len());
+        ServerMessage::MemoryGraph {
+            subject,
+            facts,
+            hops,
+        } => {
+            eprintln!(
+                "[frontend][memory_graph] subject={subject} facts={} hops={hops}",
+                facts.len()
+            );
         }
         ServerMessage::MemoryStats { total_facts, .. } => {
             eprintln!("[frontend][memory_stats] total_facts={total_facts}");
         }
-        ServerMessage::MemoryOperationResult { operation, affected, summary } => {
-            eprintln!("[frontend][memory_operation_result] op={operation} affected={affected} {summary}");
+        ServerMessage::MemoryOperationResult {
+            operation,
+            affected,
+            summary,
+        } => {
+            eprintln!(
+                "[frontend][memory_operation_result] op={operation} affected={affected} {summary}"
+            );
         }
-        ServerMessage::CacheStats { total_requests, total_cache_hits, total_cache_misses, hit_rate, estimated_savings, .. } => {
+        ServerMessage::CacheStats {
+            total_requests,
+            total_cache_hits,
+            total_cache_misses,
+            hit_rate,
+            estimated_savings,
+            ..
+        } => {
             eprintln!(
                 "[frontend][cache_stats] requests={} hits={} misses={} hit_rate={:.1}% savings=${:.4}",
-                total_requests, total_cache_hits, total_cache_misses, hit_rate * 100.0, estimated_savings
+                total_requests,
+                total_cache_hits,
+                total_cache_misses,
+                hit_rate * 100.0,
+                estimated_savings
             );
         }
-        ServerMessage::ContextInfo { used_tokens, max_tokens, message_count } => {
+        ServerMessage::ContextInfo {
+            used_tokens,
+            max_tokens,
+            message_count,
+        } => {
             eprintln!(
                 "[frontend][context_info] used={}K max={}K messages={}",
-                used_tokens / 1000, max_tokens / 1000, message_count
+                used_tokens / 1000,
+                max_tokens / 1000,
+                message_count
             );
         }
-        ServerMessage::WorkflowUpdate { workflow_id, nodes, edges } => {
+        ServerMessage::WorkflowUpdate {
+            workflow_id,
+            nodes,
+            edges,
+        } => {
             eprintln!(
                 "[frontend][workflow_update] id={} nodes={} edges={}",
-                workflow_id, nodes.len(), edges.len()
+                workflow_id,
+                nodes.len(),
+                edges.len()
             );
         }
-        ServerMessage::WorkflowStarted { run_id, workflow_name, .. } => {
+        ServerMessage::WorkflowStarted {
+            run_id,
+            workflow_name,
+            ..
+        } => {
             eprintln!("[frontend][workflow_started] run={run_id} name={workflow_name}");
         }
-        ServerMessage::WorkflowNodeUpdate { run_id, node_id, status, .. } => {
-            eprintln!("[frontend][workflow_node_update] run={run_id} node={node_id} status={status:?}");
+        ServerMessage::WorkflowNodeUpdate {
+            run_id,
+            node_id,
+            status,
+            ..
+        } => {
+            eprintln!(
+                "[frontend][workflow_node_update] run={run_id} node={node_id} status={status:?}"
+            );
         }
         ServerMessage::WorkflowCompleted { run_id, summary } => {
             eprintln!("[frontend][workflow_completed] run={run_id} {summary}");
         }
-        ServerMessage::WorkflowFailed { run_id, node_id, error } => {
+        ServerMessage::WorkflowFailed {
+            run_id,
+            node_id,
+            error,
+        } => {
             eprintln!("[frontend][workflow_failed] run={run_id} node={node_id:?} {error}");
         }
-        ServerMessage::ApprovalRequested { run_id, node_id, prompt } => {
+        ServerMessage::ApprovalRequested {
+            run_id,
+            node_id,
+            prompt,
+        } => {
             eprintln!("[frontend][approval_requested] run={run_id} node={node_id} prompt={prompt}");
         }
         ServerMessage::PlanCreated { plan_id, steps } => {
-            eprintln!("[frontend][plan_created] plan={plan_id} steps={}", steps.len());
+            eprintln!(
+                "[frontend][plan_created] plan={plan_id} steps={}",
+                steps.len()
+            );
         }
-        ServerMessage::PlanStepUpdate { plan_id, step_id, status } => {
-            eprintln!("[frontend][plan_step_update] plan={plan_id} step={step_id} status={status:?}");
+        ServerMessage::PlanStepUpdate {
+            plan_id,
+            step_id,
+            status,
+        } => {
+            eprintln!(
+                "[frontend][plan_step_update] plan={plan_id} step={step_id} status={status:?}"
+            );
         }
         ServerMessage::ChatModeChanged { mode } => {
             eprintln!("[frontend][chat_mode_changed] mode={mode:?}");
         }
         ServerMessage::MemoryUpdated { source, report } => {
-            eprintln!("[frontend][memory_updated] source={source} report={:?}", report);
-        }        ServerMessage::MemoryReport { report_path, content } => {
-            eprintln!("[frontend][memory_report] path={report_path} bytes={}", content.len());
+            eprintln!(
+                "[frontend][memory_updated] source={source} report={:?}",
+                report
+            );
         }
-        ServerMessage::SkillActivated { skill_name, description, trigger, orchestration_mode } => {
-            eprintln!("[frontend][skill_activated] skill={skill_name} trigger={trigger} mode={:?}", orchestration_mode);
+        ServerMessage::MemoryReport {
+            report_path,
+            content,
+        } => {
+            eprintln!(
+                "[frontend][memory_report] path={report_path} bytes={}",
+                content.len()
+            );
+        }
+        ServerMessage::SkillActivated {
+            skill_name,
+            description,
+            trigger,
+            orchestration_mode,
+        } => {
+            eprintln!(
+                "[frontend][skill_activated] skill={skill_name} trigger={trigger} mode={:?}",
+                orchestration_mode
+            );
             let _ = description;
-        }        ServerMessage::SkillsList { skills } => {
+        }
+        ServerMessage::SkillsList { skills } => {
             eprintln!("[frontend][skills_list] count={}", skills.len());
         }
         ServerMessage::VerifyPass { step, message } => {
             eprintln!("[frontend][verify_pass] step={step} message={message}");
         }
-        ServerMessage::VerifyFail { step, error, retry_count } => {
-            eprintln!("[frontend][verify_fail] step={step} error={error} retries={:?}", retry_count);
+        ServerMessage::VerifyFail {
+            step,
+            error,
+            retry_count,
+        } => {
+            eprintln!(
+                "[frontend][verify_fail] step={step} error={error} retries={:?}",
+                retry_count
+            );
         }
-        ServerMessage::SkillDoc { name, description, content } => {
-            eprintln!("[frontend][skill_doc] name={name} description_len={} content_len={}", description.len(), content.len());
+        ServerMessage::SkillDoc {
+            name,
+            description,
+            content,
+        } => {
+            eprintln!(
+                "[frontend][skill_doc] name={name} description_len={} content_len={}",
+                description.len(),
+                content.len()
+            );
         }
-        ServerMessage::ApiKeyTestResult { ok, model, provider, latency_ms, error } => {
-            eprintln!("[frontend][api_key_test_result] ok={ok} model={model} provider={provider} latency={latency_ms}ms error={:?}", error);
+        ServerMessage::ApiKeyTestResult {
+            ok,
+            model,
+            provider,
+            latency_ms,
+            error,
+        } => {
+            eprintln!(
+                "[frontend][api_key_test_result] ok={ok} model={model} provider={provider} latency={latency_ms}ms error={:?}",
+                error
+            );
         }
         ServerMessage::SupportedModels { models } => {
             eprintln!("[frontend][supported_models] count={}", models.len());
         }
     }
 }
-
 
 /// Send one direct per-connection message and mirror it to the backend
 /// terminal.
@@ -5713,17 +5851,11 @@ async fn ws_session(socket: WebSocket, state: Arc<ServerState>) {
 /// The message uses the prefix `__IMAGE__:data:...` so that
 /// `mailbox_entry_to_message` can recognise it and build a multimodal
 /// `ChatMessage` with `ContentPart::Image`.
-async fn inject_user_image(
-    hub: &Arc<Hub>,
-    data_url: &str,
-    saved_path: &str,
-) -> anyhow::Result<()> {
+async fn inject_user_image(hub: &Arc<Hub>, data_url: &str, saved_path: &str) -> anyhow::Result<()> {
     let target_agent_id = hub.effective_input_owner().await?;
 
     let caption = "同学上传了一张图片，请查看并分析。";
-    let mailbox_text = format!(
-        "__IMAGE__:{data_url}\n__IMAGE_PATH__:{saved_path}"
-    );
+    let mailbox_text = format!("__IMAGE__:{data_url}\n__IMAGE_PATH__:{saved_path}");
     let full_message = format!("{caption}\n{mailbox_text}");
 
     hub.append_mailbox_message(
@@ -5843,7 +5975,11 @@ async fn ws_session_with_timeout(
         _ => None,
     };
 
-    if let Err(err) = verify_client_hello(&client_hello, std::time::SystemTime::now(), auth_key.as_deref()) {
+    if let Err(err) = verify_client_hello(
+        &client_hello,
+        std::time::SystemTime::now(),
+        auth_key.as_deref(),
+    ) {
         reject_handshake(
             connection_id,
             "client_hello_verification_failed",
@@ -5916,8 +6052,14 @@ async fn ws_session_with_timeout(
     // Shared approval channels for workflow nodes.
     // Maps (run_id, node_id) -> sender.
     use sa_core::workflow_engine::ApprovalResponse;
-    let approval_txs: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<(Uuid, String), tokio::sync::mpsc::UnboundedSender<ApprovalResponse>>>> =
-        std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+    let approval_txs: std::sync::Arc<
+        tokio::sync::Mutex<
+            std::collections::HashMap<
+                (Uuid, String),
+                tokio::sync::mpsc::UnboundedSender<ApprovalResponse>,
+            >,
+        >,
+    > = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
 
     // Chat mode tracking (per-connection).
     let mut chat_mode: ChatMode = ChatMode::default();
@@ -6021,7 +6163,8 @@ async fn ws_session_with_timeout(
                                     send_direct_server_message(
                                         &out_tx,
                                         ServerMessage::Error {
-                                            message: "Runtime not ready for plan generation".to_string(),
+                                            message: "Runtime not ready for plan generation"
+                                                .to_string(),
                                         },
                                     );
                                     continue;
@@ -6049,12 +6192,19 @@ async fn ws_session_with_timeout(
                             let context = "You are an AI planning assistant. Generate clear, actionable steps that can be executed sequentially.";
 
                             tokio::spawn(async move {
-                                match sa_core::plan_engine::generate_plan(&task, context, &llm_config).await {
+                                match sa_core::plan_engine::generate_plan(
+                                    &task,
+                                    context,
+                                    &llm_config,
+                                )
+                                .await
+                                {
                                     Ok(plan) => {
                                         let _ = sa_core::plan_engine::save_plan(
                                             &std::path::PathBuf::from("."),
                                             &plan,
-                                        ).await;
+                                        )
+                                        .await;
                                         let _ = out_tx_plan.send(ServerMessage::PlanCreated {
                                             plan_id: plan.plan_id,
                                             steps: plan.steps,
@@ -6082,7 +6232,8 @@ async fn ws_session_with_timeout(
                                     send_direct_server_message(
                                         &out_tx,
                                         ServerMessage::Error {
-                                            message: "Runtime not ready for workflow generation".to_string(),
+                                            message: "Runtime not ready for workflow generation"
+                                                .to_string(),
                                         },
                                     );
                                     continue;
@@ -6108,8 +6259,11 @@ async fn ws_session_with_timeout(
                             };
 
                             // Get workspace root and approval_txs
-                            let (ws_root, approval_txs_clone) = match state.runtime_snapshot().await {
-                                RuntimeState::Ready(hub) => (hub.workspace_root.clone(), approval_txs.clone()),
+                            let (ws_root, approval_txs_clone) = match state.runtime_snapshot().await
+                            {
+                                RuntimeState::Ready(hub) => {
+                                    (hub.workspace_root.clone(), approval_txs.clone())
+                                }
                                 _ => {
                                     send_direct_server_message(
                                         &out_tx,
@@ -6131,14 +6285,28 @@ async fn ws_session_with_timeout(
 
                             tokio::spawn(async move {
                                 // 1. LLM generates the workflow DAG
-                                let def = match sa_core::plan_engine::generate_workflow(&task, context, &llm_config).await {
+                                let def = match sa_core::plan_engine::generate_workflow(
+                                    &task,
+                                    context,
+                                    &llm_config,
+                                )
+                                .await
+                                {
                                     Ok(def) => {
-                                        tracing::info!("Generated workflow '{}' with {} nodes:", def.name, def.nodes.len());
+                                        tracing::info!(
+                                            "Generated workflow '{}' with {} nodes:",
+                                            def.name,
+                                            def.nodes.len()
+                                        );
                                         for n in &def.nodes {
-                                            tracing::info!("  Node '{}' type={:?} deps={:?} prompt={:?} cmd={:?}",
-                                                n.id, n.node_type, n.depends_on,
+                                            tracing::info!(
+                                                "  Node '{}' type={:?} deps={:?} prompt={:?} cmd={:?}",
+                                                n.id,
+                                                n.node_type,
+                                                n.depends_on,
                                                 n.prompt.as_deref().map(|s| &s[..s.len().min(80)]),
-                                                n.command.as_deref().map(|s| &s[..s.len().min(80)]));
+                                                n.command.as_deref().map(|s| &s[..s.len().min(80)])
+                                            );
                                         }
                                         def
                                     }
@@ -6151,8 +6319,12 @@ async fn ws_session_with_timeout(
                                 };
 
                                 // 2. Create channels for progress and approval
-                                let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
-                                let (approval_tx, approval_rx) = tokio::sync::mpsc::unbounded_channel::<sa_core::workflow_engine::ApprovalResponse>();
+                                let (progress_tx, mut progress_rx) =
+                                    tokio::sync::mpsc::unbounded_channel();
+                                let (approval_tx, approval_rx) =
+                                    tokio::sync::mpsc::unbounded_channel::<
+                                        sa_core::workflow_engine::ApprovalResponse,
+                                    >();
 
                                 // 3. Spawn forwarder: WorkflowEvent → ServerMessage
                                 let forward_tx = out_tx_wf.clone();
@@ -6221,14 +6393,22 @@ async fn ws_session_with_timeout(
                                 };
 
                                 // 5. Create tool resources for workflow nodes
-                                let wf_tool_ctx = match sa_core::tools::ToolContext::new(ws_root.clone(), std::sync::Arc::new(sa_core::skills::SkillRegistry::default())) {
+                                let wf_tool_ctx = match sa_core::tools::ToolContext::new(
+                                    ws_root.clone(),
+                                    std::sync::Arc::new(sa_core::skills::SkillRegistry::default()),
+                                ) {
                                     Ok(ctx) => ctx,
                                     Err(e) => {
-                                        tracing::warn!("Failed to create tool context for workflow: {e}");
+                                        tracing::warn!(
+                                            "Failed to create tool context for workflow: {e}"
+                                        );
                                         sa_core::tools::ToolContext::new(
                                             std::path::PathBuf::from("."),
-                                            std::sync::Arc::new(sa_core::skills::SkillRegistry::default()),
-                                        ).unwrap()
+                                            std::sync::Arc::new(
+                                                sa_core::skills::SkillRegistry::default(),
+                                            ),
+                                        )
+                                        .unwrap()
                                     }
                                 };
                                 let wf_tools = sa_core::tools::ToolExecutor::new(wf_tool_ctx, None);
@@ -6246,7 +6426,8 @@ async fn ws_session_with_timeout(
                                     Some(wf_llm_config),
                                     approval_rx,
                                     Some((wf_tools, wf_runtime, wf_cancel)),
-                                ).await;
+                                )
+                                .await;
                                 let _ = forwarder.await;
                             });
                         } else {
@@ -6266,7 +6447,9 @@ async fn ws_session_with_timeout(
                                             send_direct_server_message(
                                                 &out_tx,
                                                 ServerMessage::Error {
-                                                    message: format!("Failed to submit task: {err}"),
+                                                    message: format!(
+                                                        "Failed to submit task: {err}"
+                                                    ),
                                                 },
                                             );
                                         }
@@ -6363,7 +6546,9 @@ async fn ws_session_with_timeout(
                                 let uploads_dir = {
                                     let runtime = state.runtime.lock().await;
                                     match &*runtime {
-                                        RuntimeState::Ready(hub) => hub.workspace_root.join("uploads"),
+                                        RuntimeState::Ready(hub) => {
+                                            hub.workspace_root.join("uploads")
+                                        }
                                         RuntimeState::Bootstrap(_) => {
                                             send_direct_server_message(
                                                 &out_tx,
@@ -6389,15 +6574,15 @@ async fn ws_session_with_timeout(
                                             &out_tx,
                                             ServerMessage::ImageUploaded {
                                                 upload_id,
-                                                saved_path: saved_path.to_string_lossy().to_string(),
+                                                saved_path: saved_path
+                                                    .to_string_lossy()
+                                                    .to_string(),
                                             },
                                         );
 
                                         // Inject the uploaded image into the current agent's
                                         // conversation so the LLM can analyse it.
-                                        let data_url = format!(
-                                            "data:{mime_type};base64,{data}"
-                                        );
+                                        let data_url = format!("data:{mime_type};base64,{data}");
                                         // Grab the Hub from the ready runtime state.
                                         let hub = {
                                             let runtime = state.runtime.lock().await;
@@ -6446,41 +6631,39 @@ async fn ws_session_with_timeout(
                             }
                         }
                     }
-                    ClientMessage::GetConfig => {
-                        match state.runtime_snapshot().await {
-                            RuntimeState::Ready(hub) => {
-                                let cfg = match load_config_from_file(&hub.config_path) {
-                                    Ok(c) => c,
-                                    Err(err) => {
-                                        send_direct_server_message(
-                                            &out_tx,
-                                            ServerMessage::ConfigUpdateFailed {
-                                                message: "读取配置文件失败。".to_string(),
-                                                detail: Some(format!("{err:#}")),
-                                            },
-                                        );
-                                        continue;
-                                    }
-                                };
-                                send_direct_server_message(
-                                    &out_tx,
-                                    ServerMessage::ConfigSnapshot {
-                                        config: cfg.to_toml_value(),
-                                        config_path: hub.config_path.display().to_string(),
-                                    },
-                                );
-                            }
-                            RuntimeState::Bootstrap(_) => {
-                                send_direct_server_message(
-                                    &out_tx,
-                                    ServerMessage::ConfigUpdateFailed {
-                                        message: "SA 尚未初始化，无法读取配置。".to_string(),
-                                        detail: None,
-                                    },
-                                );
-                            }
+                    ClientMessage::GetConfig => match state.runtime_snapshot().await {
+                        RuntimeState::Ready(hub) => {
+                            let cfg = match load_config_from_file(&hub.config_path) {
+                                Ok(c) => c,
+                                Err(err) => {
+                                    send_direct_server_message(
+                                        &out_tx,
+                                        ServerMessage::ConfigUpdateFailed {
+                                            message: "读取配置文件失败。".to_string(),
+                                            detail: Some(format!("{err:#}")),
+                                        },
+                                    );
+                                    continue;
+                                }
+                            };
+                            send_direct_server_message(
+                                &out_tx,
+                                ServerMessage::ConfigSnapshot {
+                                    config: cfg.to_toml_value(),
+                                    config_path: hub.config_path.display().to_string(),
+                                },
+                            );
                         }
-                    }
+                        RuntimeState::Bootstrap(_) => {
+                            send_direct_server_message(
+                                &out_tx,
+                                ServerMessage::ConfigUpdateFailed {
+                                    message: "SA 尚未初始化，无法读取配置。".to_string(),
+                                    detail: None,
+                                },
+                            );
+                        }
+                    },
                     ClientMessage::UpdateConfig { config } => {
                         match state.runtime_snapshot().await {
                             RuntimeState::Ready(hub) => {
@@ -6500,7 +6683,10 @@ async fn ws_session_with_timeout(
                                 };
 
                                 // Merge frontend edits into a full Config.
-                                let merged = match Config::merge_from_frontend_value(&config, &current_cfg) {
+                                let merged = match Config::merge_from_frontend_value(
+                                    &config,
+                                    &current_cfg,
+                                ) {
                                     Ok(c) => c,
                                     Err(err) => {
                                         send_direct_server_message(
@@ -6552,7 +6738,9 @@ async fn ws_session_with_timeout(
                                         send_direct_server_message(
                                             &out_tx,
                                             ServerMessage::ConfigUpdateFailed {
-                                                message: "配置已写入但热重载失败，可能需要重启 SA。".to_string(),
+                                                message:
+                                                    "配置已写入但热重载失败，可能需要重启 SA。"
+                                                        .to_string(),
                                                 detail: Some(format!("{err:#}")),
                                             },
                                         );
@@ -6571,7 +6759,6 @@ async fn ws_session_with_timeout(
                         }
                     }
 
-
                     ClientMessage::GetSkillDoc { name } => {
                         match state.runtime_snapshot().await {
                             RuntimeState::Ready(hub) => {
@@ -6580,14 +6767,15 @@ async fn ws_session_with_timeout(
                                     let preload_ctx = hub.preload_ctx.read().unwrap();
                                     preload_ctx.skills.clone()
                                 };
-                                
+
                                 match skills_clone.load_skill_file(&name, None).await {
                                     Ok((path, content)) => {
                                         // 获取技能描述
-                                        let description = skills_clone.get(&name)
+                                        let description = skills_clone
+                                            .get(&name)
                                             .map(|skill| skill.description.clone())
                                             .unwrap_or_default();
-                                        
+
                                         send_direct_server_message(
                                             &out_tx,
                                             ServerMessage::SkillDoc {
@@ -6620,12 +6808,7 @@ async fn ws_session_with_timeout(
                         }
                     }
 
-
-
-
-
                     // ── Memory panel handlers ────────────────────────────
-
                     ClientMessage::GetMemoryStats => {
                         if let RuntimeState::Ready(hub) = state.runtime_snapshot().await {
                             let store = hub.memory_store.clone();
@@ -6633,7 +6816,14 @@ async fn ws_session_with_timeout(
                             tokio::spawn(async move {
                                 let result = memory_panel::compute_memory_stats_from_store(&store);
                                 match result {
-                                    Ok((total_facts, unique_subjects, unique_predicates, avg_confidence, oldest_fact, newest_fact)) => {
+                                    Ok((
+                                        total_facts,
+                                        unique_subjects,
+                                        unique_predicates,
+                                        avg_confidence,
+                                        oldest_fact,
+                                        newest_fact,
+                                    )) => {
                                         send_direct_server_message(
                                             &out_tx,
                                             ServerMessage::MemoryStats {
@@ -6650,7 +6840,9 @@ async fn ws_session_with_timeout(
                                         send_direct_server_message(
                                             &out_tx,
                                             ServerMessage::Error {
-                                                message: format!("Failed to get memory stats: {err}"),
+                                                message: format!(
+                                                    "Failed to get memory stats: {err}"
+                                                ),
                                             },
                                         );
                                     }
@@ -6659,24 +6851,39 @@ async fn ws_session_with_timeout(
                         }
                     }
 
-                    ClientMessage::GetMemoryFacts { query, limit, offset } => {
+                    ClientMessage::GetMemoryFacts {
+                        query,
+                        limit,
+                        offset,
+                    } => {
                         if let RuntimeState::Ready(hub) = state.runtime_snapshot().await {
                             let store = hub.memory_store.clone();
                             let out_tx = out_tx.clone();
                             tokio::spawn(async move {
-                                let result = memory_panel::query_memory_facts_from_store(&store, query.as_deref(), limit, offset);
+                                let result = memory_panel::query_memory_facts_from_store(
+                                    &store,
+                                    query.as_deref(),
+                                    limit,
+                                    offset,
+                                );
                                 match result {
                                     Ok((facts, total)) => {
                                         send_direct_server_message(
                                             &out_tx,
-                                            ServerMessage::MemoryFacts { facts, total, offset },
+                                            ServerMessage::MemoryFacts {
+                                                facts,
+                                                total,
+                                                offset,
+                                            },
                                         );
                                     }
                                     Err(err) => {
                                         send_direct_server_message(
                                             &out_tx,
                                             ServerMessage::Error {
-                                                message: format!("Failed to query memory facts: {err}"),
+                                                message: format!(
+                                                    "Failed to query memory facts: {err}"
+                                                ),
                                             },
                                         );
                                     }
@@ -6685,12 +6892,21 @@ async fn ws_session_with_timeout(
                         }
                     }
 
-                    ClientMessage::TraverseMemoryGraph { subject, max_hops, max_results } => {
+                    ClientMessage::TraverseMemoryGraph {
+                        subject,
+                        max_hops,
+                        max_results,
+                    } => {
                         if let RuntimeState::Ready(hub) = state.runtime_snapshot().await {
                             let store = hub.memory_store.clone();
                             let out_tx = out_tx.clone();
                             tokio::spawn(async move {
-                                let result = memory_panel::traverse_memory_from_store(&store, &subject, max_hops, max_results);
+                                let result = memory_panel::traverse_memory_from_store(
+                                    &store,
+                                    &subject,
+                                    max_hops,
+                                    max_results,
+                                );
                                 match result {
                                     Ok(facts) => {
                                         send_direct_server_message(
@@ -6706,7 +6922,9 @@ async fn ws_session_with_timeout(
                                         send_direct_server_message(
                                             &out_tx,
                                             ServerMessage::Error {
-                                                message: format!("Failed to traverse memory graph: {err}"),
+                                                message: format!(
+                                                    "Failed to traverse memory graph: {err}"
+                                                ),
                                             },
                                         );
                                     }
@@ -6750,7 +6968,8 @@ async fn ws_session_with_timeout(
                             let store = hub.memory_store.clone();
                             let out_tx = out_tx.clone();
                             tokio::spawn(async move {
-                                let result = memory_panel::prune_memory_in_store(&store, min_confidence);
+                                let result =
+                                    memory_panel::prune_memory_in_store(&store, min_confidence);
                                 match result {
                                     Ok(affected) => {
                                         send_direct_server_message(
@@ -6758,7 +6977,9 @@ async fn ws_session_with_timeout(
                                             ServerMessage::MemoryOperationResult {
                                                 operation: "prune".to_string(),
                                                 affected,
-                                                summary: format!("已剪除 {affected} 条低置信度记忆"),
+                                                summary: format!(
+                                                    "已剪除 {affected} 条低置信度记忆"
+                                                ),
                                             },
                                         );
                                     }
@@ -6793,7 +7014,11 @@ async fn ws_session_with_timeout(
                                 let full_path = memory_dir.join(&normalized);
                                 match tokio::fs::read_to_string(&full_path).await {
                                     Ok(content) => {
-                                        tracing::info!("[GetMemoryReport] sending report '{}' ({} bytes)", normalized, content.len());
+                                        tracing::info!(
+                                            "[GetMemoryReport] sending report '{}' ({} bytes)",
+                                            normalized,
+                                            content.len()
+                                        );
                                         send_direct_server_message(
                                             &out_tx,
                                             ServerMessage::MemoryReport {
@@ -6804,7 +7029,10 @@ async fn ws_session_with_timeout(
                                     }
                                     Err(err) => {
                                         if err.kind() == std::io::ErrorKind::NotFound {
-                                            let msg = format!("📭 报告尚未生成: {}\n\n该报告将在下一次 Dream 运行后自动生成。", normalized);
+                                            let msg = format!(
+                                                "📭 报告尚未生成: {}\n\n该报告将在下一次 Dream 运行后自动生成。",
+                                                normalized
+                                            );
                                             send_direct_server_message(
                                                 &out_tx,
                                                 ServerMessage::MemoryReport {
@@ -6816,7 +7044,9 @@ async fn ws_session_with_timeout(
                                             send_direct_server_message(
                                                 &out_tx,
                                                 ServerMessage::Error {
-                                                    message: format!("Failed to read report '{normalized}': {err}"),
+                                                    message: format!(
+                                                        "Failed to read report '{normalized}': {err}"
+                                                    ),
                                                 },
                                             );
                                         }
@@ -6826,12 +7056,15 @@ async fn ws_session_with_timeout(
                         }
                     }
 
-
                     // ── Workflow engine handlers ─────────────────────────────
-
-                    ClientMessage::StartWorkflow { workflow_name, inputs } => {
+                    ClientMessage::StartWorkflow {
+                        workflow_name,
+                        inputs,
+                    } => {
                         if let RuntimeState::Ready(hub) = state.runtime_snapshot().await {
-                            let workflows_dir = hub.workspace_root.parent()
+                            let workflows_dir = hub
+                                .workspace_root
+                                .parent()
                                 .unwrap_or(&hub.workspace_root)
                                 .join("sa")
                                 .join("workflows");
@@ -6851,13 +7084,17 @@ async fn ws_session_with_timeout(
                             let approval_txs_clone = approval_txs.clone();
 
                             tokio::spawn(async move {
-                                match sa_core::workflow_engine::load_workflow_def(&workflow_path).await {
+                                match sa_core::workflow_engine::load_workflow_def(&workflow_path)
+                                    .await
+                                {
                                     Ok(def) => {
                                         let ws_root = hub.workspace_root.clone();
                                         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
 
                                         // Create approval channel
-                                        let (approval_tx, approval_rx) = tokio::sync::mpsc::unbounded_channel::<ApprovalResponse>();
+                                        let (approval_tx, approval_rx) =
+                                            tokio::sync::mpsc::unbounded_channel::<ApprovalResponse>(
+                                            );
 
                                         // Spawn a task to forward progress events to the WS client
                                         let forward_tx = out_tx.clone();
@@ -6929,14 +7166,17 @@ async fn ws_session_with_timeout(
                                             llm_config,
                                             approval_rx,
                                             None, // YAML workflows don't need LLM tool-calling
-                                        ).await;
+                                        )
+                                        .await;
                                         let _ = forwarder.await;
                                     }
                                     Err(err) => {
                                         send_direct_server_message(
                                             &out_tx,
                                             ServerMessage::Error {
-                                                message: format!("Failed to load workflow '{workflow_name}': {err}"),
+                                                message: format!(
+                                                    "Failed to load workflow '{workflow_name}': {err}"
+                                                ),
                                             },
                                         );
                                     }
@@ -6963,7 +7203,11 @@ async fn ws_session_with_timeout(
                         );
                     }
 
-                    ClientMessage::InjectWorkflowContext { run_id, node_id, context } => {
+                    ClientMessage::InjectWorkflowContext {
+                        run_id,
+                        node_id,
+                        context,
+                    } => {
                         // Forward the injected context to the workflow via approval channel.
                         let mut map = approval_txs.lock().await;
                         if let Some(sender) = map.remove(&(run_id, node_id.clone())) {
@@ -6978,7 +7222,9 @@ async fn ws_session_with_timeout(
                             send_direct_server_message(
                                 &out_tx,
                                 ServerMessage::Error {
-                                    message: format!("No pending node for injection: run={run_id} node={node_id}"),
+                                    message: format!(
+                                        "No pending node for injection: run={run_id} node={node_id}"
+                                    ),
                                 },
                             );
                         }
@@ -7051,7 +7297,12 @@ async fn ws_session_with_timeout(
 
                                 tokio::spawn(async move {
                                     let workspace_root = std::path::PathBuf::from(".");
-                                    let plan = match sa_core::plan_engine::load_plan(&workspace_root, &plan_id).await {
+                                    let plan = match sa_core::plan_engine::load_plan(
+                                        &workspace_root,
+                                        &plan_id,
+                                    )
+                                    .await
+                                    {
                                         Ok(p) => p,
                                         Err(err) => {
                                             let _ = out_tx_plan.send(ServerMessage::Error {
@@ -7079,28 +7330,40 @@ async fn ws_session_with_timeout(
                                         }
 
                                         match sa_core::plan_engine::execute_plan_step(
-                                            &plan, i, &accumulated, &llm_config,
-                                        ).await {
+                                            &plan,
+                                            i,
+                                            &accumulated,
+                                            &llm_config,
+                                        )
+                                        .await
+                                        {
                                             Ok(output) => {
                                                 let step_output = format!(
                                                     "--- Step {}: {} ---\n{}\n",
                                                     step.step_id, step.description, output
                                                 );
                                                 accumulated.push_str(&step_output);
-                                                let _ = out_tx_plan.send(ServerMessage::PlanStepUpdate {
-                                                    plan_id,
-                                                    step_id: step.step_id.clone(),
-                                                    status: PlanStepStatus::Completed,
-                                                });
+                                                let _ = out_tx_plan.send(
+                                                    ServerMessage::PlanStepUpdate {
+                                                        plan_id,
+                                                        step_id: step.step_id.clone(),
+                                                        status: PlanStepStatus::Completed,
+                                                    },
+                                                );
                                             }
                                             Err(err) => {
-                                                let _ = out_tx_plan.send(ServerMessage::PlanStepUpdate {
-                                                    plan_id,
-                                                    step_id: step.step_id.clone(),
-                                                    status: PlanStepStatus::Failed,
-                                                });
+                                                let _ = out_tx_plan.send(
+                                                    ServerMessage::PlanStepUpdate {
+                                                        plan_id,
+                                                        step_id: step.step_id.clone(),
+                                                        status: PlanStepStatus::Failed,
+                                                    },
+                                                );
                                                 let _ = out_tx_plan.send(ServerMessage::Error {
-                                                    message: format!("Step {} failed: {err}", step.step_id),
+                                                    message: format!(
+                                                        "Step {} failed: {err}",
+                                                        step.step_id
+                                                    ),
                                                 });
                                                 return;
                                             }
@@ -7112,14 +7375,20 @@ async fn ws_session_with_timeout(
                                 send_direct_server_message(
                                     &out_tx,
                                     ServerMessage::Error {
-                                        message: "Plan modification not yet implemented".to_string(),
+                                        message: "Plan modification not yet implemented"
+                                            .to_string(),
                                     },
                                 );
                             }
                         }
                     }
 
-                    ClientMessage::RespondApproval { run_id, node_id, approved, feedback } => {
+                    ClientMessage::RespondApproval {
+                        run_id,
+                        node_id,
+                        approved,
+                        feedback,
+                    } => {
                         let mut map = approval_txs.lock().await;
                         if let Some(sender) = map.remove(&(run_id, node_id.clone())) {
                             let _ = sender.send(ApprovalResponse {
@@ -7128,13 +7397,19 @@ async fn ws_session_with_timeout(
                                 approved,
                                 feedback,
                             });
-                            tracing::info!("Approval response sent for run={run_id} node={node_id} approved={approved}");
+                            tracing::info!(
+                                "Approval response sent for run={run_id} node={node_id} approved={approved}"
+                            );
                         } else {
-                            tracing::warn!("No pending approval found for run={run_id} node={node_id}");
+                            tracing::warn!(
+                                "No pending approval found for run={run_id} node={node_id}"
+                            );
                             send_direct_server_message(
                                 &out_tx,
                                 ServerMessage::Error {
-                                    message: format!("No pending approval for run {run_id} node {node_id}"),
+                                    message: format!(
+                                        "No pending approval for run {run_id} node {node_id}"
+                                    ),
                                 },
                             );
                         }
@@ -7143,16 +7418,25 @@ async fn ws_session_with_timeout(
                     ClientMessage::GetSkillsList => {
                         if let RuntimeState::Ready(hub) = state.runtime_snapshot().await {
                             let preload_ctx = hub.preload_ctx.read().unwrap();
-                            let skills: Vec<sa_core::ws_protocol::SkillListItem> = preload_ctx.skills.list_full()
+                            let skills: Vec<sa_core::ws_protocol::SkillListItem> = preload_ctx
+                                .skills
+                                .list_full()
                                 .into_iter()
                                 .map(|(_name, spec)| {
                                     let source = match spec.source {
-                                        sa_core::commands::CommandSource::LocalSkill => sa_core::ws_protocol::SkillSource::Local,
-                                        sa_core::commands::CommandSource::Bundled => sa_core::ws_protocol::SkillSource::Builtin,
-                                        sa_core::commands::CommandSource::McpPrompt => sa_core::ws_protocol::SkillSource::Mcp,
+                                        sa_core::commands::CommandSource::LocalSkill => {
+                                            sa_core::ws_protocol::SkillSource::Local
+                                        }
+                                        sa_core::commands::CommandSource::Bundled => {
+                                            sa_core::ws_protocol::SkillSource::Builtin
+                                        }
+                                        sa_core::commands::CommandSource::McpPrompt => {
+                                            sa_core::ws_protocol::SkillSource::Mcp
+                                        }
                                     };
                                     // Mark core skills (毛选, 求是)
-                                    let core = spec.name.contains("毛选") || spec.name.contains("求是");
+                                    let core =
+                                        spec.name.contains("毛选") || spec.name.contains("求是");
                                     sa_core::ws_protocol::SkillListItem {
                                         name: spec.name.clone(),
                                         description: spec.description.clone(),
@@ -7169,11 +7453,16 @@ async fn ws_session_with_timeout(
                             );
                         }
                     }
-                    ClientMessage::TestApiKey { base_url, api_key, model } => {
+                    ClientMessage::TestApiKey {
+                        base_url,
+                        api_key,
+                        model,
+                    } => {
                         let out_tx = out_tx.clone();
                         tokio::spawn(async move {
                             let start = std::time::Instant::now();
-                            let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+                            let url =
+                                format!("{}/chat/completions", base_url.trim_end_matches('/'));
                             let body = serde_json::json!({
                                 "model": model,
                                 "messages": [{"role": "user", "content": "hi"}],
@@ -7196,7 +7485,9 @@ async fn ws_session_with_timeout(
                                 Ok(resp) => {
                                     let status = resp.status();
                                     if status.is_success() {
-                                        let provider = base_url.split("://").nth(1)
+                                        let provider = base_url
+                                            .split("://")
+                                            .nth(1)
                                             .and_then(|s| s.split('/').next())
                                             .unwrap_or("unknown")
                                             .to_string();
@@ -7211,8 +7502,13 @@ async fn ws_session_with_timeout(
                                             },
                                         );
                                     } else {
-                                        let err_text = resp.text().await.unwrap_or_else(|_| format!("HTTP {status}"));
-                                        let provider = base_url.split("://").nth(1)
+                                        let err_text = resp
+                                            .text()
+                                            .await
+                                            .unwrap_or_else(|_| format!("HTTP {status}"));
+                                        let provider = base_url
+                                            .split("://")
+                                            .nth(1)
                                             .and_then(|s| s.split('/').next())
                                             .unwrap_or("unknown")
                                             .to_string();
@@ -7223,7 +7519,11 @@ async fn ws_session_with_timeout(
                                                 model: model.clone(),
                                                 provider,
                                                 latency_ms,
-                                                error: Some(format!("HTTP {}: {}", status, err_text.chars().take(200).collect::<String>())),
+                                                error: Some(format!(
+                                                    "HTTP {}: {}",
+                                                    status,
+                                                    err_text.chars().take(200).collect::<String>()
+                                                )),
                                             },
                                         );
                                     }
@@ -7248,7 +7548,12 @@ async fn ws_session_with_timeout(
                         use sa_core::cost_budget::ModelPricing;
                         use sa_core::ws_protocol::SupportedModelInfo;
 
-                        fn info(id: &str, display: &str, provider: &str, p: ModelPricing) -> SupportedModelInfo {
+                        fn info(
+                            id: &str,
+                            display: &str,
+                            provider: &str,
+                            p: ModelPricing,
+                        ) -> SupportedModelInfo {
                             SupportedModelInfo {
                                 id: id.to_string(),
                                 display_name: display.to_string(),
@@ -7256,26 +7561,92 @@ async fn ws_session_with_timeout(
                                 cache_hit_price_per_million: p.cache_hit_price_per_million,
                                 cache_miss_price_per_million: p.cache_miss_price_per_million,
                                 output_price_per_million: p.output_price_per_million,
-                                has_cache_discount: (p.cache_hit_price_per_million - p.cache_miss_price_per_million).abs() > 0.001,
+                                has_cache_discount: (p.cache_hit_price_per_million
+                                    - p.cache_miss_price_per_million)
+                                    .abs()
+                                    > 0.001,
                             }
                         }
 
                         let models = vec![
-                            info("deepseek-v4-flash", "DeepSeek V4 Flash", "deepseek", ModelPricing::deepseek_v4_flash()),
-                            info("deepseek-v4-pro", "DeepSeek V4 Pro", "deepseek", ModelPricing::deepseek_v4_pro()),
-                            info("xiaomi/mimo-v2.5-pro", "MiMo V2.5 Pro", "mimo", ModelPricing::mimo_v25_pro()),
-                            info("xiaomi/mimo-v2.5", "MiMo V2.5", "mimo", ModelPricing::mimo_v25()),
-                            info("xiaomi/mimo-v2-pro", "MiMo V2 Pro", "mimo", ModelPricing::mimo_v2_pro()),
-                            info("xiaomi/mimo-v2-omni", "MiMo V2 Omni", "mimo", ModelPricing::mimo_v2_omni()),
-                            info("xiaomi/mimo-v2-flash", "MiMo V2 Flash", "mimo", ModelPricing::mimo_v2_flash()),
+                            info(
+                                "deepseek-v4-flash",
+                                "DeepSeek V4 Flash",
+                                "deepseek",
+                                ModelPricing::deepseek_v4_flash(),
+                            ),
+                            info(
+                                "deepseek-v4-pro",
+                                "DeepSeek V4 Pro",
+                                "deepseek",
+                                ModelPricing::deepseek_v4_pro(),
+                            ),
+                            info(
+                                "xiaomi/mimo-v2.5-pro",
+                                "MiMo V2.5 Pro",
+                                "mimo",
+                                ModelPricing::mimo_v25_pro(),
+                            ),
+                            info(
+                                "xiaomi/mimo-v2.5",
+                                "MiMo V2.5",
+                                "mimo",
+                                ModelPricing::mimo_v25(),
+                            ),
+                            info(
+                                "xiaomi/mimo-v2-pro",
+                                "MiMo V2 Pro",
+                                "mimo",
+                                ModelPricing::mimo_v2_pro(),
+                            ),
+                            info(
+                                "xiaomi/mimo-v2-omni",
+                                "MiMo V2 Omni",
+                                "mimo",
+                                ModelPricing::mimo_v2_omni(),
+                            ),
+                            info(
+                                "xiaomi/mimo-v2-flash",
+                                "MiMo V2 Flash",
+                                "mimo",
+                                ModelPricing::mimo_v2_flash(),
+                            ),
                             info("gpt-4o", "GPT-4o", "openai", ModelPricing::gpt_4o()),
-                            info("gpt-4o-mini", "GPT-4o Mini", "openai", ModelPricing::gpt_4o_mini()),
-                            info("claude-3-5-sonnet", "Claude 3.5 Sonnet", "anthropic", ModelPricing::claude_35_sonnet()),
-                            info("claude-3-5-haiku", "Claude 3.5 Haiku", "anthropic", ModelPricing::claude_35_haiku()),
-                            info("gemini-1.5-pro", "Gemini 1.5 Pro", "google", ModelPricing::gemini_15_pro()),
-                            info("gemini-1.5-flash", "Gemini 1.5 Flash", "google", ModelPricing::gemini_15_flash()),
+                            info(
+                                "gpt-4o-mini",
+                                "GPT-4o Mini",
+                                "openai",
+                                ModelPricing::gpt_4o_mini(),
+                            ),
+                            info(
+                                "claude-3-5-sonnet",
+                                "Claude 3.5 Sonnet",
+                                "anthropic",
+                                ModelPricing::claude_35_sonnet(),
+                            ),
+                            info(
+                                "claude-3-5-haiku",
+                                "Claude 3.5 Haiku",
+                                "anthropic",
+                                ModelPricing::claude_35_haiku(),
+                            ),
+                            info(
+                                "gemini-1.5-pro",
+                                "Gemini 1.5 Pro",
+                                "google",
+                                ModelPricing::gemini_15_pro(),
+                            ),
+                            info(
+                                "gemini-1.5-flash",
+                                "Gemini 1.5 Flash",
+                                "google",
+                                ModelPricing::gemini_15_flash(),
+                            ),
                         ];
-                        send_direct_server_message(&out_tx, ServerMessage::SupportedModels { models });
+                        send_direct_server_message(
+                            &out_tx,
+                            ServerMessage::SupportedModels { models },
+                        );
                     }
                 }
             }
@@ -7284,7 +7655,6 @@ async fn ws_session_with_timeout(
             _ => {}
         }
     }
-
 
     // Drop outbound channel to stop writer task.
     drop(out_tx);
@@ -7735,6 +8105,7 @@ effort: high
                     allow_user_ask: false,
                     allow_input_transfer_target: false,
                     existing_agent_id: None,
+                    category: None,
                 },
                 sa_core::cancel::cancel_pair().1,
             )
@@ -8222,8 +8593,7 @@ description: Teaches patiently
         assert_eq!(last.role, "tool");
         assert_eq!(last.tool_call_id.as_deref(), Some("call_answer"));
         let content = last
-            .content
-            .as_deref()
+            .text_content()
             .expect("tool result should contain text");
         assert!(content.contains("\"selected_option_ids\":[\"a\"]"));
         assert!(content.contains("\"selected_labels\":[\"选项A\"]"));

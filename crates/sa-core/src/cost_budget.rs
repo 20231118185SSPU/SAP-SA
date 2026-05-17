@@ -115,10 +115,16 @@ impl ModelPricing {
         let lower = model_name.to_lowercase();
 
         // MiMo (prefix match to avoid ambiguity with other models)
-        if lower.starts_with("mimo-v2.5-pro") || lower.starts_with("mimo_v2.5_pro") || lower.contains("mimo-v2.5-pro") {
+        if lower.starts_with("mimo-v2.5-pro")
+            || lower.starts_with("mimo_v2.5_pro")
+            || lower.contains("mimo-v2.5-pro")
+        {
             return Self::mimo_v25_pro();
         }
-        if lower.starts_with("mimo-v2.5") || lower.starts_with("mimo_v2.5") || lower.contains("mimo-v2.5") {
+        if lower.starts_with("mimo-v2.5")
+            || lower.starts_with("mimo_v2.5")
+            || lower.contains("mimo-v2.5")
+        {
             return Self::mimo_v25();
         }
         if lower.contains("mimo-v2-pro") || lower.contains("mimo_v2_pro") {
@@ -127,7 +133,10 @@ impl ModelPricing {
         if lower.contains("mimo-v2-omni") || lower.contains("mimo_v2_omni") {
             return Self::mimo_v2_omni();
         }
-        if lower.starts_with("mimo-v2-flash") || lower.starts_with("mimo_v2_flash") || lower.contains("mimo-v2-flash") {
+        if lower.starts_with("mimo-v2-flash")
+            || lower.starts_with("mimo_v2_flash")
+            || lower.contains("mimo-v2-flash")
+        {
             return Self::mimo_v2_flash();
         }
 
@@ -328,11 +337,7 @@ impl ModelPricing {
     }
 
     /// Calculate potential savings compared to all-cache-miss scenario.
-    pub fn calculate_savings(
-        &self,
-        cache_hit_tokens: u64,
-        total_input_tokens: u64,
-    ) -> f64 {
+    pub fn calculate_savings(&self, cache_hit_tokens: u64, total_input_tokens: u64) -> f64 {
         let hit = cache_hit_tokens as f64;
         let total = total_input_tokens as f64;
 
@@ -398,23 +403,14 @@ impl CostBudgetTracker {
         match fs::read_to_string(&path) {
             Ok(raw) => {
                 let mut tracker: Self = serde_json::from_str(&raw).with_context(|| {
-                    format!(
-                        "Failed to parse cost budget file: {}",
-                        path.display()
-                    )
+                    format!("Failed to parse cost budget file: {}", path.display())
                 })?;
                 tracker.prune_history();
                 Ok(tracker)
             }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                Ok(Self::default())
-            }
-            Err(err) => Err(err).with_context(|| {
-                format!(
-                    "Failed to read cost budget file: {}",
-                    path.display()
-                )
-            }),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(err) => Err(err)
+                .with_context(|| format!("Failed to read cost budget file: {}", path.display())),
         }
     }
 
@@ -426,9 +422,8 @@ impl CostBudgetTracker {
         }
         let raw = serde_json::to_string_pretty(self)
             .context("Failed to serialize cost budget tracker")?;
-        fs::write(&path, raw.as_bytes()).with_context(|| {
-            format!("Failed to write cost budget file: {}", path.display())
-        })
+        fs::write(&path, raw.as_bytes())
+            .with_context(|| format!("Failed to write cost budget file: {}", path.display()))
     }
 
     /// Ensure the tracker is aligned to the current calendar day.
@@ -489,7 +484,9 @@ impl CostBudgetTracker {
         self.tokens_used_today = self.tokens_used_today.saturating_add(total_tokens as usize);
         self.request_count_today = self.request_count_today.saturating_add(1);
         self.cache_hit_tokens_today = self.cache_hit_tokens_today.saturating_add(cache_hit_tokens);
-        self.cache_miss_tokens_today = self.cache_miss_tokens_today.saturating_add(cache_miss_tokens);
+        self.cache_miss_tokens_today = self
+            .cache_miss_tokens_today
+            .saturating_add(cache_miss_tokens);
         self.output_tokens_today = self.output_tokens_today.saturating_add(output_tokens);
 
         let cost = pricing.calculate_cost(cache_hit_tokens, cache_miss_tokens, output_tokens);
@@ -514,12 +511,21 @@ impl CostBudgetTracker {
         output_tokens: u64,
         pricing: &ModelPricing,
     ) {
-        self.record_llm_usage(now, cache_hit_tokens, cache_miss_tokens, output_tokens, pricing);
+        self.record_llm_usage(
+            now,
+            cache_hit_tokens,
+            cache_miss_tokens,
+            output_tokens,
+            pricing,
+        );
     }
 
     /// Get estimated savings today compared to all-cache-miss scenario.
     pub fn estimated_savings_today(&self, pricing: &ModelPricing) -> f64 {
-        pricing.calculate_savings(self.cache_hit_tokens_today, self.cache_hit_tokens_today + self.cache_miss_tokens_today)
+        pricing.calculate_savings(
+            self.cache_hit_tokens_today,
+            self.cache_hit_tokens_today + self.cache_miss_tokens_today,
+        )
     }
 
     /// Check the remaining budget for today.
@@ -573,7 +579,11 @@ impl CostBudgetTracker {
     }
 
     /// Enhanced budget status line with cache statistics.
-    pub fn cache_budget_status_line(&self, config: &CostBudgetConfig, pricing: &ModelPricing) -> String {
+    pub fn cache_budget_status_line(
+        &self,
+        config: &CostBudgetConfig,
+        pricing: &ModelPricing,
+    ) -> String {
         let cache_rate = self.cache_hit_rate_today() * 100.0;
         let savings = self.estimated_savings_today(pricing);
 
@@ -800,7 +810,7 @@ mod tests {
     #[test]
     fn test_deepseek_cost_calculation() {
         let pricing = ModelPricing::v4_flash();
-        
+
         // 800 cache hit + 200 cache miss + 300 output
         let cost = pricing.calculate_cost(800, 200, 300);
         // Expected: (800 * 0.0028 + 200 * 0.14 + 300 * 0.28) / 1_000_000
@@ -811,7 +821,7 @@ mod tests {
     #[test]
     fn test_deepseek_savings_calculation() {
         let pricing = ModelPricing::v4_flash();
-        
+
         // 800 cache hit out of 1000 total input tokens
         let savings = pricing.calculate_savings(800, 1000);
         // Would pay: 1000 * 0.14 / 1_000_000 = 0.00014
@@ -859,26 +869,68 @@ mod tests {
     #[test]
     fn test_for_model_routing() {
         // DeepSeek
-        assert_eq!(ModelPricing::for_model("deepseek-v4-flash").model, KnownModel::DeepSeekV4Flash);
-        assert_eq!(ModelPricing::for_model("deepseek-v4-pro").model, KnownModel::DeepSeekV4Pro);
-        assert_eq!(ModelPricing::for_model("deepseek-chat").model, KnownModel::DeepSeekV4Flash);
+        assert_eq!(
+            ModelPricing::for_model("deepseek-v4-flash").model,
+            KnownModel::DeepSeekV4Flash
+        );
+        assert_eq!(
+            ModelPricing::for_model("deepseek-v4-pro").model,
+            KnownModel::DeepSeekV4Pro
+        );
+        assert_eq!(
+            ModelPricing::for_model("deepseek-chat").model,
+            KnownModel::DeepSeekV4Flash
+        );
         // OpenAI
         assert_eq!(ModelPricing::for_model("gpt-4o").model, KnownModel::Gpt4o);
-        assert_eq!(ModelPricing::for_model("gpt-4o-mini").model, KnownModel::Gpt4oMini);
+        assert_eq!(
+            ModelPricing::for_model("gpt-4o-mini").model,
+            KnownModel::Gpt4oMini
+        );
         // Anthropic
-        assert_eq!(ModelPricing::for_model("claude-3-5-sonnet-20241022").model, KnownModel::Claude35Sonnet);
-        assert_eq!(ModelPricing::for_model("claude-3-5-haiku-20241022").model, KnownModel::Claude35Haiku);
+        assert_eq!(
+            ModelPricing::for_model("claude-3-5-sonnet-20241022").model,
+            KnownModel::Claude35Sonnet
+        );
+        assert_eq!(
+            ModelPricing::for_model("claude-3-5-haiku-20241022").model,
+            KnownModel::Claude35Haiku
+        );
         // Google
-        assert_eq!(ModelPricing::for_model("gemini-1.5-pro").model, KnownModel::Gemini15Pro);
-        assert_eq!(ModelPricing::for_model("gemini-1.5-flash").model, KnownModel::Gemini15Flash);
+        assert_eq!(
+            ModelPricing::for_model("gemini-1.5-pro").model,
+            KnownModel::Gemini15Pro
+        );
+        assert_eq!(
+            ModelPricing::for_model("gemini-1.5-flash").model,
+            KnownModel::Gemini15Flash
+        );
         // MiMo
-        assert_eq!(ModelPricing::for_model("xiaomi/mimo-v2.5-pro").model, KnownModel::MiMoV25Pro);
-        assert_eq!(ModelPricing::for_model("xiaomi/mimo-v2.5").model, KnownModel::MiMoV25);
-        assert_eq!(ModelPricing::for_model("xiaomi/mimo-v2-pro").model, KnownModel::MiMoV2Pro);
-        assert_eq!(ModelPricing::for_model("xiaomi/mimo-v2-omni").model, KnownModel::MiMoV2Omni);
-        assert_eq!(ModelPricing::for_model("xiaomi/mimo-v2-flash").model, KnownModel::MiMoV2Flash);
+        assert_eq!(
+            ModelPricing::for_model("xiaomi/mimo-v2.5-pro").model,
+            KnownModel::MiMoV25Pro
+        );
+        assert_eq!(
+            ModelPricing::for_model("xiaomi/mimo-v2.5").model,
+            KnownModel::MiMoV25
+        );
+        assert_eq!(
+            ModelPricing::for_model("xiaomi/mimo-v2-pro").model,
+            KnownModel::MiMoV2Pro
+        );
+        assert_eq!(
+            ModelPricing::for_model("xiaomi/mimo-v2-omni").model,
+            KnownModel::MiMoV2Omni
+        );
+        assert_eq!(
+            ModelPricing::for_model("xiaomi/mimo-v2-flash").model,
+            KnownModel::MiMoV2Flash
+        );
         // Unknown falls back
-        assert_eq!(ModelPricing::for_model("some-random-model").model, KnownModel::DeepSeekV4Flash);
+        assert_eq!(
+            ModelPricing::for_model("some-random-model").model,
+            KnownModel::DeepSeekV4Flash
+        );
     }
 
     #[test]

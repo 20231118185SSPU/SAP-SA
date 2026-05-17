@@ -217,15 +217,10 @@ impl CacheMonitor {
     }
 
     /// Record a request using ChatUsage from the API response.
-    /// 
+    ///
     /// Uses `cache_read_tokens()` for cache hits and calculates misses
     /// from total input tokens minus cache hits.
-    pub fn record_from_usage(
-        &mut self,
-        request_id: String,
-        model: String,
-        usage: &ChatUsage,
-    ) {
+    pub fn record_from_usage(&mut self, request_id: String, model: String, usage: &ChatUsage) {
         let cache_hit = usage.cache_read_tokens();
         let total_input = usage.input_tokens.unwrap_or(0);
         let cache_miss = total_input.saturating_sub(cache_hit);
@@ -247,7 +242,9 @@ impl CacheMonitor {
                 total_estimated_cost_usd: 0.0,
                 total_estimated_savings_usd: 0.0,
                 hit_rate_trend: HitRateTrend::InsufficientData,
-                recommendations: vec!["No data available yet. Start making API calls to see statistics.".to_string()],
+                recommendations: vec![
+                    "No data available yet. Start making API calls to see statistics.".to_string(),
+                ],
                 time_period: TimePeriod {
                     start: Local::now(),
                     end: Local::now(),
@@ -257,9 +254,21 @@ impl CacheMonitor {
         }
 
         let total_requests = self.hit_rate_history.len();
-        let total_input: u64 = self.hit_rate_history.iter().map(|s| s.total_input_tokens).sum();
-        let total_hit: u64 = self.hit_rate_history.iter().map(|s| s.cache_hit_tokens).sum();
-        let total_miss: u64 = self.hit_rate_history.iter().map(|s| s.cache_miss_tokens).sum();
+        let total_input: u64 = self
+            .hit_rate_history
+            .iter()
+            .map(|s| s.total_input_tokens)
+            .sum();
+        let total_hit: u64 = self
+            .hit_rate_history
+            .iter()
+            .map(|s| s.cache_hit_tokens)
+            .sum();
+        let total_miss: u64 = self
+            .hit_rate_history
+            .iter()
+            .map(|s| s.cache_miss_tokens)
+            .sum();
         let total_output: u64 = self.hit_rate_history.iter().map(|s| s.output_tokens).sum();
 
         let average_hit_rate = if total_input > 0 {
@@ -268,7 +277,11 @@ impl CacheMonitor {
             0.0
         };
 
-        let total_cost: f64 = self.hit_rate_history.iter().map(|s| s.estimated_cost_usd).sum();
+        let total_cost: f64 = self
+            .hit_rate_history
+            .iter()
+            .map(|s| s.estimated_cost_usd)
+            .sum();
         let total_savings: f64 = self
             .hit_rate_history
             .iter()
@@ -347,11 +360,7 @@ impl CacheMonitor {
     }
 
     /// Generate optimization recommendations based on performance.
-    fn generate_recommendations(
-        &self,
-        average_hit_rate: f64,
-        trend: &HitRateTrend,
-    ) -> Vec<String> {
+    fn generate_recommendations(&self, average_hit_rate: f64, trend: &HitRateTrend) -> Vec<String> {
         let mut recommendations = Vec::new();
 
         // Overall hit rate recommendations
@@ -372,9 +381,8 @@ impl CacheMonitor {
             recommendations.push(
                 "Cache hit rate is moderate (30-60%). Consider further optimization.".to_string(),
             );
-            recommendations.push(
-                "Move more stable content to the beginning of messages.".to_string(),
-            );
+            recommendations
+                .push("Move more stable content to the beginning of messages.".to_string());
         } else if average_hit_rate < 0.8 {
             recommendations.push(
                 "Cache hit rate is good (60-80%). Minor optimizations may be possible.".to_string(),
@@ -401,9 +409,8 @@ impl CacheMonitor {
             }
             HitRateTrend::Stable => {}
             HitRateTrend::InsufficientData => {
-                recommendations.push(
-                    "Not enough data to determine trend. Continue monitoring.".to_string(),
-                );
+                recommendations
+                    .push("Not enough data to determine trend. Continue monitoring.".to_string());
             }
         }
 
@@ -438,13 +445,15 @@ impl CacheMonitor {
         let mut model_stats: HashMap<String, ModelCacheStats> = HashMap::new();
 
         for snapshot in &self.hit_rate_history {
-            let entry = model_stats.entry(snapshot.model.clone()).or_insert_with(|| ModelCacheStats {
-                requests: 0,
-                cache_hits: 0,
-                cache_misses: 0,
-                output_tokens: 0,
-                hit_rate: 0.0,
-            });
+            let entry = model_stats
+                .entry(snapshot.model.clone())
+                .or_insert_with(|| ModelCacheStats {
+                    requests: 0,
+                    cache_hits: 0,
+                    cache_misses: 0,
+                    output_tokens: 0,
+                    hit_rate: 0.0,
+                });
             entry.requests += 1;
             entry.cache_hits += snapshot.cache_hit_tokens;
             entry.cache_misses += snapshot.cache_miss_tokens;
@@ -467,9 +476,14 @@ impl CacheMonitor {
     /// Persist cache monitor state to a JSON file.
     pub fn save_to_file(&self, path: &std::path::Path) -> anyhow::Result<()> {
         let json = serde_json::to_string_pretty(self)?;
-        std::fs::write(path, &json)
-            .map_err(|e| anyhow::anyhow!("Failed to write cache monitor to {}: {e}", path.display()))?;
-        tracing::info!("Cache monitor saved ({} snapshots) to {}", self.hit_rate_history.len(), path.display());
+        std::fs::write(path, &json).map_err(|e| {
+            anyhow::anyhow!("Failed to write cache monitor to {}: {e}", path.display())
+        })?;
+        tracing::info!(
+            "Cache monitor saved ({} snapshots) to {}",
+            self.hit_rate_history.len(),
+            path.display()
+        );
         Ok(())
     }
 
@@ -480,16 +494,26 @@ impl CacheMonitor {
             Ok(json) => match serde_json::from_str::<CacheMonitor>(&json) {
                 Ok(mut monitor) => {
                     monitor.pricing = pricing;
-                    tracing::info!("Cache monitor loaded ({} snapshots) from {}", monitor.hit_rate_history.len(), path.display());
+                    tracing::info!(
+                        "Cache monitor loaded ({} snapshots) from {}",
+                        monitor.hit_rate_history.len(),
+                        path.display()
+                    );
                     monitor
                 }
                 Err(e) => {
-                    tracing::warn!("Cache monitor corrupt at {}, starting fresh: {e}", path.display());
+                    tracing::warn!(
+                        "Cache monitor corrupt at {}, starting fresh: {e}",
+                        path.display()
+                    );
                     Self::with_pricing(pricing)
                 }
             },
             Err(_) => {
-                tracing::info!("No cache monitor file at {}, starting fresh", path.display());
+                tracing::info!(
+                    "No cache monitor file at {}, starting fresh",
+                    path.display()
+                );
                 Self::with_pricing(pricing)
             }
         }
@@ -614,7 +638,12 @@ mod tests {
         }
 
         let report = monitor.generate_report();
-        assert!(report.recommendations.iter().any(|r| r.contains("very low")));
+        assert!(
+            report
+                .recommendations
+                .iter()
+                .any(|r| r.contains("very low"))
+        );
     }
 
     #[test]
@@ -633,10 +662,12 @@ mod tests {
         }
 
         let report = monitor.generate_report();
-        assert!(report
-            .recommendations
-            .iter()
-            .any(|r| r.contains("excellent")));
+        assert!(
+            report
+                .recommendations
+                .iter()
+                .any(|r| r.contains("excellent"))
+        );
     }
 
     #[test]

@@ -112,7 +112,10 @@ impl SkillIndex {
 fn tokenize(input: &str) -> Vec<String> {
     input
         .split(|c: char| c.is_whitespace() || c == '-' || c == '_' || c == '/' || c == ',')
-        .map(|s| s.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase())
+        .map(|s| {
+            s.trim_matches(|c: char| !c.is_alphanumeric())
+                .to_lowercase()
+        })
         .filter(|s| s.len() > 1)
         .collect()
 }

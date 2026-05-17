@@ -1270,7 +1270,10 @@ fn strip_timeout_wrapper(tokens: &[String]) -> Result<usize, String> {
         // -k/-s with attached value: -k5, -s10
         if (token.starts_with("-k") || token.starts_with("-s"))
             && token.len() > 2
-            && token[2..].chars().next().is_some_and(|c| c.is_ascii_digit())
+            && token[2..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_digit())
         {
             index += 1;
             continue;
@@ -1669,16 +1672,16 @@ mod tests {
     }
 
     #[test]
-    fn allows_timeout_with_kill_after_attached_value() {
+    fn blocks_timeout_wrapped_dangerous_command_with_kill_after_attached_value() {
         // `-k5` form: value attached to flag, not a separate token
         let decision = validate("timeout -k5 rm -rf /tmp/test");
-        assert_eq!(decision, BashSafetyDecision::Allow { warning: None });
+        assert!(matches!(decision, BashSafetyDecision::Block { .. }));
     }
 
     #[test]
-    fn allows_timeout_with_kill_after_separate_value() {
+    fn blocks_timeout_wrapped_dangerous_command_with_kill_after_separate_value() {
         // `-k 5` form: value as next token
         let decision = validate("timeout -k 5 rm -rf /tmp/test");
-        assert_eq!(decision, BashSafetyDecision::Allow { warning: None });
+        assert!(matches!(decision, BashSafetyDecision::Block { .. }));
     }
 }
